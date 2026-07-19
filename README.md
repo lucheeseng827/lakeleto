@@ -115,13 +115,63 @@ docker run --rm -p 8080:8080 -v "$PWD:/data:ro" mancube/lakeleto serve --addr 0.
 cargo install lakeleto --features serve,sql,iceberg,object-store
 ```
 
-**Windows:** `cargo binstall lakeleto` pulls the `x86_64-pc-windows-msvc` zip automatically. Or download `lakeleto-x86_64-pc-windows-msvc.zip` from the release, unzip, and run `lakeleto.exe` — a single static executable, no install step:
+**Windows:** `cargo binstall lakeleto` pulls the `x86_64-pc-windows-msvc` zip automatically. Or download `lakeleto-x86_64-pc-windows-msvc.zip` from the release, unzip, and run `lakeleto.exe` — a single static executable, no install step.
 
-```powershell
-lakeleto.exe serve --root C:\path\to\data   # then open http://127.0.0.1:8080
+## Running it — step by step (no terminal experience needed)
+
+Lakeleto is **one self-contained program** — no installer, no account, nothing to configure. The friendliest way in is `lakeleto open <your file>`: it starts the local viewer and **opens your web browser automatically**. Everything runs on your own machine; your data is never uploaded.
+
+> **Double-clicking the file won't work.** Lakeleto is a command-line program — if you double-click it, a black window flashes and closes. You run it by typing one short command in a terminal, as shown below. It only takes a minute.
+
+### Windows
+
+1. Download **`lakeleto-x86_64-pc-windows-msvc.zip`** from the [latest release](https://github.com/lucheeseng827/lakeleto/releases/latest).
+2. In your Downloads folder, **right-click the zip → Extract All**. You now have a folder containing `lakeleto.exe`.
+3. **Open a terminal in that folder:** open the folder, click the address bar at the top, type `powershell`, and press **Enter**. A blue terminal window opens, already pointed at the folder.
+4. **Open a data file** (drag your `.parquet` / `.csv` / `.tsv` file onto the terminal to paste its full path):
+   ```powershell
+   .\lakeleto.exe open "C:\Users\you\Downloads\yourfile.parquet"
+   ```
+   Your browser opens with the table loaded. **Or browse a whole folder** at http://127.0.0.1:8080:
+   ```powershell
+   .\lakeleto.exe serve --root "C:\Users\you\Documents\data"
+   ```
+5. **First run:** Windows SmartScreen may warn "Windows protected your PC / unknown publisher." Click **More info → Run anyway**. (The download is cosign-signed and ships a `.sha256` you can verify.)
+6. **To stop it:** click the terminal and press **Ctrl + C**.
+
+### macOS
+
+1. `brew install lucheeseng827/lakeleto/lakeleto` — or download the `…apple-darwin.tar.gz` (Apple Silicon = `aarch64`, older Intel Macs = `x86_64`) and double-click it to unpack `lakeleto`.
+2. Open **Terminal** (Spotlight → type "Terminal"). Type `lakeleto ` (or drag the unpacked `lakeleto` file in), then `open `, then drag your data file in, and press **Enter**:
+   ```bash
+   lakeleto open ~/Downloads/yourfile.parquet      # browser opens automatically
+   lakeleto serve --root ~/Documents/data          # or browse a folder at http://127.0.0.1:8080
+   ```
+3. **First run:** if macOS blocks it ("cannot verify the developer"), right-click the `lakeleto` file in Finder → **Open** once, or run `xattr -d com.apple.quarantine ./lakeleto`.
+
+### Linux
+
+```bash
+tar xzf lakeleto-x86_64-unknown-linux-musl.tar.gz    # -> ./lakeleto
+./lakeleto open yourfile.parquet                     # opens your browser
+./lakeleto serve --root ~/data                        # or browse a folder at http://127.0.0.1:8080
 ```
 
-## Quickstart
+### Once it's open in the browser
+
+Point at a file or a folder and you get, with no setup:
+
+- **Grid** — scroll the rows; type in a column's **filter** box (substring by default, or prefix `>` `<` `>=` `<=` `=` `!=` for comparisons); click a header to **sort**; click a cell to copy it; click a row for full **Row detail**.
+- **Schema** — every column, its type, nullability, and the exact row count.
+- **Profile** — per-column null %, distinct count, min/max, and sample values.
+- **SQL** — run read-only `SELECT …` over the table (the current file is the table `t`).
+- **Export / Download view** — save the current (filtered/sorted) view as CSV, JSON, or Parquet.
+
+Stop the server anytime with **Ctrl + C** in the terminal.
+
+## Command-line reference
+
+For scripting and pipelines, every view is also a one-shot command (no server, prints to stdout):
 
 ```bash
 # (paths below are relative to this module dir: .)
