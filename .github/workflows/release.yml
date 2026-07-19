@@ -3,8 +3,8 @@
 # Synced from the private monorepo to `.github/workflows/release.yml` (see .ossync.yaml). Cuts a
 # release on a `v*` tag. Lakeleto is a SINGLE crate (lakeleto → published as `lakeleto`; binary stays `lakeleto`), so this
 # is simpler than a multi-crate workspace: one build, one `cargo publish`, no dep-order loop.
-#   1. build   — static musl (x86_64 + aarch64) + macOS (x86_64 + arm64); archive + sha256;
-#                cosign keyless signature (.sig/.pem) + SLSA build provenance per artifact
+#   1. build   — static musl (x86_64 + aarch64) + macOS (x86_64 + arm64) + Windows x64 (.zip);
+#                archive + sha256; cosign keyless signature (.sig/.pem) + SLSA provenance per artifact
 #   2. sbom    — CycloneDX SBOM (cargo-cyclonedx) for the crate
 #   3. release — attach every artifact + SHA256SUMS + signatures + SBOM to the GitHub release
 #   4. crates  — `cargo publish` the single `lakeleto` crate (real tags only, idempotent)
@@ -98,10 +98,13 @@ jobs:
           - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest, cross: true }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
           # Both macOS targets build on macos-14 (Apple Silicon): arm64 native, x86_64 via an
-          # in-macOS cross-compile. (No Windows image in the release matrix; binstall's Windows
-          # override exists for a user-built zip.)
+          # in-macOS cross-compile.
           - { target: x86_64-apple-darwin,         os: macos-14 }
           - { target: aarch64-apple-darwin,        os: macos-14 }
+          # Windows x64: native MSVC build on windows-latest. Ships a `.zip` of lakeleto.exe
+          # (the `archive` step below branches on the target); matches binstall's
+          # `overrides.x86_64-pc-windows-msvc { pkg-fmt = "zip" }` in Cargo.toml.
+          - { target: x86_64-pc-windows-msvc,      os: windows-latest }
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -133,9 +136,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          root="$PWD"
           dist="target/${{ matrix.target }}/release"
-          asset="${BIN}-${{ matrix.target }}.tar.gz"
-          tar -czf "$asset" -C "$dist" "$BIN"
+          case "${{ matrix.target }}" in
+            *windows*)
+              # Windows convention: a .zip of lakeleto.exe. 7z is preinstalled on windows-latest.
+              bin="${BIN}.exe"
+              asset="${BIN}-${{ matrix.target }}.zip"
+              ( cd "$dist" && 7z a "$root/$asset" "$bin" >/dev/null )
+              ;;
+            *)
+              bin="${BIN}"
+              asset="${BIN}-${{ matrix.target }}.tar.gz"
+              tar -czf "$asset" -C "$dist" "$bin"
+              ;;
+          esac
           if command -v sha256sum >/dev/null; then
             sha256sum "$asset" > "$asset.sha256"
           else
@@ -226,6 +241,7 @@ jobs:
           prerelease: ${{ contains(env.TAG, '-') }}
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
             dist/*.sig
             dist/*.pem

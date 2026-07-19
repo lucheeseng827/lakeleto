@@ -97,6 +97,30 @@ sequenceDiagram
     end
 ```
 
+## Install
+
+Prebuilt, signed binaries ship on every [release](https://github.com/lucheeseng827/lakeleto/releases) for **Linux** (x86_64/aarch64, static musl), **macOS** (Intel/Apple Silicon), and **Windows** (x86_64). Every artifact carries a cosign signature (`.sig`/`.pem`), a SHA256, and SLSA build provenance.
+
+```bash
+# cargo-binstall — fetches the right prebuilt binary for your platform (no compile)
+cargo binstall lakeleto
+
+# Homebrew (macOS + Linux)
+brew install lucheeseng827/lakeleto/lakeleto   # or: brew tap lucheeseng827/lakeleto && brew install lakeleto
+
+# Docker (linux/amd64 + linux/arm64, distroless)
+docker run --rm -p 8080:8080 -v "$PWD:/data:ro" mancube/lakeleto serve --addr 0.0.0.0:8080 --root /data
+
+# from source
+cargo install lakeleto --features serve,sql,iceberg,object-store
+```
+
+**Windows:** `cargo binstall lakeleto` pulls the `x86_64-pc-windows-msvc` zip automatically. Or download `lakeleto-x86_64-pc-windows-msvc.zip` from the release, unzip, and run `lakeleto.exe` — a single static executable, no install step:
+
+```powershell
+lakeleto.exe serve --root C:\path\to\data   # then open http://127.0.0.1:8080
+```
+
 ## Quickstart
 
 ```bash

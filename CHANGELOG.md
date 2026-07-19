@@ -8,6 +8,25 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.1.1] - 2026-07-20
+
+### Fixed
+- **Windows: SQL tab / filtered grid no longer panic.** The SQL engine passed
+  canonicalized paths (from `--root` or `fs::canonicalize`, which carry the
+  Windows extended-length `\\?\` verbatim prefix) straight to DataFusion, whose
+  `ListingTableUrl` can't round-trip that prefix — surfacing as
+  `to_file_path() failed to produce an absolute Path`. The path is now normalized
+  before registration, covering every DataFusion-backed operation
+  (`POST /v1/query` and any `/v1/rows` scan with a filter/sort).
+
+### Added
+- **Windows x64 release binary.** Every release now ships a signed
+  `lakeleto-x86_64-pc-windows-msvc.zip` (cosign + SHA256 + SLSA provenance),
+  alongside the existing Linux (musl x86_64/aarch64) and macOS (Intel/Apple
+  Silicon) artifacts. `cargo binstall lakeleto` resolves it automatically.
+- **README `Install` section** covering binstall, Homebrew, Docker, and
+  from-source across all platforms.
+
 ## [0.1.0] - 2026-07-20
 
 First public release — the MVP scaffold for idea #25 "Lakeleto": instant, offline,

@@ -20,6 +20,23 @@ use super::{
 use crate::error::{EngineError, Result};
 use crate::source::{Format, Source};
 
+/// Normalize a local filesystem path into a form DataFusion's `ListingTableUrl` can parse.
+///
+/// On Windows, canonicalized paths (e.g. from `--root` confinement or `fs::canonicalize`) carry the
+/// extended-length verbatim prefix `\\?\` (or `\\?\UNC\` for shares). DataFusion round-trips the path
+/// through `Url::from_file_path`/`to_file_path`, which rejects that prefix — surfacing as the panic
+/// `to_file_path() failed to produce an absolute Path`. Strip the prefix so the plain drive path is
+/// used. On non-Windows this is a no-op (no such prefix ever appears).
+fn datafusion_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 /// DataFusion-backed engine. Owns its own single-worker multi-threaded Tokio runtime so callers
 /// use the same synchronous [`Engine`] API as the local engine (no `async` leaks across the seam).
 pub struct DataFusionEngine {
@@ -37,7 +54,7 @@ impl DataFusionEngine {
     }
 
     fn register(&self, ctx: &SessionContext, table: &NamedSource) -> Result<()> {
-        let path = table.source.path.to_string_lossy().to_string();
+        let path = datafusion_path(&table.source.path.to_string_lossy());
         self.rt.block_on(async {
             match table.source.format {
                 Format::Parquet => ctx
@@ -313,10 +330,28 @@ fn statement_is_read_only(stmt: &DfStatement) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_read_only, DataFusionEngine};
+    use super::{datafusion_path, ensure_read_only, DataFusionEngine};
     use crate::engine::Engine;
     use crate::error::EngineError;
     use crate::source::{Format, Source};
+
+    #[test]
+    fn strips_windows_verbatim_prefix() {
+        // A canonicalized Windows path (from `--root` or fs::canonicalize) reaching the SQL engine
+        // must lose its `\\?\` prefix, else DataFusion's ListingTableUrl panics with
+        // "to_file_path() failed to produce an absolute Path".
+        assert_eq!(
+            datafusion_path(r"\\?\C:\data\orders.parquet"),
+            r"C:\data\orders.parquet"
+        );
+        assert_eq!(
+            datafusion_path(r"\\?\UNC\server\share\t.csv"),
+            r"\\server\share\t.csv"
+        );
+        // Plain paths (the non-Windows case, and already-clean Windows paths) pass through.
+        assert_eq!(datafusion_path("/home/u/t.parquet"), "/home/u/t.parquet");
+        assert_eq!(datafusion_path(r"C:\data\t.csv"), r"C:\data\t.csv");
+    }
 
     #[test]
     fn profile_rejects_scan_zero() {
