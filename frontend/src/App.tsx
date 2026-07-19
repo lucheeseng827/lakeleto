@@ -327,7 +327,7 @@ export function App() {
 
       {err && <div style={{ padding: "var(--space-4) var(--gutter)" }}><Banner tone="err">{err}</Banner></div>}
 
-      <div style={{ flex: "1 1 auto", display: "flex", minHeight: 0 }}>
+      <div style={{ flex: "1 1 auto", display: "flex", minHeight: 0, overflow: "hidden" }}>
         {showSidebar && (
           <Sidebar ws={ws} listing={listing} mutate={mutate}
             onOpenConnection={openConnection} onOpenQuery={openQuery} onRunFolder={runFolder}

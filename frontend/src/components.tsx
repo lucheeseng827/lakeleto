@@ -221,7 +221,12 @@ export function DataGrid({ columns = [], rows = [], sort = null, onSort, filters
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", minHeight: 0, ...style }}>
+    // The header + body are `width: totalWidth` (sum of column widths), which can exceed the
+    // viewport. This root MUST own the horizontal scroll and clip to its flex box, else the wide
+    // grid paints OUTSIDE <main> and overlaps the side panels (Row detail / History). minWidth:0
+    // lets it shrink inside the flex row; overflowX scrolls the columns; the body keeps its own
+    // vertical scroll so the header row stays put.
+    <div style={{ display: "flex", flexDirection: "column", minHeight: 0, flex: "1 1 auto", minWidth: 0, overflowX: "auto", overflowY: "hidden", ...style }}>
       <div style={{ overflow: "hidden", flex: "0 0 auto", borderBottom: "var(--border-hairline)", width: totalWidth }}>
         <div style={{ display: "flex" }}>
           {columns.map((c) => {

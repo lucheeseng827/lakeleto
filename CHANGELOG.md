@@ -8,6 +8,21 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.1.2] - 2026-07-20
+
+### Fixed
+- **SQL/grid over `.tsv` files.** DataFusion's `register_csv` gates on a `.csv`
+  extension and rejected `.tsv` (or `--format tsv` over any name) with
+  "File path '….tsv' does not match the expected extension '.csv'". The reader
+  is now told the file's real extension.
+- **Grid "contains" filter on non-text columns.** A substring filter on a
+  numeric/bool/temporal column errored ("There isn't a common type to coerce
+  Float64 and Utf8 in LIKE expression"); the column is now cast to text so
+  contains works on any type.
+- **Grid overlapping the side panels.** With the Row-detail and History panels
+  open, the wide data grid painted over them — the grid now owns its horizontal
+  scroll and clips to its box.
+
 ## [0.1.1] - 2026-07-20
 
 ### Fixed

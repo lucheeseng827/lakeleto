@@ -55,6 +55,17 @@ impl DataFusionEngine {
 
     fn register(&self, ctx: &SessionContext, table: &NamedSource) -> Result<()> {
         let path = datafusion_path(&table.source.path.to_string_lossy());
+        // DataFusion's register_csv validates the path against CsvReadOptions.file_extension
+        // (default ".csv") and rejects anything else — a `.tsv` (or `--format tsv` over any name)
+        // errors with "File path '...' does not match the expected extension '.csv'". Tell it the
+        // file's real extension so the delimiter-driven reader accepts it. An extensionless path
+        // gets "" (ends_with("") is always true → no gate), which is what we want for an explicit
+        // single file.
+        let ext = std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
         self.rt.block_on(async {
             match table.source.format {
                 Format::Parquet => ctx
@@ -65,7 +76,9 @@ impl DataFusionEngine {
                     .register_csv(
                         &table.name,
                         &path,
-                        CsvReadOptions::default().delimiter(table.source.format.delimiter()),
+                        CsvReadOptions::default()
+                            .delimiter(table.source.format.delimiter())
+                            .file_extension(&ext),
                     )
                     .await
                     .map_err(|e| EngineError::Query(e.to_string())),
@@ -269,7 +282,15 @@ fn build_where(filters: &[FilterSpec]) -> String {
         .map(|f| {
             let id = quote_ident(&f.column);
             match f.op {
-                FilterOp::Contains => format!("{id} LIKE {}", sql_str(&format!("%{}%", f.value))),
+                // Cast to text first: the grid's "contains" box is applied to any column, but
+                // `LIKE` only plans over Utf8 — DataFusion refuses to coerce e.g. Float64 to Utf8
+                // ("There isn't a common type to coerce Float64 and Utf8 in LIKE expression").
+                // CAST(col AS VARCHAR) makes substring search work on numeric/bool/temporal columns
+                // too (NULLs cast to NULL → excluded, as expected).
+                FilterOp::Contains => format!(
+                    "CAST({id} AS VARCHAR) LIKE {}",
+                    sql_str(&format!("%{}%", f.value))
+                ),
                 FilterOp::Eq => format!("{id} = {}", sql_str(&f.value)),
                 FilterOp::Ne => format!("{id} <> {}", sql_str(&f.value)),
                 FilterOp::Lt => format!("{id} < {}", sql_str(&f.value)),
@@ -363,6 +384,56 @@ mod tests {
         assert!(matches!(err, EngineError::Query(_)), "got: {err}");
         // A positive scan limit still profiles fine.
         assert!(DataFusionEngine::new().profile(&source, 100).is_ok());
+    }
+
+    #[test]
+    fn contains_filter_casts_column_to_text() {
+        use super::build_where;
+        use crate::engine::{FilterOp, FilterSpec};
+        // "contains" must plan over any column type — cast to VARCHAR so LIKE doesn't fail
+        // coercing a numeric column against a text pattern.
+        let w = build_where(&[FilterSpec {
+            column: "amount_usd".into(),
+            op: FilterOp::Contains,
+            value: "12".into(),
+        }]);
+        assert_eq!(w, r#" WHERE CAST("amount_usd" AS VARCHAR) LIKE '%12%'"#);
+    }
+
+    #[test]
+    fn contains_filter_matches_numeric_rows() {
+        // End-to-end: a substring filter over a numeric column returns rows instead of erroring.
+        let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/people.csv");
+        let source = Source::with_format(csv, Format::Csv);
+        use crate::engine::{FilterOp, FilterSpec, ScanSpec};
+        let spec = ScanSpec {
+            limit: 100,
+            filters: vec![FilterSpec {
+                column: "score".into(), // numeric column in people.csv (id,name,city,score,active)
+                op: FilterOp::Contains,
+                value: "3".into(),
+            }],
+            ..ScanSpec::default()
+        };
+        // The point is that planning succeeds (no type-coercion error), not the exact count.
+        DataFusionEngine::new().scan(&source, &spec).unwrap();
+    }
+
+    #[test]
+    fn reads_tsv_via_sql_engine() {
+        // DataFusion rejected non-.csv extensions ("does not match the expected extension
+        // '.csv'"); the sql engine must read a .tsv (tab-delimited) file.
+        let tsv = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/mini.tsv");
+        let source = Source::with_format(tsv, Format::Tsv);
+        let eng = DataFusionEngine::new();
+        let schema = eng.schema(&source).unwrap();
+        // Tab-split gives the 4 real columns, not one giant column.
+        assert_eq!(schema.columns.len(), 4, "schema: {schema:?}");
+        let rb = eng.query("SELECT count(*) AS c FROM t", &[crate::engine::NamedSource {
+            name: "t".into(),
+            source,
+        }]).unwrap();
+        assert_eq!(rb.num_rows(), 1);
     }
 
     #[test]
