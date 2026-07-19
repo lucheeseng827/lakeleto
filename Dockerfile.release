@@ -1,0 +1,21 @@
+# Release image — assembles the distroless container from the ALREADY-BUILT static musl
+# binaries (the release build matrix produced them natively/cross in ~2 min each). No compile
+# here, so multi-arch buildx is seconds instead of a ~30-min emulated arm64 cargo+LTO build.
+#
+# The docker job stages `lakeleto-amd64` and `lakeleto-arm64` into the build context; buildx sets
+# TARGETARCH per platform, so each image gets its matching static binary. Each staged binary was
+# built with `--features serve,sql,iceberg,object-store`, so the SPA bundle is already embedded.
+# For a from-source local build use the plain ./Dockerfile instead.
+#
+# distroless/static carries just the static-musl binary — no dynamic glibc needed.
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+LABEL org.opencontainers.image.source="https://github.com/lucheeseng827/lakeleto" \
+      org.opencontainers.image.description="Lakeleto — instant local lakehouse-table explorer (Parquet/CSV/Iceberg) in a single binary" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY lakeleto-${TARGETARCH} /usr/local/bin/lakeleto
+# `lakeleto serve` binds 127.0.0.1:8080 by default (env LAKELETO_ADDR). In a container pass
+# `serve --addr 0.0.0.0:8080` so the listener is reachable from outside the network namespace.
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/lakeleto"]
+CMD ["--help"]

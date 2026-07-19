@@ -1,0 +1,24 @@
+{
+  "name": "lakeleto-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Lakeleto explorer — Vite + React + TS multi-tab workspace UI (Grid/Schema/Profile/SQL per tab, saved connections/queries, run history + cached results, export/import) wired to the /v1/* backend, compiled to dist/ and embedded in the lakeleto binary (--features serve).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource/jetbrains-mono": "^5.2.8",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

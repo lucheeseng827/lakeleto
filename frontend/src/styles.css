@@ -1,0 +1,72 @@
+/* Lakeleto design system — tokens + globals.
+   Verbatim from the Lakeleto Design System export (tokens/colors|typography|spacing|effects.css
+   + the app <style> block). Semantic-first: components think in --bg/--fg/--accent. */
+
+/* Self-hosted (no external network request — required for the air-gapped/embedded
+   deploy this bundle ships in, and avoids sending visitor IPs to Google's CDN). */
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/600.css';
+
+:root {
+  /* --- semantic color aliases (the real tokens components use) --- */
+  --bg: #fff;            /* app background, control fills */
+  --fg: #1a1d21;         /* primary text */
+  --muted: #6b7280;      /* secondary text, type sublabels, hints */
+  --line: #e5e7eb;       /* every hairline: borders, dividers, cell rules */
+  --accent: #2563eb;     /* the single accent */
+  --accent-fg: #fff;     /* text on accent */
+  --panel: #f8fafc;      /* header / toolbar / grid-chrome / table-head fill */
+  --null: #b0b6c0;       /* null-cell text (the "·" glyph) */
+  --err-bg: #fef2f2;     --err-fg: #b91c1c;
+  --chip: #eef2ff;       --chip-fg: #3730a3;
+  --hover: #f1f5f9;      /* hover state on rows and controls */
+  --warn-bg: #fffbeb;    --warn-fg: #92600a;
+  --sel: #dbeafe;        /* selected / copied cell, drag-over header */
+
+  /* --- typography --- */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, "Liberation Mono", monospace;
+  --text-xs: 10px;   --text-sm: 11px;  --text-12: 12px;  --text-base: 13px;  --text-ui: 14px;
+  --line-tight: 1.2; --line-body: 1.5;
+  --weight-normal: 400; --weight-semibold: 600; --weight-h1: 650;
+  --row-height: 28px;
+
+  /* --- spacing --- */
+  --space-1: 2px; --space-2: 3px; --space-3: 5px; --space-4: 6px; --space-5: 8px;
+  --space-6: 9px; --space-7: 10px; --space-8: 12px; --space-9: 14px;
+  --pad-control: 6px 10px; --pad-input: 6px 9px; --pad-chrome: 10px 14px;
+  --pad-toolbar: 8px 14px; --pad-cell: 5px 8px; --gutter: 14px;
+
+  /* --- effects --- */
+  --radius-sm: 5px; --radius-md: 7px; --radius-lg: 8px; --radius-pill: 999px;
+  --border-hairline: 1px solid var(--line); --border-width: 1px;
+  --shadow-popover: 0 6px 24px rgba(0, 0, 0, .15);
+  --accent-underline: 2px; --flash-duration: 500ms;
+}
+
+/* Dark mode ships via prefers-color-scheme — same token names, new values. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1116; --fg: #e6e8eb; --muted: #9099a6; --line: #232a33; --accent: #3b82f6;
+    --accent-fg: #0e1116; --panel: #151a21; --null: #545b66; --err-bg: #2a1618; --err-fg: #f87171;
+    --chip: #1e2637; --chip-fg: #93b4ff; --hover: #1a2029; --warn-bg: #2a2410; --warn-fg: #e0b64a; --sel: #1e3a5f;
+  }
+}
+/* Explicit opt-in theme scope. */
+:root[data-theme="dark"] {
+  --bg: #0e1116; --fg: #e6e8eb; --muted: #9099a6; --line: #232a33; --accent: #3b82f6;
+  --accent-fg: #0e1116; --panel: #151a21; --null: #545b66; --err-bg: #2a1618; --err-fg: #f87171;
+  --chip: #1e2637; --chip-fg: #93b4ff; --hover: #1a2029; --warn-bg: #2a2410; --warn-fg: #e0b64a; --sel: #1e3a5f;
+}
+
+/* --- app globals (from the SPA <style> block) --- */
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--fg);
+  font-family: var(--font-sans); font-size: var(--text-ui); line-height: var(--line-body);
+}
+#root { height: 100vh; display: flex; flex-direction: column; }
+a { color: var(--accent); }
+a:hover { color: var(--accent); opacity: .8; }
+code { font-family: var(--font-mono); }
+* { box-sizing: border-box; }

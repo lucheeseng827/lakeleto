@@ -1,0 +1,121 @@
+[workspace]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[package]
+name = "lakeleto"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Lakeleto — instant local lakehouse-table explorer (\"the Postman of lakehouse tables\"): reads Parquet + CSV (and Iceberg tables with --features iceberg), all behind one pluggable Engine trait; a DuckDB backend and a hosted Lakeleto Cloud are on the roadmap. MVP: schema / head / profile / grid."
+repository = "https://github.com/lucheeseng827/lakeleto"
+publish = true
+
+[lib]
+name = "lakeleto"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lakeleto"
+path = "src/main.rs"
+
+# cargo-binstall: fetch the prebuilt `lakeleto` binary from a GitHub release instead of
+# compiling — part of the "frictionless distribution" MVP lever (no account, no server,
+# works air-gapped). `{ repo }` resolves from `repository` above (rewritten to the public
+# mirror on OSS sync); asset names match the release workflow's `lakeleto-<target>.<ext>`.
+# Inert in the monorepo; the OSS sync flips `publish` so the standalone `lakeleto` crate
+# publishes to crates.io.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/lakeleto-{ target }{ archive-suffix }"
+bin-dir = "lakeleto{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+# --- Design note: engine is a commodity BEHIND a trait -----------------------------
+# The whole thesis of #25 Lakeleto is "engine is commodity -> pure UX". So the crate is built
+# around one `Engine` trait (src/engine/mod.rs) and the UI is meant to bind to that trait,
+# never to a concrete engine. The DEFAULT build is the pure-Rust `local` reader
+# (arrow + parquet + csv) — it always compiles, fast, no C++ toolchain, so
+# `cargo build -p lakeleto` (and the workspace CI) stays lean. Everything heavier is an
+# OFF-BY-DEFAULT feature (same pattern as module_52/edgeguard-ner's `onnx` gate):
+#   sql     -> DataFusion SQL engine (datafusion 54, pinned in lockstep with module_62)
+#   remote  -> RemoteEngine over HTTP: the paid "Lakeleto Cloud" SaaS seam behind the same trait
+#   iceberg -> Apache Iceberg table reader (Phase 2 — wire iceberg-rust here)
+#   duckdb  -> DuckDB backend (the Radar's cited commodity engine; Phase 2, C++ toolchain)
+# ADR: docs/ADR-0001-local-engine-first.md answers "local engine first, SaaS behind the trait".
+
+[dependencies]
+# CLI surface: schema / head / profile / info / engines / query
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"                                          # in-memory Parquet windows (workspace result sync); already in-tree via arrow/parquet
+unicode-width = "0.2"                                # terminal display width for aligned tables (CJK/emoji)
+
+# --- local reader engine (DEFAULT, pure Rust) ---------------------------------------
+# arrow-array/-schema directly (not the umbrella `arrow` crate) keeps the tree lean; the
+# 58 line is pinned in lockstep with module_62 (datafusion 54 -> arrow/parquet 58.3) so a
+# single Arrow major lives in the workspace and RecordBatches are shared across modules.
+arrow-array = "58"
+arrow-schema = "58"
+arrow-cast = "58"                                    # display::ArrayFormatter — type-aware cell rendering
+arrow-csv = "58"                                     # CSV schema inference + reader/writer
+arrow-json = "58"                                    # RecordBatch -> JSON / NDJSON output
+# Arrow compute kernels powering the grid's server-side sort + filter (the "pushed to Arrow
+# compute kernels" path): arrow-ord (sort_to_indices + cmp), arrow-select (filter/take/concat).
+arrow-ord = "58"
+arrow-select = "58"
+parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+
+# --- optional engine backends + server (all OFF by default; heavy compiles stay opt-in) --
+datafusion = { version = "54", optional = true }     # `sql` — full SQL engine over the same trait
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"], optional = true }  # `remote` — Lakeleto Cloud seam
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }  # `sql`/`serve` — async runtime
+axum = { version = "0.8", optional = true }          # `serve` — the HTTP/JSON backend the SPA + Lakeleto Cloud speak
+# `debug-embed` embeds the SPA bundle even in debug builds, so `lakeleto serve`/`lakeleto open` are
+# self-contained (no runtime dependency on the source tree) from any working directory.
+rust-embed = { version = "8", features = ["debug-embed"], optional = true }  # `serve` — embed frontend/dist/ into the binary
+serde_urlencoded = { version = "0.7", optional = true }  # `serve` — parse repeated `filter=` grid params
+# `iceberg` — read Apache Iceberg tables self-contained on arrow 58 (no iceberg-datafusion, which
+# is pinned to datafusion 52): parse metadata.json + the Avro manifest-list/manifests to find the
+# current snapshot's Parquet data files, then read them with the existing arrow-58 parquet reader.
+apache-avro = { version = "0.17", optional = true }
+# `object-store` — BYO-credential reads of s3://, gs://, az:// tables ("sits next to your cloud
+# data"). Pinned to the object_store 0.13 that `parquet`'s `object_store` feature also uses, so
+# the async ParquetObjectReader type-matches. rustls (native roots) TLS; no C toolchain.
+object_store = { version = "0.13", default-features = false, features = ["aws", "gcp", "azure"], optional = true }
+url = { version = "2", optional = true }             # `object-store` — parse s3://… URIs
+futures = { version = "0.3", optional = true }        # `object-store` — drive the async parquet stream
+
+[features]
+default = []
+sql = ["dep:datafusion", "dep:tokio"]
+remote = ["dep:reqwest"]
+# `serve` exposes the Engine trait as an HTTP/JSON API (`lakeleto serve`) + the embedded SPA shell
+# (`lakeleto open`) — the same contract the localhost UI and the RemoteEngine/Lakeleto-Cloud client
+# both speak. Add `sql` too (`--features serve,sql`) for a working `POST /v1/query`.
+serve = ["dep:axum", "dep:rust-embed", "dep:serde_urlencoded", "dep:tokio", "tokio/net", "tokio/macros", "tokio/signal"]
+# self-contained Iceberg reader (metadata + Avro manifests → Parquet data files, incl. positional
+# merge-on-read deletes). snappy/zstandard let it read compressed manifests (snap/zstd are already
+# in the tree via parquet, so no new heavy deps); deflate is built into apache-avro.
+iceberg = ["dep:apache-avro", "apache-avro/snappy", "apache-avro/zstandard"]
+# `object-store` reads remote Parquet/CSV with the user's own env credentials; enables
+# parquet/object_store for the ranged async reader and a shared multi-thread Tokio runtime.
+object-store = [
+    "dep:object_store", "dep:url", "dep:futures",
+    "dep:tokio", "tokio/rt-multi-thread", "tokio/net", "tokio/time",
+    "parquet/object_store",
+]
+duckdb = []    # Phase 2: alternate commodity backend (libduckdb-sys, C++ toolchain)
+
+[dev-dependencies]
+tempfile = "3"                                       # write throwaway parquet/csv fixtures in tests
+tower = { version = "0.5", features = ["util"] }     # ServiceExt::oneshot — drive the `serve` router in tests, no socket

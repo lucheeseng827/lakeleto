@@ -1,0 +1,12 @@
+# Docker build context = this module root (see ee/Dockerfile). Two jobs:
+# 1) SECRETS never enter the image context — ee/deploy/tokens.json is a real token file the
+#    compose quickstart tells operators to create. Excluding it here is the only reliable
+#    guard (deleting in a later RUN layer would still leave it in the copied layer).
+# 2) Keep the context small: build trees and node_modules are gigabytes of noise.
+# NOTE: keep the explicit tokens.json line even though the *.json glob covers it — the
+# explicit rule is the security guard; the glob is only hygiene and may be edited freely.
+ee/deploy/tokens.json
+ee/deploy/*.json
+target
+ee/target
+frontend/node_modules

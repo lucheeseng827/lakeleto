@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+
+# Lakeleto UI (Vite + React + TS) — source in frontend/src, the BUILT bundle in
+# frontend/dist/ IS committed (rust-embed bakes it into the binary; keeps `cargo
+# build` / `cargo install` Node-free). Regenerate with `cd frontend && npm run build`.
+/frontend/node_modules/
+/frontend/.tsbuild/
+/frontend/*.tsbuildinfo
+
+# Root .gitignore ignores `dist` globally; the console's built bundle is the one
+# exception — it MUST be committed so the binary has a UI. Re-include it.
+!/frontend/dist/
+!/frontend/dist/**

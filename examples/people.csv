@@ -1,0 +1,9 @@
+id,name,city,score,active
+1,Ada,London,91.5,true
+2,Grace,New York,88.0,false
+3,Linus,Helsinki,,true
+4,Alan,London,79.25,true
+5,Katherine,Hampton,95.0,
+6,Edsger,Rotterdam,84.0,false
+7,Barbara,New York,,true
+8,Donald,Pittsburgh,90.5,true

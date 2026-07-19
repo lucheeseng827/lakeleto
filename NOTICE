@@ -1,0 +1,50 @@
+Lakeleto — instant local lakehouse-table explorer
+Copyright 2026 Lakeleto contributors
+
+This product includes software developed by the Lakeleto contributors.
+
+The OSS engine (the `lakeleto` binary and library, the `lakeleto` crate at the
+module root) is licensed under the Apache License, Version 2.0 (see ./LICENSE).
+
+The paid `ee/lakeleto-cloud` plane is licensed under the Elastic License 2.0
+(ELv2). It is source-available, not open source. `ee/` is a separate workspace
+and is never packaged into the public engine crate published to crates.io.
+
+================================================================================
+Third-party dependencies
+================================================================================
+
+This software builds on third-party open-source components, each under its own
+license (see each crate's own license metadata and the generated SBOM for the
+authoritative, version-pinned list). Notable runtime dependencies include:
+
+  - arrow-array, arrow-schema,   (Apache-2.0)     — columnar in-memory data +
+    arrow-cast, arrow-csv,                           CSV/JSON/TSV I/O and the
+    arrow-json, arrow-ord,                           sort/filter compute kernels
+    arrow-select                                     that back the grid
+  - parquet                      (Apache-2.0)     — Parquet reader (default local
+                                                     engine), ranged + footer stats
+  - clap                         (MIT / Apache-2.0)— CLI parsing
+  - serde, serde_json            (MIT / Apache-2.0)— serialization
+  - thiserror                    (MIT / Apache-2.0)— error handling
+  - bytes                        (MIT)            — in-memory Parquet windows
+  - unicode-width                (MIT / Apache-2.0)— aligned terminal tables
+
+Optional, feature-gated dependencies (off by default — the lean local reader is
+the only default build):
+
+  - datafusion                   (Apache-2.0)     — `sql`: read-only SQL engine
+  - apache-avro                  (Apache-2.0)     — `iceberg`: parse Iceberg
+                                                     metadata + Avro manifests
+  - object_store                 (Apache-2.0 / MIT)— `object-store`: BYO-cred
+                                                     s3://, gs://, az:// reads
+  - url, futures                 (MIT / Apache-2.0)— `object-store` plumbing
+  - axum                         (MIT)            — `serve`: HTTP/JSON API
+  - rust-embed                   (MIT)            — `serve`: embed the SPA bundle
+  - serde_urlencoded             (MIT / Apache-2.0)— `serve`: grid query params
+  - tokio                        (MIT)            — `sql`/`serve`/`object-store`
+                                                     async runtime
+  - reqwest                      (MIT / Apache-2.0)— `remote`: Lakeleto Cloud seam
+
+A complete, version-pinned dependency manifest with licenses is produced as a
+CycloneDX SBOM at release time (see RELEASING.md).
