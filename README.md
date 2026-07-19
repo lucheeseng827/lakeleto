@@ -159,6 +159,10 @@ tar xzf lakeleto-x86_64-unknown-linux-musl.tar.gz    # -> ./lakeleto
 
 ### Once it's open in the browser
 
+> **New here?** The [**usage guide**](docs/GUIDE.md) walks through real workflows —
+> viewing daily data, batch-querying many files at once (*Run across*), and reading
+> your S3/GCS/Azure data locally — with copy-paste examples.
+
 Point at a file or a folder and you get, with no setup:
 
 - **Grid** — scroll the rows; type in a column's **filter** box (substring by default, or prefix `>` `<` `>=` `<=` `=` `!=` for comparisons); click a header to **sort**; click a cell to copy it; click a row for full **Row detail**.

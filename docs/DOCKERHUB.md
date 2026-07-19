@@ -49,3 +49,91 @@ serves the UI.
   then renders a virtualized grid — larger-than-memory Parquet, click-to-sort,
   per-column filters — with Schema / Profile / SQL tabs. The current view exports to
   CSV / JSON / Parquet.
+
+## Quick start — serve your local data
+
+Mount a folder of data read-only and open the UI in your browser:
+
+```bash
+docker run --rm -p 8080:8080 -v "$PWD:/data:ro" \
+  mancube/lakeleto serve --addr 0.0.0.0:8080 --root /data
+# open http://localhost:8080  and browse anything under the folder you mounted
+```
+
+Three parts to remember:
+
+- **`-v "$PWD:/data:ro"`** — mount your data into the container at `/data` (read-only).
+  Swap `$PWD` for any folder, e.g. `-v /home/me/exports:/data:ro`.
+- **`--addr 0.0.0.0:8080`** — bind *all* interfaces **inside** the container. The default
+  `127.0.0.1` is only reachable from within the container, so the host couldn't see it.
+  `-p 8080:8080` then maps it to your machine's port 8080.
+- **`--root /data`** — confine every read/browse to the mounted folder (nothing outside it).
+
+**Windows (PowerShell):**
+
+```powershell
+docker run --rm -p 8080:8080 -v "${PWD}:/data:ro" mancube/lakeleto serve --addr 0.0.0.0:8080 --root /data
+# or a specific folder:
+docker run --rm -p 8080:8080 -v "C:\Users\you\data:/data:ro" mancube/lakeleto serve --addr 0.0.0.0:8080 --root /data
+```
+
+## One-shot inspection (no server)
+
+The entrypoint is the `lakeleto` binary, so any subcommand works — handy in CI or a
+`Makefile`:
+
+```bash
+docker run --rm -v "$PWD:/data:ro" mancube/lakeleto schema  /data/orders.parquet
+docker run --rm -v "$PWD:/data:ro" mancube/lakeleto profile /data/orders.csv
+docker run --rm -v "$PWD:/data:ro" mancube/lakeleto head    /data/events.parquet -n 20
+```
+
+## Read S3 / GCS / Azure (your credentials, no mount)
+
+Point at an object-store URI and pass credentials as env — no volume needed, nothing is
+uploaded, the bytes stream straight from your bucket:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_REGION \
+  mancube/lakeleto serve --addr 0.0.0.0:8080
+# then in the UI, open:  s3://my-bucket/warehouse/
+```
+
+Notes: omit `--root` when reading remote URIs (it confines to a *local* dir and refuses
+object-store URIs). Also works for `gs://` (`GOOGLE_APPLICATION_CREDENTIALS`) and `az://`
+(`AZURE_STORAGE_ACCOUNT_NAME` / `_KEY`); S3-compatible stores (MinIO, R2) via `AWS_ENDPOINT`.
+
+## docker compose
+
+```yaml
+services:
+  lakeleto:
+    image: mancube/lakeleto:latest
+    ports: ["8080:8080"]
+    volumes: ["./data:/data:ro"]
+    command: ["serve", "--addr", "0.0.0.0:8080", "--root", "/data"]
+```
+
+## Expose it safely
+
+Behind a shared host or proxy, require a bearer token on every `/v1/*` call:
+
+```bash
+docker run --rm -p 8080:8080 -v /srv/data:/data:ro \
+  -e LAKELETO_TOKEN=change-me \
+  mancube/lakeleto serve --addr 0.0.0.0:8080 --root /data
+# every API call now needs:  Authorization: Bearer change-me
+```
+
+Prefer a reverse proxy with TLS (or an SSH tunnel) over publishing the port directly.
+
+## Good to know
+
+- **Tags:** `:latest` and `:vX.Y.Z` (pin a version for reproducibility).
+- **Multi-arch:** `linux/amd64` + `linux/arm64`. Each image is cosign-signed and carries
+  SLSA build provenance.
+- **Distroless:** no shell in the image (smaller, less attack surface), so
+  `docker exec … sh` won't work by design — inspect from the host instead.
+- Full command/flag reference and more worked examples: the
+  [usage guide](https://github.com/lucheeseng827/lakeleto/blob/main/docs/GUIDE.md).
