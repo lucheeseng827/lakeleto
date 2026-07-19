@@ -77,7 +77,7 @@ sequenceDiagram
     participant E as Engine (sql | local)
     participant W as WorkspaceStore
 
-    UI->>S: POST /v1/workspaces/{id}/runs {sql?, path, preview}
+    UI->>S: POST /v1/workspaces/id/runs (sql, path, preview)
     S->>G: confine_entry / confine_members(path)
     alt outside --root
         G-->>UI: 403 (nothing recorded)
@@ -85,14 +85,14 @@ sequenceDiagram
         S->>E: query(sql, t=path) or preview(path, cap)
         alt engine ok
             E-->>S: RowBatch
-            S->>W: append_run(rec ok, rows) → results/&lt;run-id&gt;.parquet
-            S-->>UI: {run, preview rows}
-            UI->>S: GET /v1/workspaces/{id}/runs/{run_id}?offset=&limit=
-            S->>W: run_result(...) — windowed read of the cached Parquet
+            S->>W: append_run(ok, rows) writes results/run-id.parquet
+            S-->>UI: run + preview rows
+            UI->>S: GET /v1/workspaces/id/runs/run_id (windowed by offset, limit)
+            S->>W: run_result(...) windowed read of the cached Parquet
             W-->>UI: rows (no re-scan)
         else engine error
-            S->>W: append_run(rec error)
-            S-->>UI: 4xx/5xx {error}
+            S->>W: append_run(error)
+            S-->>UI: 4xx/5xx error
         end
     end
 ```
@@ -158,6 +158,13 @@ visible rows over a spacer sized to the total, fetching windows from `/v1/rows` 
 it browses larger-than-memory Parquet. Hiding/reordering columns pushes a projection (`cols=`)
 so the fetch and the download match what's on screen. Non-API routes fall back to the SPA;
 `/v1/*` misses return `404` JSON.
+
+![Lakeleto workspace — a SQL result grid over a local CSV, with the file browser and query history](docs/screenshots/lakeleto-sql-workspace.png)
+
+The multi-tab workbench: saved queries, per-tab variables, run history, and multiple
+connections — every query cached to a re-openable result.
+
+![Lakeleto workbench — saved queries, variables, and run history across multiple tabs](docs/screenshots/lakeleto-workbench.png)
 
 | Method | Path | Purpose |
 |--------|------|---------|
