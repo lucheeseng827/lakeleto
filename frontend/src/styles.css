@@ -22,6 +22,8 @@
   --hover: #f1f5f9;      /* hover state on rows and controls */
   --warn-bg: #fffbeb;    --warn-fg: #92600a;
   --sel: #dbeafe;        /* selected / copied cell, drag-over header */
+  --scroll-thumb: rgba(17, 24, 39, .48);       /* modern pill scrollbar (>=3:1 resting contrast) */
+  --scroll-thumb-hover: rgba(17, 24, 39, .64);
 
   /* --- typography --- */
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -50,6 +52,7 @@
     --bg: #0e1116; --fg: #e6e8eb; --muted: #9099a6; --line: #232a33; --accent: #3b82f6;
     --accent-fg: #0e1116; --panel: #151a21; --null: #545b66; --err-bg: #2a1618; --err-fg: #f87171;
     --chip: #1e2637; --chip-fg: #93b4ff; --hover: #1a2029; --warn-bg: #2a2410; --warn-fg: #e0b64a; --sel: #1e3a5f;
+    --scroll-thumb: rgba(230, 232, 235, .46); --scroll-thumb-hover: rgba(230, 232, 235, .64);
   }
 }
 /* Explicit opt-in theme scope. */
@@ -57,6 +60,15 @@
   --bg: #0e1116; --fg: #e6e8eb; --muted: #9099a6; --line: #232a33; --accent: #3b82f6;
   --accent-fg: #0e1116; --panel: #151a21; --null: #545b66; --err-bg: #2a1618; --err-fg: #f87171;
   --chip: #1e2637; --chip-fg: #93b4ff; --hover: #1a2029; --warn-bg: #2a2410; --warn-fg: #e0b64a; --sel: #1e3a5f;
+    --scroll-thumb: rgba(230, 232, 235, .46); --scroll-thumb-hover: rgba(230, 232, 235, .64);
+}
+/* Explicit light — re-asserts the light tokens so a user who toggles to Light wins over the
+   OS `prefers-color-scheme: dark` above (attribute selector out-specifies the media `:root`). */
+:root[data-theme="light"] {
+  --bg: #fff; --fg: #1a1d21; --muted: #6b7280; --line: #e5e7eb; --accent: #2563eb;
+  --accent-fg: #fff; --panel: #f8fafc; --null: #b0b6c0; --err-bg: #fef2f2; --err-fg: #b91c1c;
+  --chip: #eef2ff; --chip-fg: #3730a3; --hover: #f1f5f9; --warn-bg: #fffbeb; --warn-fg: #92600a; --sel: #dbeafe;
+    --scroll-thumb: rgba(17, 24, 39, .48); --scroll-thumb-hover: rgba(17, 24, 39, .64);
 }
 
 /* --- app globals (from the SPA <style> block) --- */
@@ -70,3 +82,30 @@ a { color: var(--accent); }
 a:hover { color: var(--accent); opacity: .8; }
 code { font-family: var(--font-mono); }
 * { box-sizing: border-box; }
+
+/* --- modern scrollbars: thin track, rounded pill thumb (always visible) --- */
+/* Firefox (and any engine without ::-webkit-scrollbar support). Scoped away from
+   Chromium/WebKit on purpose: setting scrollbar-color/-width there makes the
+   engine ignore the ::-webkit-scrollbar rules below (CSS Scrollbars spec), which
+   would drop the rounded-pill thumb. */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scroll-thumb) transparent;
+  }
+}
+/* WebKit / Chromium / Edge / Safari */
+*::-webkit-scrollbar { width: 11px; height: 11px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: var(--radius-pill);
+  border: 3px solid transparent;   /* transparent border + padding-box clip = a slim inset pill */
+  background-clip: padding-box;
+  min-height: 32px;                /* keep the pill grabbable on long lists */
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner { background: transparent; }

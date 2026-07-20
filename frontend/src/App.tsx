@@ -8,8 +8,8 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { connectLakeleto, type Backend, type Conn, type Row, type RunRecord, type Workspace, type WorkspaceBundle, type WsConnection, type WsMeta, type WsSavedQuery } from "./api";
 import { Banner, Button, Chip } from "./components";
 import { TableView } from "./TableView";
-import { buildDoc, docToTabs, HistoryPanel, newDataTab, newTabId, resolveVars, ResultView, Sidebar, TabStrip, WorkspaceBar, basename, type OpenTab } from "./workspace";
-import { CommandPalette, CompareView, RowDetail, RunnerModal, type PaletteItem, type RunJob } from "./extras";
+import { buildDoc, docToTabs, HistoryPanel, newDataTab, newLauncherTab, newTabId, resolveVars, ResultView, Sidebar, TabStrip, WorkspaceBar, basename, type OpenTab } from "./workspace";
+import { CommandPalette, CompareView, LauncherView, RowDetail, RunnerModal, type PaletteItem, type RunJob } from "./extras";
 
 const qs = new URLSearchParams(location.search);
 const dirOf = (p: string) => { const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); return i > 0 ? p.slice(0, i) : "/data/warehouse"; };
@@ -65,6 +65,15 @@ export function App() {
   const renameTab = (id: string) => { const t = tabs.find((x) => x.id === id); if (!t) return; const n = window.prompt("Rename tab", t.title); if (n && n.trim()) patchTab(id, { title: n.trim() }); };
   const duplicateTab = () => { if (active && active.kind === "data") addTab({ ...active, id: newTabId(), title: active.title + " copy", sqlOut: null, sqlErr: null }); };
   const switchTab = (dir: number) => { if (!tabs.length) return; const i = Math.max(0, tabs.findIndex((t) => t.id === activeId)); setActiveId(tabs[(i + dir + tabs.length) % tabs.length].id); };
+  const reorderTabs = (fromId: string, toId: string) => setTabs((ts) => {
+    if (fromId === toId) return ts;
+    const from = ts.find((t) => t.id === fromId);
+    if (!from) return ts;
+    const rest = ts.filter((t) => t.id !== fromId);
+    const i = rest.findIndex((t) => t.id === toId);
+    rest.splice(i < 0 ? rest.length : i, 0, from);
+    return rest;
+  });
 
   const loadListingFor = (path: string) => backend && backend.list(dirOf(path)).then(setListing).catch(() => { /* ignore */ });
   const openDir = (d: string) => backend && backend.list(d).then((l) => { setListing(l); setErr(null); }).catch((e) => setErr((e as Error).message));
@@ -76,7 +85,18 @@ export function App() {
     else addTab(newDataTab(path, opts));
     loadListingFor(path);
   };
-  const openBlank = () => openPath(ws?.connections[0]?.path || "/data/warehouse/people.csv");
+  // `+` opens a launcher tab (a start page), not an arbitrary source.
+  const openLauncher = () => addTab(newLauncherTab());
+  // Launcher actions: create the chosen tab, then drop the launcher tab.
+  const launcherOpenPath = (launcherId: string, path: string) => {
+    openPath(path);
+    setTabs((ts) => ts.filter((t) => t.id !== launcherId));
+  };
+  const launcherNewQuery = (launcherId: string, c: WsConnection) => {
+    addTab(newDataTab(c.path, { sub: "SQL", connId: c.id, title: c.label }));
+    setTabs((ts) => ts.filter((t) => t.id !== launcherId));
+    loadListingFor(c.path);
+  };
 
   const loadHistory = async (id: string) => {
     if (!backend) return;
@@ -249,8 +269,24 @@ export function App() {
   };
   const importWorkspace = async (file: File) => {
     if (!backend) return;
+    // "Import" loads a *workspace bundle* (the .json from Export), NOT a data file. Guard the
+    // common mistake — picking a .csv/.parquet here — with a clear message instead of a raw
+    // "Unexpected token … is not valid JSON" from JSON.parse.
+    const looksLikeData = /\.(csv|tsv|parquet|json?l|ndjson|arrow)$/i.test(file.name);
+    let bundle: WorkspaceBundle;
     try {
-      const bundle = JSON.parse(await file.text()) as WorkspaceBundle;
+      bundle = JSON.parse(await file.text()) as WorkspaceBundle;
+    } catch {
+      setErr(looksLikeData
+        ? `"${file.name}" is a data file, not a workspace. To view data, open it from the file browser (or the address box) — "Import" only loads a workspace bundle exported via "Export".`
+        : `"${file.name}" isn't valid JSON. "Import" expects a Lakeleto workspace bundle (the .json from "Export").`);
+      return;
+    }
+    if (!bundle || typeof bundle !== "object" || !bundle.workspace || bundle.bundle_version == null) {
+      setErr(`"${file.name}" is JSON but not a Lakeleto workspace bundle (no workspace / bundle_version). Use a file exported via "Export".`);
+      return;
+    }
+    try {
       const w = await backend.wsImport(bundle);
       setWorkspaces(await backend.wsList()); await selectWorkspace(w.id);
     } catch (e) { setErr("Import failed: " + (e as Error).message); }
@@ -261,7 +297,7 @@ export function App() {
   kb.current = {
     palette: () => setPaletteOpen((v) => !v),
     run: () => { if (active && active.kind === "data" && active.sub === "SQL") runSql(active.id, active.sql); },
-    newTab: openBlank, close: () => { if (activeId) closeTab(activeId); },
+    newTab: openLauncher, close: () => { if (activeId) closeTab(activeId); },
     prev: () => switchTab(-1), next: () => switchTab(1), reopen: reopenClosed,
     sidebar: () => setShowSidebar((v) => !v),
     esc: () => { setPaletteOpen(false); setDetailRow(null); setRunner(null); },
@@ -295,7 +331,7 @@ export function App() {
 
   // ---- command palette items ----
   const paletteItems: PaletteItem[] = [
-    { icon: "＋", label: "New tab", hint: "Alt+T", run: openBlank },
+    { icon: "＋", label: "New tab", hint: "Alt+T", run: openLauncher },
     { icon: "⧉", label: "Duplicate current tab", run: duplicateTab },
     { icon: "✎", label: "Rename current tab", run: () => activeId && renameTab(activeId) },
     ...(active?.kind === "data" && active.sub === "SQL" ? [{ icon: "▶", label: "Run across connections…", hint: "current SQL", run: runAcross }] : []),
@@ -313,7 +349,7 @@ export function App() {
         workspaces={workspaces} wsId={wsId} onSelect={selectWorkspace} onNew={newWorkspace} onRename={renameWorkspace}
         onDelete={deleteWorkspace} onExport={exportWorkspace} onImport={importWorkspace} busy={saving} />
 
-      <TabStrip tabs={tabs} activeId={activeId} onSelect={setActiveId} onClose={closeTab} onNew={openBlank} onRename={renameTab} />
+      <TabStrip tabs={tabs} activeId={activeId} onSelect={setActiveId} onClose={closeTab} onNew={openLauncher} onRename={renameTab} onReorder={reorderTabs} />
 
       <div style={shellBar}>
         <Button size="sm" onClick={() => setShowSidebar((v) => !v)} title="toggle the sidebar (⌘B)">☰ Sidebar</Button>
@@ -335,13 +371,18 @@ export function App() {
         )}
 
         {active ? (
-          active.kind === "compare" ? <CompareView tab={active} />
+          active.kind === "launcher" ? (
+            <LauncherView connections={ws?.connections || []}
+              onOpenPath={(p) => launcherOpenPath(active.id, p)}
+              onNewQuery={(c) => launcherNewQuery(active.id, c)}
+              onBrowse={() => setPaletteOpen(true)} />
+          ) : active.kind === "compare" ? <CompareView tab={active} />
             : active.kind === "result" ? <ResultView tab={active} onOpenRow={setDetailRow} />
               : <TableView backend={conn.backend} conn={conn} tab={active} onPatch={(p) => patchTab(active.id, p)} onRunSql={(sql) => runSql(active.id, sql)} sqlAvailable={sqlAvailable} resolve={resolve} onOpenRow={setDetailRow} />
         ) : (
           <main style={{ flex: "1 1 auto", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)", flexDirection: "column", gap: 10 }}>
             <div>No open tabs.</div>
-            <Button variant="primary" onClick={openBlank}>Open a source</Button>
+            <Button variant="primary" onClick={openLauncher}>Open a source</Button>
             <Chip tone="neutral">or press ⌘K</Chip>
           </main>
         )}

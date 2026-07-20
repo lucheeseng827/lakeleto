@@ -1,8 +1,9 @@
 # Lakeleto — usage guide
 
-A task-oriented tour: start it, understand how it thinks, then four worked
-examples — **viewing daily data**, **exploring in the browser**, **batch-querying
-many files at once**, and **reading your S3 / GCS / Azure data locally**.
+A task-oriented tour: start it, understand how it thinks, then worked examples —
+**viewing daily data**, **exploring in the browser**, **batch-querying many files
+at once**, **reusable `{{variables}}`**, and **reading your S3 / GCS / Azure data
+locally**.
 
 Everything runs on your own machine. Lakeleto never uploads your data and needs
 no account or server.
@@ -165,7 +166,51 @@ over many sources.
 
 ---
 
-## 6. Example — read your S3 / GCS / Azure data locally
+## 6. Example — reusable values with variables (`{{...}}`)
+
+Variables are **Postman-style `{{key}}` placeholders**. They're resolved in **both the
+SQL and the path** right before a query runs — a literal text substitution
+(`{{key}}` → its value). They live per-workspace and persist.
+
+**Set one:** sidebar → **Variables** → **+ Variable** → a key and a value, e.g.
+`city = Singapore`, `min_amt = 100`, `day = 2026-07-18`.
+
+**Use in SQL** (the current source is the table `t`). Because it's a literal replace,
+**you write the quotes** for string values and leave numbers bare:
+
+```sql
+-- {{city}} → Singapore   (you supply the quotes)
+SELECT * FROM t WHERE city = '{{city}}'
+
+-- numeric → no quotes
+SELECT tier, count(*) AS n, round(avg(amount_usd), 2) AS avg_usd
+FROM t
+WHERE amount_usd > {{min_amt}}
+GROUP BY tier
+ORDER BY n DESC
+
+-- date / timestamp
+SELECT * FROM t WHERE order_ts >= TIMESTAMP '{{day}} 00:00:00'
+```
+
+**Use in the path box too** — swap the source without retyping it:
+
+```
+C:\exports\orders-{{day}}.parquet
+s3://my-bucket/events/{{day}}.parquet
+```
+
+Change `day` once and every tab/query that references `{{day}}` re-points.
+
+Notes:
+
+- It's a **literal substitution**, not a bound parameter — quote strings yourself,
+  leave numbers unquoted. (So don't paste untrusted text into a value.)
+- An **unresolved** `{{x}}` shows an "unset" warning chip in the toolbar until you
+  define it.
+- Pairs well with **Run across** (§5): one `{{min_amt}}` query fanned over many files.
+
+## 7. Example — read your S3 / GCS / Azure data locally
 
 Point Lakeleto at an object-store URI and it reads the table **with your own
 credentials and zero hosted compute** — the bytes go straight from your bucket to
@@ -216,7 +261,7 @@ Details worth knowing:
 
 ---
 
-## 7. Example — an Iceberg table
+## 8. Example — an Iceberg table
 
 Point at the table directory (the one containing `metadata/`):
 
@@ -231,7 +276,7 @@ an Iceberg table sitting in a bucket.
 
 ---
 
-## 8. Sharing it safely (beyond your own machine)
+## 9. Sharing it safely (beyond your own machine)
 
 By default `serve` binds to loopback (`127.0.0.1`) and the API is open — fine for
 your own machine. If you expose it (a shared box, a container), lock it down:
@@ -254,7 +299,7 @@ directly. See [OPERATIONS.md](OPERATIONS.md) and [DEPLOY.md](DEPLOY.md).
 
 ---
 
-## 9. Where things live · stopping · resetting
+## 10. Where things live · stopping · resetting
 
 - **Workspace state:** `~/.lakeleto/workspaces/<id>/` (`workspace.json`,
   `history.jsonl`, `results/*.parquet`). Override the base with `LAKELETO_HOME`.
@@ -262,7 +307,7 @@ directly. See [OPERATIONS.md](OPERATIONS.md) and [DEPLOY.md](DEPLOY.md).
 - **Reset a workspace:** delete its folder under `~/.lakeleto/workspaces/`, or use
   **Delete** in the workspace bar.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |

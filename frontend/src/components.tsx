@@ -1,7 +1,30 @@
 // Lakeleto design-system components — TSX ports of the Lakeleto Design System export.
 // Faithful to the shipped SPA: 1px hairlines, one accent, monospace data, CSS-var tokens.
-import { useState, type CSSProperties, type ReactNode, type KeyboardEvent } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode, type KeyboardEvent } from "react";
 import type { Column, Filters, Sort, Row } from "./api";
+
+/** Theme switch — cycles Auto → Light → Dark, persisted in localStorage. "auto" follows the OS
+ * (`prefers-color-scheme`); Light/Dark set `data-theme` on <html> and override the OS. */
+export function ThemeToggle() {
+  const read = (): "auto" | "light" | "dark" => {
+    const v = typeof localStorage !== "undefined" ? localStorage.getItem("lakeleto-theme") : null;
+    return v === "light" || v === "dark" ? v : "auto";
+  };
+  const [theme, setTheme] = useState<"auto" | "light" | "dark">(read);
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === "auto") { delete root.dataset.theme; localStorage.removeItem("lakeleto-theme"); }
+    else { root.dataset.theme = theme; localStorage.setItem("lakeleto-theme", theme); }
+  }, [theme]);
+  const next = { auto: "light", light: "dark", dark: "auto" } as const;
+  const face = { auto: "◐ Auto", light: "☀ Light", dark: "☾ Dark" } as const;
+  return (
+    <Button size="sm" onClick={() => setTheme((t) => next[t])}
+      title={`Theme: ${theme}${theme === "auto" ? " (follows your OS)" : ""} — click for ${next[theme]}`}>
+      {face[theme]}
+    </Button>
+  );
+}
 
 /* ---------- Button ---------- */
 export function Button({ variant = "default", size = "md", disabled = false, title, onClick, type = "button", children, style, ...rest }: {

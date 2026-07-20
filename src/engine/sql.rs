@@ -37,20 +37,31 @@ fn datafusion_path(path: &str) -> String {
     }
 }
 
-/// DataFusion-backed engine. Owns its own single-worker multi-threaded Tokio runtime so callers
-/// use the same synchronous [`Engine`] API as the local engine (no `async` leaks across the seam).
-pub struct DataFusionEngine {
-    rt: tokio::runtime::Runtime,
-}
-
-impl DataFusionEngine {
-    pub fn new() -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+/// The Tokio runtime the DataFusion engine drives its async reads on. It is a **process-wide
+/// static** (never dropped) on purpose: an owned `Runtime` stored on the engine would be dropped
+/// when the server's `AppState` drops at graceful shutdown — which happens *inside* the serve
+/// runtime's async context — panicking with "Cannot drop a runtime in a context where blocking is
+/// not allowed". A leaked static sidesteps that entirely. (Same pattern as `objstore::runtime`.)
+fn runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
-            .expect("build tokio runtime for DataFusion engine");
-        Self { rt }
+            .expect("build tokio runtime for DataFusion engine")
+    })
+}
+
+/// DataFusion-backed engine. Reads run on the shared static [`runtime`] via `block_on`, so callers
+/// use the same synchronous [`Engine`] API as the local engine (no `async` leaks across the seam).
+pub struct DataFusionEngine;
+
+impl DataFusionEngine {
+    pub fn new() -> Self {
+        // Touch the runtime so it is built eagerly (a bad build surfaces here, not mid-request).
+        let _ = runtime();
+        Self
     }
 
     fn register(&self, ctx: &SessionContext, table: &NamedSource) -> Result<()> {
@@ -66,7 +77,7 @@ impl DataFusionEngine {
             .and_then(|e| e.to_str())
             .map(|e| format!(".{e}"))
             .unwrap_or_default();
-        self.rt.block_on(async {
+        runtime().block_on(async {
             match table.source.format {
                 Format::Parquet => ctx
                     .register_parquet(&table.name, &path, ParquetReadOptions::default())
@@ -101,7 +112,7 @@ impl DataFusionEngine {
     }
 
     fn collect_sql(&self, ctx: &SessionContext, sql: &str) -> Result<RowBatch> {
-        self.rt.block_on(async {
+        runtime().block_on(async {
             let df = ctx
                 .sql(sql)
                 .await
@@ -139,7 +150,7 @@ impl Engine for DataFusionEngine {
 
     fn schema(&self, source: &Source) -> Result<TableSchema> {
         let ctx = self.ctx_for(source)?;
-        let arrow_schema = self.rt.block_on(async {
+        let arrow_schema = runtime().block_on(async {
             let df = ctx
                 .table("t")
                 .await
@@ -202,7 +213,7 @@ impl Engine for DataFusionEngine {
         for t in tables {
             self.register(&ctx, t)?;
         }
-        self.rt.block_on(async {
+        runtime().block_on(async {
             let df = ctx
                 .sql(sql)
                 .await

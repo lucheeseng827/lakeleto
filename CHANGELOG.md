@@ -8,6 +8,38 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.1.3] - 2026-07-20
+
+### Fixed
+- **Windows: `serve`/`open` no longer panic on Ctrl-C.** The DataFusion engine
+  owned a Tokio runtime that was dropped inside the serve runtime's async context
+  at graceful shutdown ("Cannot drop a runtime in a context where blocking is not
+  allowed"). The runtime is now a process-wide static, so nothing is dropped in an
+  async context.
+
+### Added
+- **Theme toggle** in the header — cycles Auto → Light → Dark and persists (Auto
+  follows the OS `prefers-color-scheme`).
+- **New-tab launcher** — the `+` button opens a start page to open a data source
+  (path/URI) or start a query on a saved connection.
+- **Drag to reorder** — tabs and the sidebar sections can be dragged to reorder;
+  sidebar order + collapse state persist.
+- **Collapsible sidebar sections**, with **Files** first and clearly navigable.
+- **Copy path** — the toolbar path is click-to-copy (and the Windows `\\?\`
+  verbatim prefix is stripped for display/copy).
+- **Version in the header** — `GET /v1/engines` now reports the running binary's
+  version, shown under the title.
+- **Modern scrollbars** — thin, always-visible rounded-pill scrollbars.
+
+### Changed
+- **Friendlier workspace import** — feeding a data file to "Import" (which loads a
+  workspace bundle) now explains the mistake instead of a raw JSON parse error.
+
+### Docs
+- New usage guide (`docs/GUIDE.md`) with a variables (`{{...}}`) section, a
+  step-by-step "Running it" walkthrough in the README, and a Docker Hub
+  getting-started section.
+
 ## [0.1.2] - 2026-07-20
 
 ### Fixed

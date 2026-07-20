@@ -10,6 +10,9 @@ import { usedVars, type OpenTab, type SubView } from "./workspace";
 
 const fmtInt = (n?: number | null) => (n == null ? "?" : Number(n).toLocaleString());
 const basename = (p: string) => { const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); return i >= 0 ? p.slice(i + 1) : p; };
+// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`) so the UI shows and copies
+// a clean `C:\…` path instead of `\\?\C:\…` (the server canonicalizes to the verbatim form).
+const cleanPath = (p: string) => p.replace(/^\\\\\?\\UNC\\/, "\\\\").replace(/^\\\\\?\\/, "");
 
 export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable, resolve, onOpenRow }: {
   backend: Backend; conn: Conn; tab: OpenTab;
@@ -25,6 +28,12 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
   const [err, setErr] = useState<string | null>(null);
   const [exportFmt, setExportFmt] = useState("csv");
   const [resultSearch, setResultSearch] = useState("");
+  const [pathCopied, setPathCopied] = useState(false);
+  const copyPath = () => {
+    navigator.clipboard?.writeText(cleanPath(rpath))
+      .then(() => { setPathCopied(true); setTimeout(() => setPathCopied(false), 1200); })
+      .catch(() => { /* clipboard blocked (e.g. non-secure context) — ignore */ });
+  };
 
   useEffect(() => {
     setErr(null);
@@ -72,7 +81,11 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
         <Tabs tabs={["Grid", "Schema", "Profile", "SQL"]} value={sub} onChange={(t) => onPatch({ sub: t as SubView })} />
       </div>
       <div style={toolbar}>
-        <span style={{ color: "var(--muted)", fontFamily: "var(--font-mono)", fontSize: "var(--text-12)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 420 }} title={rpath !== tab.path ? `${tab.path}  →  ${rpath}` : tab.path}>{tab.path}</span>
+        <span role="button" tabIndex={0} onClick={copyPath}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); copyPath(); } }}
+          style={{ color: "var(--muted)", fontFamily: "var(--font-mono)", fontSize: "var(--text-12)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 520, cursor: "pointer" }}
+          title={(rpath !== tab.path ? `${cleanPath(tab.path)}\n  →  ${cleanPath(rpath)}` : cleanPath(tab.path)) + "\n\nClick to copy"}>{cleanPath(tab.path)}</span>
+        <Button size="sm" onClick={copyPath} title="copy the full path to the clipboard">{pathCopied ? "Copied ✓" : "Copy path"}</Button>
         {rpath !== tab.path && unresolved.length === 0 && <Chip title={rpath}>→ {basename(rpath)}</Chip>}
         {unresolved.length > 0 && <Chip tone="warn" title="define these in the Variables panel">unset: {unresolved.map((v) => "{{" + v + "}}").join(" ")}</Chip>}
         <span style={{ flex: 1 }} />

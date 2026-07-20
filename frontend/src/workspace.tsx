@@ -2,9 +2,9 @@
 // TableView: a workspace switcher, the open-tab strip, the sidebar (saved connections + queries +
 // file tree), and the run-history panel. The client tab model round-trips through the backend
 // `Tab.view` (opaque grid state), so open tabs + their sort/filter/sql survive a reload.
-import { useState, type CSSProperties, type ReactNode, type SyntheticEvent } from "react";
+import { useEffect, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode, type SyntheticEvent } from "react";
 import type { Conn, Filters, Row, RunRecord, RunResponse, Sort, Workspace, WsConnection, WsMeta, WsSavedQuery, WsVariable, QueryResp } from "./api";
-import { Button, Chip, filterRows, Select, StatTable, TextInput } from "./components";
+import { Button, Chip, filterRows, Select, StatTable, TextInput, ThemeToggle } from "./components";
 
 const VAR_RE = /\{\{\s*([\w.-]+)\s*\}\}/g;
 /** Substitute `{{key}}` with the workspace variable's value (client-side, Postman-style). Unknown
@@ -27,7 +27,7 @@ export type SubView = "Grid" | "Schema" | "Profile" | "SQL";
 
 export interface OpenTab {
   id: string;
-  kind: "data" | "result" | "compare";
+  kind: "data" | "result" | "compare" | "launcher";
   title: string;
   path: string;
   sub: SubView;
@@ -72,6 +72,15 @@ export function newDataTab(path: string, o: { connId?: string | null; sub?: SubV
   };
 }
 
+/** A "launcher" tab — the start page shown by `+`: open a source or start a query on a saved
+ * connection. Transient (never persisted; buildDoc keeps only `data` tabs). */
+export function newLauncherTab(): OpenTab {
+  return {
+    id: newTabId(), kind: "launcher", title: "New tab", path: "",
+    sub: "Grid", sort: null, filters: {}, sql: "", connId: null,
+  };
+}
+
 // ---- persistence: open tabs <-> backend Workspace.tabs (opaque view state) ----
 interface TabView { v: 1; path: string; sub: SubView; sort: Sort | null; filters: Filters; sql: string; title: string; }
 
@@ -112,9 +121,14 @@ export function WorkspaceBar({ conn, engineName, sqlAvailable, workspaces, wsId,
   const header: CSSProperties = { display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap", padding: "var(--pad-chrome)", borderBottom: "var(--border-hairline)", background: "var(--panel)", flex: "0 0 auto" };
   return (
     <header style={header}>
-      <h1 style={{ fontSize: "var(--text-ui)", margin: 0, fontWeight: "var(--weight-h1)", whiteSpace: "nowrap" }}>
-        Lakeleto <span style={{ color: "var(--muted)", fontWeight: "var(--weight-normal)" }}>· the Postman of lakehouse tables</span>
-      </h1>
+      <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.15 }}>
+        <h1 style={{ fontSize: "var(--text-ui)", margin: 0, fontWeight: "var(--weight-h1)", whiteSpace: "nowrap" }}>
+          Lakeleto <span style={{ color: "var(--muted)", fontWeight: "var(--weight-normal)" }}>· the Postman of lakehouse tables</span>
+        </h1>
+        {conn.caps.version && (
+          <span style={{ color: "var(--muted)", fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)" }}>v{conn.caps.version}</span>
+        )}
+      </div>
       <span style={{ color: "var(--muted)", fontSize: "var(--text-12)" }}>workspace</span>
       <Select value={wsId || ""} onChange={onSelect} options={workspaces.map((w) => ({ value: w.id, label: w.name }))} title="switch workspace" style={{ minWidth: 160 }} />
       <Button size="sm" onClick={onNew} title="new workspace">＋ New</Button>
@@ -128,6 +142,7 @@ export function WorkspaceBar({ conn, engineName, sqlAvailable, workspaces, wsId,
       <Button size="sm" onClick={onDelete} disabled={!wsId} title="delete this workspace">Delete</Button>
       <span style={{ flex: 1 }} />
       {busy && <span style={{ color: "var(--muted)", fontSize: "var(--text-12)" }}>saving…</span>}
+      <ThemeToggle />
       <Chip>{engineName}{sqlAvailable ? " · SQL" : ""}</Chip>
       <Chip tone={conn.mode === "live" ? "indigo" : "neutral"}
         title={conn.mode === "live" ? "connected to a running lakeleto serve" : "no server reached — in-memory sample tables + a localStorage workspace store"}>
@@ -140,18 +155,29 @@ export function WorkspaceBar({ conn, engineName, sqlAvailable, workspaces, wsId,
 // ======================================================================
 // Tab strip — the open-tab bar
 // ======================================================================
-export function TabStrip({ tabs, activeId, onSelect, onClose, onNew, onRename }: {
+export function TabStrip({ tabs, activeId, onSelect, onClose, onNew, onRename, onReorder }: {
   tabs: OpenTab[]; activeId: string | null; onSelect: (id: string) => void; onClose: (id: string) => void; onNew: () => void; onRename?: (id: string) => void;
+  onReorder?: (fromId: string, toId: string) => void;
 }) {
   const bar: CSSProperties = { display: "flex", alignItems: "stretch", gap: 0, borderBottom: "var(--border-hairline)", background: "var(--panel)", overflowX: "auto", flex: "0 0 auto" };
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overId, setOverId] = useState<string | null>(null);
   return (
     <div style={bar}>
       {tabs.map((t) => {
         const active = t.id === activeId;
+        const isOver = onReorder && overId === t.id && dragId != null && dragId !== t.id;
         return (
           <div key={t.id} onClick={() => onSelect(t.id)} title={t.path}
-            style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 8px 6px 12px", cursor: "pointer", whiteSpace: "nowrap",
+            draggable={!!onReorder}
+            onDragStart={() => onReorder && setDragId(t.id)}
+            onDragEnd={() => { setDragId(null); setOverId(null); }}
+            onDragOver={(e) => { if (onReorder && dragId && dragId !== t.id) { e.preventDefault(); if (overId !== t.id) setOverId(t.id); } }}
+            onDrop={() => { if (onReorder && dragId) onReorder(dragId, t.id); setDragId(null); setOverId(null); }}
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 8px 6px 12px", cursor: onReorder ? "grab" : "pointer", whiteSpace: "nowrap",
               borderRight: "var(--border-hairline)", borderBottom: `var(--accent-underline) solid ${active ? "var(--accent)" : "transparent"}`,
+              boxShadow: isOver ? "inset 2px 0 0 0 var(--accent)" : undefined,
+              opacity: dragId === t.id ? 0.5 : 1,
               background: active ? "var(--bg)" : "transparent", color: active ? "var(--fg)" : "var(--muted)", fontSize: "var(--text-12)", maxWidth: 220 }}>
             <span style={{ opacity: 0.7 }}>{t.kind === "compare" ? "⇄" : t.kind === "result" ? "▤" : t.sub === "SQL" ? "λ" : "▦"}</span>
             <span style={{ overflow: "hidden", textOverflow: "ellipsis" }} onDoubleClick={(e) => { e.stopPropagation(); onRename && onRename(t.id); }} title="double-click to rename">{t.title}</span>
@@ -195,15 +221,34 @@ function SideRow({ icon, label, sub, onClick, onDelete, onPin, pinned, onEdit, t
   );
 }
 
-function Section({ title, action, children }: { title: string; action?: ReactNode; children: ReactNode }) {
+/** A sidebar section: a collapsible header (click to toggle) with an optional drag handle so the
+ * user can reorder sections. `drag` is omitted for non-reorderable uses. */
+function Section({ title, action, children, collapsed, onToggle, drag }: {
+  title: string; action?: ReactNode; children: ReactNode;
+  collapsed?: boolean; onToggle?: () => void;
+  drag?: {
+    onDragStart: () => void; onDragEnd: () => void;
+    onDragOver: (e: ReactDragEvent) => void; onDrop: () => void; isTarget?: boolean;
+  };
+}) {
   return (
-    <div style={{ marginBottom: "var(--space-6)" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
-        <span style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--muted)", fontWeight: "var(--weight-semibold)" }}>{title}</span>
+    <div style={{ marginBottom: "var(--space-6)", borderRadius: 6, ...(drag?.isTarget ? { outline: "2px dashed var(--accent)", outlineOffset: 2 } : {}) }}
+      onDragOver={drag?.onDragOver} onDrop={drag?.onDrop}>
+      <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
+        {drag && (
+          <span draggable onDragStart={drag.onDragStart} onDragEnd={drag.onDragEnd} title="drag to reorder"
+            style={{ cursor: "grab", color: "var(--muted)", fontSize: "var(--text-xs)", userSelect: "none", padding: "0 1px" }}>⠿</span>
+        )}
+        <span role="button" tabIndex={0} onClick={onToggle}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onToggle?.(); } }}
+          title={collapsed ? "expand" : "collapse"}
+          style={{ display: "flex", alignItems: "center", gap: 4, cursor: onToggle ? "pointer" : "default", fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--muted)", fontWeight: "var(--weight-semibold)" }}>
+          <span style={{ fontSize: 9, width: 8, display: "inline-block" }}>{collapsed ? "▸" : "▾"}</span>{title}
+        </span>
         <span style={{ flex: 1 }} />
         {action}
       </div>
-      {children}
+      {!collapsed && children}
     </div>
   );
 }
@@ -245,8 +290,31 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
   onRunFolder: (folder: string) => void;
   onOpenFile: (p: string) => void; onOpenDir: (d: string) => void;
 }) {
-  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({}); // saved-query FOLDER collapse (keyed by folder name)
   const aside: CSSProperties = { flex: "0 0 260px", borderRight: "var(--border-hairline)", overflow: "auto", padding: "var(--space-5)", background: "var(--panel)", display: "flex", flexDirection: "column" };
+
+  // --- reorderable + collapsible sidebar sections (persisted) ---
+  // Files is first by default — it's the "browse to your data" entry point.
+  const DEFAULT_ORDER = ["files", "connections", "queries", "variables"];
+  const [order, setOrder] = useState<string[]>(() => {
+    try {
+      const s = JSON.parse(localStorage.getItem("lakeleto-sidebar-order") || "null");
+      if (Array.isArray(s) && s.length === DEFAULT_ORDER.length && DEFAULT_ORDER.every((x) => s.includes(x))) return s;
+    } catch { /* ignore */ }
+    return DEFAULT_ORDER;
+  });
+  const [secCollapsed, setSecCollapsed] = useState<Record<string, boolean>>(() => {
+    try { return JSON.parse(localStorage.getItem("lakeleto-sidebar-collapsed") || "{}"); } catch { return {}; }
+  });
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [overId, setOverId] = useState<string | null>(null);
+  useEffect(() => { try { localStorage.setItem("lakeleto-sidebar-order", JSON.stringify(order)); } catch { /* ignore */ } }, [order]);
+  useEffect(() => { try { localStorage.setItem("lakeleto-sidebar-collapsed", JSON.stringify(secCollapsed)); } catch { /* ignore */ } }, [secCollapsed]);
+  const toggleSec = (id: string) => setSecCollapsed((c) => ({ ...c, [id]: !c[id] }));
+  const reorder = (from: string, to: string) => {
+    if (from === to) return;
+    setOrder((o) => { const a = o.filter((x) => x !== from); const i = a.indexOf(to); a.splice(i < 0 ? a.length : i, 0, from); return a; });
+  };
   const connections = ws?.connections || [];
   const queries = ws?.saved_queries || [];
   const variables = ws?.variables || [];
@@ -275,56 +343,86 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
       onEdit={() => editDesc("query", q.id, q.description)} title={q.sql} />
   );
 
+  // Each section rendered by id, so the order can be reordered + persisted.
+  const sections: Record<string, { title: string; body: ReactNode }> = {
+    files: {
+      title: `Files${listing ? ` · ${listing.entries.filter((e) => e.kind === "dir").length} dirs / ${listing.entries.filter((e) => e.kind === "file").length} files` : ""}`,
+      body: listing ? (
+        <div>
+          {listing.parent != null && (
+            <SideRow icon="↑" label=".. (up a folder)" onClick={() => onOpenDir(listing.parent!)} title={listing.parent} />
+          )}
+          {listing.entries.map((e) => (
+            <SideRow key={e.path} icon={e.kind === "dir" ? "▸" : "▦"} label={e.name}
+              sub={e.kind === "dir" ? "folder — click to open" : undefined}
+              onClick={() => (e.kind === "dir" ? onOpenDir(e.path) : onOpenFile(e.path))} title={e.path} />
+          ))}
+          {listing.entries.length === 0 && listing.parent == null && <div style={hint}>Empty folder.</div>}
+        </div>
+      ) : <div style={hint}>Start the server with a folder — <code>serve --root your-folder</code> — to browse files here.</div>,
+    },
+    connections: {
+      title: `Connections (${connections.length})`,
+      body: (
+        <>
+          {connections.length === 0 && <div style={hint}>Save a source with ⭑ in a tab.</div>}
+          {[...connections].sort(byPinned).map((c) => (
+            <SideRow key={c.id} icon="▤" label={c.label} sub={c.description || undefined}
+              onClick={() => onOpenConnection(c)} onDelete={() => delConn(c.id)} onPin={() => pinConn(c.id)} pinned={c.pinned}
+              onEdit={() => editDesc("conn", c.id, c.description)} title={c.path} />
+          ))}
+        </>
+      ),
+    },
+    queries: {
+      title: `Saved queries (${queries.length})`,
+      body: (
+        <>
+          {queries.length === 0 && <div style={hint}>Save a query from the SQL tab (name it <code>folder/name</code> to group it).</div>}
+          {ungrouped.map((q) => queryRow(q))}
+          {[...folders.entries()].map(([folder, qs]) => {
+            const open = !collapsed[folder];
+            return (
+              <div key={folder}>
+                <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 6px", cursor: "pointer", borderRadius: 6 }}>
+                  <span role="button" tabIndex={0} onClick={() => setCollapsed((c) => ({ ...c, [folder]: open }))}
+                    onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setCollapsed((c) => ({ ...c, [folder]: open })); } }}
+                    style={{ flex: 1, display: "flex", gap: 4, alignItems: "center", color: "var(--muted)", fontSize: "var(--text-12)" }}>
+                    <span>{open ? "▾" : "▸"}</span><span>▦ {folder}</span><span>({qs.length})</span>
+                  </span>
+                  <span role="button" tabIndex={0} aria-label="run all in folder" title="run every query in this folder"
+                    onClick={() => onRunFolder(folder)} onKeyDown={(e) => { if (e.key === "Enter") onRunFolder(folder); }}
+                    style={{ color: "var(--muted)", padding: "0 3px", cursor: "pointer" }}>▶</span>
+                </div>
+                {open && qs.map((q) => queryRow(q, true))}
+              </div>
+            );
+          })}
+          {queries.length > 0 && <div style={{ ...hint, marginTop: 2 }}>Right-click a query row's ▶… use “Run across” from ⌘K.</div>}
+        </>
+      ),
+    },
+    variables: {
+      title: `Variables (${variables.length})`,
+      body: <VariablesEditor variables={variables} mutate={mutate} />,
+    },
+  };
+
   return (
     <aside style={aside}>
-      <Section title={`Connections (${connections.length})`}>
-        {connections.length === 0 && <div style={hint}>Save a source with ⭑ in a tab.</div>}
-        {[...connections].sort(byPinned).map((c) => (
-          <SideRow key={c.id} icon="▤" label={c.label} sub={c.description || undefined}
-            onClick={() => onOpenConnection(c)} onDelete={() => delConn(c.id)} onPin={() => pinConn(c.id)} pinned={c.pinned}
-            onEdit={() => editDesc("conn", c.id, c.description)} title={c.path} />
-        ))}
-      </Section>
-
-      <Section title={`Saved queries (${queries.length})`}>
-        {queries.length === 0 && <div style={hint}>Save a query from the SQL tab (name it <code>folder/name</code> to group it).</div>}
-        {ungrouped.map((q) => queryRow(q))}
-        {[...folders.entries()].map(([folder, qs]) => {
-          const open = !collapsed[folder];
-          return (
-            <div key={folder}>
-              <div style={{ display: "flex", alignItems: "center", gap: 4, padding: "3px 6px", cursor: "pointer", borderRadius: 6 }}>
-                <span role="button" tabIndex={0} onClick={() => setCollapsed((c) => ({ ...c, [folder]: open }))}
-                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setCollapsed((c) => ({ ...c, [folder]: open })); } }}
-                  style={{ flex: 1, display: "flex", gap: 4, alignItems: "center", color: "var(--muted)", fontSize: "var(--text-12)" }}>
-                  <span>{open ? "▾" : "▸"}</span><span>▦ {folder}</span><span>({qs.length})</span>
-                </span>
-                <span role="button" tabIndex={0} aria-label="run all in folder" title="run every query in this folder"
-                  onClick={() => onRunFolder(folder)} onKeyDown={(e) => { if (e.key === "Enter") onRunFolder(folder); }}
-                  style={{ color: "var(--muted)", padding: "0 3px", cursor: "pointer" }}>▶</span>
-              </div>
-              {open && qs.map((q) => queryRow(q, true))}
-            </div>
-          );
-        })}
-        {queries.length > 0 && <div style={{ ...hint, marginTop: 2 }}>Right-click a query row's ▶… use “Run across” from ⌘K.</div>}
-      </Section>
-
-      <Section title={`Variables (${variables.length})`}>
-        <VariablesEditor variables={variables} mutate={mutate} />
-      </Section>
-
-      <Section title="Files">
-        {listing ? (
-          <div>
-            {listing.parent != null && <SideRow icon="↑" label=".." onClick={() => onOpenDir(listing.parent!)} />}
-            {listing.entries.map((e) => (
-              <SideRow key={e.path} icon={e.kind === "dir" ? "▸" : "▦"} label={e.name}
-                onClick={() => (e.kind === "dir" ? onOpenDir(e.path) : onOpenFile(e.path))} title={e.path} />
-            ))}
-          </div>
-        ) : <div style={hint}>—</div>}
-      </Section>
+      {order.filter((id) => sections[id]).map((id) => (
+        <Section key={id} title={sections[id].title}
+          collapsed={!!secCollapsed[id]} onToggle={() => toggleSec(id)}
+          drag={{
+            onDragStart: () => setDragId(id),
+            onDragEnd: () => { setDragId(null); setOverId(null); },
+            onDragOver: (e) => { e.preventDefault(); if (dragId && dragId !== id && overId !== id) setOverId(id); },
+            onDrop: () => { if (dragId) reorder(dragId, id); setDragId(null); setOverId(null); },
+            isTarget: overId === id && dragId != null && dragId !== id,
+          }}>
+          {sections[id].body}
+        </Section>
+      ))}
     </aside>
   );
 }

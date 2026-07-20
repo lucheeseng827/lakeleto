@@ -578,6 +578,9 @@ struct InfoResponse {
 
 #[derive(Serialize)]
 struct EnginesResponse {
+    /// The running binary's version (from `CARGO_PKG_VERSION`) — the SPA shows it in the header
+    /// so a user can see which Lakeleto they're talking to.
+    version: &'static str,
     engine: Capabilities,
     sql_available: bool,
     endpoints: Vec<&'static str>,
@@ -591,6 +594,7 @@ async fn healthz() -> &'static str {
 
 async fn engines(State(st): State<AppState>) -> Json<EnginesResponse> {
     Json(EnginesResponse {
+        version: env!("CARGO_PKG_VERSION"),
         engine: st.read.capabilities(),
         sql_available: st.sql.is_some(),
         endpoints: ENDPOINTS.to_vec(),

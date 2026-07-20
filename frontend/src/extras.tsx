@@ -2,9 +2,66 @@
 // folder" runner, and a two-run compare (diff) view. Kept together since they're all overlays or
 // full-pane views composed from the design-system primitives.
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import type { QueryResp, RunRecord, RunResponse, Row } from "./api";
-import { Button, Chip, Textarea } from "./components";
-import type { OpenTab } from "./workspace";
+import type { QueryResp, RunRecord, RunResponse, Row, WsConnection } from "./api";
+import { Button, Chip, TextInput, Textarea } from "./components";
+import { type OpenTab } from "./workspace";
+
+/** The `+` "new tab" start page: open a data source, or start a query on a saved connection. */
+export function LauncherView({ connections, onOpenPath, onNewQuery, onBrowse }: {
+  connections: WsConnection[];
+  onOpenPath: (path: string) => void;
+  onNewQuery: (conn: WsConnection) => void;
+  onBrowse: () => void;
+}) {
+  const [path, setPath] = useState("");
+  const open = () => { const p = path.trim(); if (p) onOpenPath(p); };
+  const label: CSSProperties = { fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--muted)", fontWeight: "var(--weight-semibold)", marginBottom: 6, display: "block" };
+  const card: CSSProperties = { border: "var(--border-hairline)", borderRadius: "var(--radius-md)", padding: "var(--space-8)", background: "var(--panel)" };
+  const connRow: CSSProperties = { display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left", padding: "7px 9px", border: "var(--border-hairline)", borderRadius: "var(--radius-sm)", background: "var(--bg)", color: "var(--fg)", cursor: "pointer", font: "inherit", marginBottom: 4 };
+  const linkBtn: CSSProperties = { background: "none", border: 0, color: "var(--accent)", cursor: "pointer", font: "inherit", padding: 0 };
+  return (
+    <main style={{ flex: "1 1 auto", minWidth: 0, overflow: "auto", padding: "clamp(16px, 4vw, 40px)", display: "flex", justifyContent: "center" }}>
+      <div style={{ width: "100%", maxWidth: 560, display: "flex", flexDirection: "column", gap: "var(--space-9)" }}>
+        <div>
+          <div style={{ fontSize: "var(--text-ui)", fontWeight: "var(--weight-h1)" }}>New tab</div>
+          <div style={{ color: "var(--muted)", fontSize: "var(--text-12)", marginTop: 2 }}>Open a data source, or start a query on a saved connection.</div>
+        </div>
+
+        <section style={card}>
+          <label style={label}>Open a source</label>
+          <div style={{ display: "flex", gap: 8 }}>
+            <div style={{ flex: 1 }}>
+              <TextInput value={path} onChange={setPath} placeholder="C:\path\to\data.parquet   ·   s3://bucket/events.parquet"
+                onKeyDown={(e) => { if (e.key === "Enter") open(); }} />
+            </div>
+            <Button variant="primary" disabled={!path.trim()} onClick={open}>Open</Button>
+          </div>
+          <div style={{ color: "var(--muted)", fontSize: "var(--text-xs)", marginTop: 6 }}>
+            Parquet / CSV / TSV / Iceberg — a local path or an <code>s3://</code> · <code>gs://</code> · <code>az://</code> URI.{" "}
+            Or <button style={linkBtn} onClick={onBrowse}>browse files (⌘K)</button>.
+          </div>
+        </section>
+
+        <section style={card}>
+          <label style={label}>New query on a connection</label>
+          {connections.length === 0 ? (
+            <div style={{ color: "var(--muted)", fontSize: "var(--text-12)" }}>
+              No saved connections yet — open a source above, then click <strong>⭑ Save source</strong> in its tab.
+            </div>
+          ) : (
+            connections.map((c) => (
+              <button key={c.id} style={connRow} title={`open a SQL tab on ${c.path}`} onClick={() => onNewQuery(c)}>
+                <span style={{ color: "var(--accent)" }}>λ</span>
+                <span style={{ fontWeight: "var(--weight-semibold)" }}>{c.label}</span>
+                <span style={{ color: "var(--muted)", fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{c.path}</span>
+              </button>
+            ))
+          )}
+        </section>
+      </div>
+    </main>
+  );
+}
 
 const fmtInt = (n?: number | null) => (n == null ? "?" : Number(n).toLocaleString());
 const overlay: CSSProperties = { position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", display: "flex", zIndex: 50 };

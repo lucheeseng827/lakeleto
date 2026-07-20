@@ -28,6 +28,7 @@ export type Filters = Record<string, string>;
 export interface Row { [k: string]: unknown; }
 
 export interface Engines {
+  version?: string;   // the running server's version (CARGO_PKG_VERSION); absent in sample mode
   engine: { engine: string; formats: string[]; sql: boolean; profile: boolean; remote: boolean };
   sql_available: boolean;
   endpoints: string[];
