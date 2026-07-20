@@ -8,10 +8,12 @@ locally**.
 Everything runs on your own machine. Lakeleto never uploads your data and needs
 no account or server.
 
-> The prebuilt release binary already includes every engine
-> (`serve`, `sql`, `iceberg`, `object-store`), so the commands below are just
-> `lakeleto …` — no `--features` flags. If you build from source, add
-> `--features serve,sql,iceberg,object-store`.
+> The prebuilt release binary already includes every optional engine (`serve`,
+> `sql`, `iceberg`, `object-store`, `delta`, and the `sqlite`/`postgres`/`mysql`
+> database connectors) on top of the built-in `local` reader, so the commands
+> below are just `lakeleto …` — no `--features` flag needed. If you build from
+> source, add
+> `--features serve,sql,iceberg,object-store,delta,sqlite,postgres,mysql`.
 
 ---
 
@@ -261,51 +263,91 @@ Details worth knowing:
 
 ---
 
-## 8. Example — query a database (bring your own SQLite)
+## 8. Example — query a database (SQLite · Postgres · MySQL)
 
-Lakeleto can point at a **live database** the same way it points at a file — with
-your own connection, read-only, nothing copied. SQLite ships today; Postgres and
-MySQL are next.
+Lakeleto can point at a **live database** the same way it points at a file — your
+own connection, **read-only**, nothing copied. SQLite, Postgres, and MySQL all
+ship in the release binary.
 
-A database is addressed by a **connection URI** in the path/open box:
+A database is addressed by a **connection URI**:
 
 ```text
-sqlite:///C:/data/app.db            # the whole database — lists its tables
-sqlite:///C:/data/app.db?table=orders   # one table, opened as a grid
+sqlite:///C:/data/app.db                       # SQLite file (Windows: forward slashes, triple slash)
+sqlite:///home/me/app.db?table=orders          #   …one table
+postgres://user:{{PGPASS}}@host:5432/shop      # Postgres
+mysql://user:{{MYSQLPASS}}@host:3306/shop      # MySQL
 ```
 
-(On Windows use forward slashes and the triple slash: `sqlite:///C:/…`. On
-macOS/Linux: `sqlite:///home/me/app.db?table=orders`.)
+A URI **without** `?table=` opens the whole database and **lists its tables**; add
+`?table=<name>` to open one directly.
 
-- **Browse tables:** open the bare `sqlite:///…app.db` URI (or paste it in the
-  file box) and the sidebar lists every table — click one to open it.
-- **Explore a table:** `?table=<name>` gives you the usual **Grid / Schema /
-  Profile**, column filters, and sort — all pushed down to SQL against the DB.
-- **Run SQL:** on the **SQL** tab, query the database directly — the tables are
-  the real database tables (not a single `t`), e.g.
+**Add it in the UI** — sidebar **CONNECTIONS → ＋** → pick **SQLite / Postgres /
+MySQL** → paste the URI (+ an optional table) → **Add**. The connection is saved
+and opened. Editing a connection (the ✎ on its row) reopens the same form.
+
+> **Passwords:** use a `{{VAR}}` in the URI (e.g. `…:{{PGPASS}}@…`) and define
+> `PGPASS` under **Variables** — the secret is substituted at query time and is
+> **not** stored in the workspace file. (See §6.)
+
+Once connected:
+
+- **Browse tables** — a whole-database connection lists its tables in **Files**;
+  click one to open it.
+- **Explore** — the usual **Grid / Schema / Profile**, with column filters + sort
+  pushed down to SQL against the database.
+- **Run SQL** on the **SQL** tab — query the real database tables directly (not a
+  single `t`), e.g.
   ```sql
   SELECT city, count(*) AS n, round(sum(amount), 2) AS total
-  FROM orders
-  GROUP BY city
-  ORDER BY n DESC
+  FROM orders GROUP BY city ORDER BY n DESC
   ```
 
-Read-only by design (an explorer, not an editor) — write statements are refused,
-and the connection is opened read-only. Requires a build with `--features sqlite`
-(the release binary includes it).
+Read-only by design (an explorer, not an editor) — write statements are refused
+and the connection is opened read-only. NUMERIC/DECIMAL render as numbers and
+dates/timestamps as text.
 
-## 9. Example — an Iceberg table
+## 9. Example — lakehouse tables (Iceberg · Delta · partitioned Parquet)
 
-Point at the table directory (the one containing `metadata/`):
+Point Lakeleto at a lakehouse table directory and it reads the **correct current
+snapshot**, not the raw files. All auto-detected — no format flag needed.
+
+**Iceberg** — a directory containing `metadata/`:
 
 ```bash
-lakeleto schema ./warehouse/db/orders        # local Iceberg table
-lakeleto open   ./warehouse/db/orders         # browse it in the UI
+lakeleto open ./warehouse/db/orders            # local Iceberg table
+```
+Reads the current snapshot's Parquet data files (incl. merge-on-read positional
+deletes). Also works over object storage — an `s3://bucket/warehouse/db/orders`
+prefix with a `metadata/` child auto-detects as Iceberg and is read with your own
+env credentials (see §7 for the AWS/GCS/Azure vars):
+```bash
+lakeleto open s3://my-bucket/warehouse/db/orders
 ```
 
-Lakeleto reads the current snapshot's Parquet data files (including
-merge-on-read positional deletes). Combine with the object-store scheme to read
-an Iceberg table sitting in a bucket.
+**Delta Lake** — a directory containing `_delta_log/`:
+
+```bash
+lakeleto open ./warehouse/delta_orders
+```
+Lakeleto replays the transaction log (`_delta_log`), so an overwritten or
+row-deleted table reads the **right rows** — not the stale/removed Parquet files
+still sitting on disk. Partition columns are filled from the log. (JSON commit
+log; checkpoints aren't consulted — correct whenever the `*.json` commits are
+present, i.e. no `VACUUM`/log cleanup.)
+
+**Hive-partitioned Parquet** — a directory of `date=…/region=…/*.parquet`:
+
+```bash
+lakeleto open ./warehouse/sales_lake
+```
+Read as one table with the `key=value` partition directories exposed as columns.
+
+**SQL over all of these** works on the **SQL** tab (and `lakeleto query`) — the
+current table is `t`, partition columns included:
+```sql
+SELECT region, count(*) AS n, round(sum(revenue), 2) AS rev
+FROM t GROUP BY region ORDER BY n DESC
+```
 
 ---
 

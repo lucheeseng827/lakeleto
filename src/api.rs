@@ -590,6 +590,10 @@ struct EnginesResponse {
     version: &'static str,
     engine: Capabilities,
     sql_available: bool,
+    /// Whether this is the Lakeleto Cloud (EE) edition. Off in the open-source binary; an `ee`
+    /// build flips it, which lifts the OSS connection cap in the UI. The real EE capabilities live
+    /// behind the hosted plane — this flag just tells the SPA which limits to apply.
+    ee: bool,
     endpoints: Vec<&'static str>,
 }
 
@@ -604,6 +608,7 @@ async fn engines(State(st): State<AppState>) -> Json<EnginesResponse> {
         version: env!("CARGO_PKG_VERSION"),
         engine: st.read.capabilities(),
         sql_available: st.sql.is_some(),
+        ee: cfg!(feature = "ee"),
         endpoints: ENDPOINTS.to_vec(),
     })
 }

@@ -387,13 +387,14 @@ function AddConnectionForm({ initial, onSubmit, onCancel }: {
 // ======================================================================
 // Sidebar — connections, saved queries (grouped into folders), variables, files
 // ======================================================================
-export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, onRunFolder, onOpenFile, onOpenDir }: {
+export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, onRunFolder, onOpenFile, onOpenDir, ee }: {
   ws: Workspace | null;
   listing: { dir: string; parent?: string | null; entries: { name: string; path: string; kind: "dir" | "file"; size?: number | null }[] } | null;
   mutate: (fn: (ws: Workspace) => Workspace) => void;
   onOpenConnection: (c: WsConnection) => void; onOpenQuery: (q: WsSavedQuery) => void;
   onRunFolder: (folder: string) => void;
   onOpenFile: (p: string) => void; onOpenDir: (d: string) => void;
+  ee?: boolean;   // Lakeleto Cloud edition — lifts the open-source DB-connection cap
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({}); // saved-query FOLDER collapse (keyed by folder name)
   const aside: CSSProperties = { flex: "0 0 260px", borderRight: "var(--border-hairline)", overflow: "auto", padding: "var(--space-5)", background: "var(--panel)", display: "flex", flexDirection: "column" };
@@ -438,8 +439,20 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
   // Add/edit-connection form (a file path or a database URI) shown inline in the Connections section.
   const [addingConn, setAddingConn] = useState(false);
   const [editingConn, setEditingConn] = useState<WsConnection | null>(null);
+  const [capMsg, setCapMsg] = useState<string | null>(null);
   type ConnForm = { label: string; path: string; format?: string | null; description?: string | null };
+  // Open-source edition connects up to 2 databases at once (any mix of SQLite/Postgres/MySQL);
+  // Lakeleto Cloud (ee) lifts the cap. File/object connections are uncapped.
+  const OSS_DB_LIMIT = 2;
   const addConn = (c: ConnForm) => {
+    if (c.format === "database" && !ee) {
+      const have = (ws?.connections || []).filter((x) => x.format === "database").length;
+      if (have >= OSS_DB_LIMIT) {
+        setCapMsg(`Open-source Lakeleto connects up to ${OSS_DB_LIMIT} databases at once. Lakeleto Cloud unlocks unlimited connections + more databases.`);
+        return;
+      }
+    }
+    setCapMsg(null);
     const conn: WsConnection = { id: "conn-" + newTabId(), label: c.label, path: c.path, format: c.format ?? null, description: c.description ?? null };
     mutate((w) => ({ ...w, connections: [...w.connections, conn] }));
     setAddingConn(false);
@@ -494,7 +507,12 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
           {(addingConn || editingConn) && (
             <AddConnectionForm initial={editingConn}
               onSubmit={editingConn ? (c) => updateConn(editingConn.id, c) : addConn}
-              onCancel={() => { setAddingConn(false); setEditingConn(null); }} />
+              onCancel={() => { setAddingConn(false); setEditingConn(null); setCapMsg(null); }} />
+          )}
+          {capMsg && (
+            <div style={{ border: "var(--border-hairline)", borderColor: "var(--warn-fg)", background: "var(--warn-bg)", color: "var(--warn-fg)", borderRadius: "var(--radius-sm)", padding: "6px 8px", marginBottom: 6, fontSize: "var(--text-12)" }}>
+              {capMsg} <span role="button" tabIndex={0} onClick={() => setCapMsg(null)} style={{ cursor: "pointer", textDecoration: "underline" }}>dismiss</span>
+            </div>
           )}
           {connections.length === 0 && !addingConn && <div style={hint}>Add a source with ＋, or save one with ⭑ in a tab.</div>}
           {[...connections].sort(byPinned).map((c) => (

@@ -377,7 +377,7 @@ export function App() {
         {showSidebar && (
           <Sidebar ws={ws} listing={listing} mutate={mutate}
             onOpenConnection={openConnection} onOpenQuery={openQuery} onRunFolder={runFolder}
-            onOpenFile={(p) => openPath(p)} onOpenDir={openDir} />
+            onOpenFile={(p) => openPath(p)} onOpenDir={openDir} ee={conn?.caps?.ee === true} />
         )}
 
         {active ? (

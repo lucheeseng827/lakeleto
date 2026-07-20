@@ -29,6 +29,7 @@ export interface Row { [k: string]: unknown; }
 
 export interface Engines {
   version?: string;   // the running server's version (CARGO_PKG_VERSION); absent in sample mode
+  ee?: boolean;       // Lakeleto Cloud (EE) edition — lifts the OSS connection cap when true
   engine: { engine: string; formats: string[]; sql: boolean; profile: boolean; remote: boolean };
   sql_available: boolean;
   endpoints: string[];

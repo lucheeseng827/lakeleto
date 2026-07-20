@@ -118,6 +118,10 @@ object-store = [
     "parquet/object_store",
 ]
 duckdb = []    # Phase 2: alternate commodity backend (libduckdb-sys, C++ toolchain)
+# `ee` — marker for the Lakeleto Cloud (paid) edition. Off in the OSS build; when set, `/v1/engines`
+# reports `ee:true`, which lifts the UI's open-source DB-connection cap (2 databases at once). The
+# actual EE capabilities live behind the hosted plane, not this flag. NOT enabled in the OSS release.
+ee = []
 # self-contained Delta Lake reader (JSON transaction log → active Parquet data files, partition
 # columns filled from add-action partitionValues). No new deps: the log is parsed with serde_json
 # and data files read with the existing arrow-58 parquet reader. JSON-only (checkpoints not consulted
