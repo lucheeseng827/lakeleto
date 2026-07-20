@@ -18,11 +18,21 @@
 
 pub mod local;
 
+// Self-contained Delta Lake reader (JSON transaction log → active Parquet files).
+#[cfg(feature = "delta")]
+pub mod delta;
+
 #[cfg(feature = "sql")]
 pub mod sql;
 
 #[cfg(feature = "remote")]
 pub mod remote;
+
+// BYO-database engine (read-only, over sqlx). Compiled when any DB backend feature is on; the
+// module body is `#![cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]` and
+// dispatches per dialect at runtime, so the declaration and every caller gate on the same set.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+pub mod database;
 
 use std::collections::HashSet;
 

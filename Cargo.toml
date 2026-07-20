@@ -9,7 +9,7 @@ panic = "unwind"
 
 [package]
 name = "lakeleto"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "Apache-2.0"
 description = "Lakeleto — instant local lakehouse-table explorer (\"the Postman of lakehouse tables\"): reads Parquet + CSV (and Iceberg tables with --features iceberg), all behind one pluggable Engine trait; a DuckDB backend and a hosted Lakeleto Cloud are on the roadmap. MVP: schema / head / profile / grid."
@@ -94,6 +94,9 @@ apache-avro = { version = "0.17", optional = true }
 object_store = { version = "0.13", default-features = false, features = ["aws", "gcp", "azure"], optional = true }
 url = { version = "2", optional = true }             # `object-store` — parse s3://… URIs
 futures = { version = "0.3", optional = true }        # `object-store` — drive the async parquet stream
+# `sqlite`/`postgres`/`mysql` (umbrella `database`) — read-only BYO-database connectors. rustls TLS
+# (no OpenSSL); per-backend drivers are gated by their own feature so nothing unused is pulled in.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls"], optional = true }
 
 [features]
 default = []
@@ -115,6 +118,30 @@ object-store = [
     "parquet/object_store",
 ]
 duckdb = []    # Phase 2: alternate commodity backend (libduckdb-sys, C++ toolchain)
+# self-contained Delta Lake reader (JSON transaction log → active Parquet data files, partition
+# columns filled from add-action partitionValues). No new deps: the log is parsed with serde_json
+# and data files read with the existing arrow-58 parquet reader. JSON-only (checkpoints not consulted
+# — correct whenever the *.json commits are still present, i.e. no VACUUM/log-cleanup).
+delta = []
+# `database` — bring-your-own-database connectors (read-only), behind the same `Engine` trait via
+# sqlx. Each backend is its own feature so a lean build can pick just what it needs; the umbrella
+# `database` turns them all on. Results are hand-mapped to arrow-58 RecordBatches, so there is no
+# arrow/datafusion version conflict (the reason DuckDB/connector crates are avoided). Postgres +
+# MySQL are pure-Rust (rustls); SQLite embeds the bundled C library (libsqlite3-sys) — the one
+# small C exception, and it compiles on every release target (MSVC / musl-gcc / clang).
+# SQLite stays lean (no bigdecimal/chrono/uuid — its dynamic typing maps NUMERIC/dates to text
+# already). Postgres/MySQL add `bigdecimal` (NUMERIC/DECIMAL → f64), `chrono` (DATE/TIME/TIMESTAMP →
+# ISO strings), and `uuid` (PG UUID → string) so real tables don't show NULL price/joined columns.
+sqlite = ["dep:sqlx", "sqlx/sqlite", "dep:tokio", "tokio/rt-multi-thread"]
+postgres = [
+    "dep:sqlx", "sqlx/postgres", "sqlx/bigdecimal", "sqlx/chrono", "sqlx/uuid",
+    "dep:tokio", "tokio/rt-multi-thread",
+]
+mysql = [
+    "dep:sqlx", "sqlx/mysql", "sqlx/bigdecimal", "sqlx/chrono", "sqlx/uuid",
+    "dep:tokio", "tokio/rt-multi-thread",
+]
+database = ["sqlite", "postgres", "mysql"]
 
 [dev-dependencies]
 tempfile = "3"                                       # write throwaway parquet/csv fixtures in tests

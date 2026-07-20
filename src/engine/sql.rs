@@ -72,6 +72,18 @@ impl DataFusionEngine {
         // file's real extension so the delimiter-driven reader accepts it. An extensionless path
         // gets "" (ends_with("") is always true → no gate), which is what we want for an explicit
         // single file.
+        // DataFusion's listing tables don't cover two cases the local engine does:
+        //   • Iceberg — no native provider (we deliberately avoid iceberg-datafusion's old pin);
+        //   • a Hive-partitioned Parquet *directory* — `register_parquet` reads the data files but
+        //     drops the `key=value` partition columns.
+        // Read those through the local engine (which handles both, partition columns included) into
+        // an in-memory table so SQL sees the full, correct schema. Trade-off: the table is
+        // materialized in memory — fine for the explorer's tables, not a streaming path.
+        let via_local = matches!(table.source.format, Format::Iceberg | Format::Delta)
+            || (matches!(table.source.format, Format::Parquet) && table.source.path.is_dir());
+        if via_local {
+            return self.register_via_local(ctx, table);
+        }
         let ext = std::path::Path::new(&path)
             .extension()
             .and_then(|e| e.to_str())
@@ -96,6 +108,20 @@ impl DataFusionEngine {
                 other => Err(EngineError::unsupported_format(other, "sql")),
             }
         })
+    }
+
+    /// Register a source that DataFusion can't list natively (Iceberg, a partitioned Parquet dir) by
+    /// reading it fully through the local engine into a [`MemTable`]. The local engine already
+    /// resolves Iceberg snapshots and Hive partition columns, so SQL gets the correct schema.
+    fn register_via_local(&self, ctx: &SessionContext, table: &NamedSource) -> Result<()> {
+        use datafusion::datasource::MemTable;
+        let local = crate::engine::local::LocalReaderEngine::default();
+        let rb = local.preview(&table.source, usize::MAX)?; // full read (no row cap)
+        let mem = MemTable::try_new(rb.schema.clone(), vec![rb.batches])
+            .map_err(|e| EngineError::Query(e.to_string()))?;
+        ctx.register_table(table.name.as_str(), Arc::new(mem))
+            .map_err(|e| EngineError::Query(e.to_string()))?;
+        Ok(())
     }
 
     /// Register a single source as table `t` for the schema/head/profile helpers.
@@ -440,10 +466,15 @@ mod tests {
         let schema = eng.schema(&source).unwrap();
         // Tab-split gives the 4 real columns, not one giant column.
         assert_eq!(schema.columns.len(), 4, "schema: {schema:?}");
-        let rb = eng.query("SELECT count(*) AS c FROM t", &[crate::engine::NamedSource {
-            name: "t".into(),
-            source,
-        }]).unwrap();
+        let rb = eng
+            .query(
+                "SELECT count(*) AS c FROM t",
+                &[crate::engine::NamedSource {
+                    name: "t".into(),
+                    source,
+                }],
+            )
+            .unwrap();
         assert_eq!(rb.num_rows(), 1);
     }
 

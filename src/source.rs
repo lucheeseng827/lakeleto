@@ -27,6 +27,12 @@ pub enum Format {
     Tsv,
     Json,
     Iceberg,
+    /// A Delta Lake table — a directory with a `_delta_log/` transaction log over Parquet data.
+    Delta,
+    /// A database table reached over a connection URI (`sqlite://` / `postgres://` / `mysql://`).
+    /// The dialect + table live in the URI (parsed by the `database` engine), so this is just the
+    /// "this source is a live DB, not a file" marker.
+    Database,
 }
 
 impl Format {
@@ -37,6 +43,8 @@ impl Format {
             Format::Tsv => "tsv",
             Format::Json => "json",
             Format::Iceberg => "iceberg",
+            Format::Delta => "delta",
+            Format::Database => "database",
         }
     }
 
@@ -48,6 +56,10 @@ impl Format {
             "tsv" => Some(Format::Tsv),
             "json" | "ndjson" | "jsonl" => Some(Format::Json),
             "iceberg" => Some(Format::Iceberg),
+            "delta" | "deltalake" => Some(Format::Delta),
+            "database" | "db" | "sqlite" | "postgres" | "postgresql" | "mysql" => {
+                Some(Format::Database)
+            }
             _ => None,
         }
     }
@@ -85,6 +97,18 @@ pub fn is_object_uri(s: &str) -> bool {
     }
 }
 
+/// Connection-URI schemes handled by the `database` engine. Recognised in every build so a DB URI
+/// gets a "rebuild with the feature" message instead of being mistaken for a file path.
+pub const DATABASE_SCHEMES: &[&str] = &["sqlite", "postgres", "postgresql", "mysql"];
+
+/// Does `s` look like a database connection URI (e.g. `sqlite:///data.db?table=orders`)?
+pub fn is_database_uri(s: &str) -> bool {
+    match s.split_once("://") {
+        Some((scheme, _)) => DATABASE_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()),
+        _ => false,
+    }
+}
+
 /// A resolved data source: a path plus the format Lakeleto detected for it.
 #[derive(Debug, Clone)]
 pub struct Source {
@@ -97,22 +121,54 @@ impl Source {
     pub fn detect(path: impl AsRef<Path>) -> Result<Source> {
         let path = path.as_ref().to_path_buf();
 
+        // Database connection URI (sqlite://… / postgres://… / mysql://…): a live DB, never a file.
+        // Classify without touching the filesystem — the `database` engine parses the URI.
+        if path.to_str().is_some_and(is_database_uri) {
+            return Ok(Source {
+                path,
+                format: Format::Database,
+            });
+        }
+
         // Object-store URI (s3://…): classify by the key's extension without touching the
         // filesystem. Magic-byte sniffing would require fetching, so an unknown extension
         // needs an explicit `--format`.
         if path.to_str().is_some_and(is_object_uri) {
-            let format =
-                format_from_extension(&path).ok_or_else(|| EngineError::UnsupportedFormat {
-                    detail: format!(
-                        "cannot infer the format of {} from its name — pass \
-                         `--format parquet|csv|json`",
-                        path.display()
-                    ),
-                })?;
-            return Ok(Source { path, format });
+            if let Some(format) = format_from_extension(&path) {
+                return Ok(Source { path, format });
+            }
+            // No data-file extension: a bare prefix is likely an Iceberg table — one cheap probe
+            // for a `metadata/` child. (Only object stores; a network round-trip, so gated behind
+            // the feature and reached only when the name gives nothing away.)
+            #[cfg(feature = "object-store")]
+            if path
+                .to_str()
+                .is_some_and(crate::objstore::looks_like_iceberg)
+            {
+                return Ok(Source {
+                    path,
+                    format: Format::Iceberg,
+                });
+            }
+            return Err(EngineError::UnsupportedFormat {
+                detail: format!(
+                    "cannot infer the format of {} from its name — pass \
+                     `--format parquet|csv|json|iceberg`",
+                    path.display()
+                ),
+            });
         }
 
         if path.is_dir() {
+            // A Delta Lake table has a `_delta_log/` transaction log. Check this BEFORE the plain
+            // parquet-dir fallback — a Delta table's data files are Parquet, so without this it
+            // would be misread as a raw parquet dataset (ignoring the log: stale/removed rows).
+            if path.join("_delta_log").is_dir() {
+                return Ok(Source {
+                    path,
+                    format: Format::Delta,
+                });
+            }
             // An Iceberg table is a directory containing a `metadata/` catalog dir.
             if path.join("metadata").is_dir() {
                 return Ok(Source {

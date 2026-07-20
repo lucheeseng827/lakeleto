@@ -163,7 +163,13 @@ impl TablePlan {
 
 /// Resolve the current-snapshot read plan: live Parquet data files + their positional deletes.
 pub fn plan(table_dir: &Path) -> Result<TablePlan> {
-    plan_with_root(table_dir, None)
+    plan_inner(table_dir, None, None)
+}
+
+/// Plan a table whose files were mirrored from object-store URI `origin` into local `table_dir`
+/// (the object-store shim). Absolute object URIs inside the metadata are remapped to the mirror.
+pub fn plan_object(table_dir: &Path, origin: &str) -> Result<TablePlan> {
+    plan_inner(table_dir, None, Some(origin))
 }
 
 /// Like [`plan`], but when `root` is `Some`, every file the reader will open — the manifest
@@ -173,13 +179,18 @@ pub fn plan(table_dir: &Path) -> Result<TablePlan> {
 /// used to read data — *or metadata* — from outside it. `None` (the engine's own call) skips the
 /// check.
 pub fn plan_with_root(table_dir: &Path, root: Option<&Path>) -> Result<TablePlan> {
+    plan_inner(table_dir, root, None)
+}
+
+/// The planner body. `origin` (object-store shim) remaps absolute object URIs to the local mirror.
+fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Result<TablePlan> {
     // Resolve a manifest/data/delete path relative to the table dir. When confined, refuse it if
     // it canonicalizes outside the root and return the **canonical** path, so the subsequent
     // `File::open` follows the already-validated target (a symlink swapped after the check can't
     // redirect the open) and delete-file keys match data-file keys. The refusal message is
     // path-free so the client-facing 403 doesn't disclose the resolved filesystem path.
     let guard = |raw: &str| -> Result<PathBuf> {
-        let p = resolve(raw, table_dir);
+        let p = resolve(raw, table_dir, origin);
         match root {
             Some(r) => match std::fs::canonicalize(&p) {
                 Ok(c) if c.starts_with(r) => Ok(c),
@@ -1243,7 +1254,17 @@ pub fn prune(plan: &TablePlan, filters: &[FilterSpec]) -> (TablePlan, usize) {
 }
 
 /// Resolve an Iceberg path (strip a `file://` scheme; join relative paths to the table dir).
-fn resolve(raw: &str, table_dir: &Path) -> PathBuf {
+///
+/// `origin` supports the object-store shim: when a table has been mirrored from an object-store URI
+/// (`s3://bucket/prefix/…`) into a local `table_dir`, the manifest/data URIs stored inside are
+/// absolute object URIs. Any that live under `origin` are remapped to the local mirror by stripping
+/// the prefix and joining the remainder to `table_dir`.
+fn resolve(raw: &str, table_dir: &Path, origin: Option<&str>) -> PathBuf {
+    if let Some(orig) = origin {
+        if let Some(rel) = raw.strip_prefix(orig) {
+            return table_dir.join(rel.trim_start_matches(['/', '\\']));
+        }
+    }
     let s = raw.strip_prefix("file://").unwrap_or(raw);
     let p = Path::new(s);
     if p.is_absolute() {

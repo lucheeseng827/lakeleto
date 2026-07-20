@@ -21,7 +21,7 @@ async fn remote_store_round_trips_against_a_live_server() {
     let dir = tempfile::tempdir().unwrap();
     let backend: Arc<dyn WorkspaceStore> = Arc::new(LocalStore::at(dir.path()).unwrap());
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
-    let app = router(read, None, 10_000, None, None, true, backend);
+    let app = router(read, None, None, 10_000, None, None, true, backend);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -88,7 +88,7 @@ async fn failed_result_upload_never_records_history() {
     let dir = tempfile::tempdir().unwrap();
     let backend: Arc<dyn WorkspaceStore> = Arc::new(LocalStore::at(dir.path()).unwrap());
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
-    let app = router(read, None, 10_000, None, None, true, backend);
+    let app = router(read, None, None, 10_000, None, None, true, backend);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

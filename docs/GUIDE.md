@@ -261,7 +261,40 @@ Details worth knowing:
 
 ---
 
-## 8. Example — an Iceberg table
+## 8. Example — query a database (bring your own SQLite)
+
+Lakeleto can point at a **live database** the same way it points at a file — with
+your own connection, read-only, nothing copied. SQLite ships today; Postgres and
+MySQL are next.
+
+A database is addressed by a **connection URI** in the path/open box:
+
+```text
+sqlite:///C:/data/app.db            # the whole database — lists its tables
+sqlite:///C:/data/app.db?table=orders   # one table, opened as a grid
+```
+
+(On Windows use forward slashes and the triple slash: `sqlite:///C:/…`. On
+macOS/Linux: `sqlite:///home/me/app.db?table=orders`.)
+
+- **Browse tables:** open the bare `sqlite:///…app.db` URI (or paste it in the
+  file box) and the sidebar lists every table — click one to open it.
+- **Explore a table:** `?table=<name>` gives you the usual **Grid / Schema /
+  Profile**, column filters, and sort — all pushed down to SQL against the DB.
+- **Run SQL:** on the **SQL** tab, query the database directly — the tables are
+  the real database tables (not a single `t`), e.g.
+  ```sql
+  SELECT city, count(*) AS n, round(sum(amount), 2) AS total
+  FROM orders
+  GROUP BY city
+  ORDER BY n DESC
+  ```
+
+Read-only by design (an explorer, not an editor) — write statements are refused,
+and the connection is opened read-only. Requires a build with `--features sqlite`
+(the release binary includes it).
+
+## 9. Example — an Iceberg table
 
 Point at the table directory (the one containing `metadata/`):
 
@@ -276,7 +309,7 @@ an Iceberg table sitting in a bucket.
 
 ---
 
-## 9. Sharing it safely (beyond your own machine)
+## 10. Sharing it safely (beyond your own machine)
 
 By default `serve` binds to loopback (`127.0.0.1`) and the API is open — fine for
 your own machine. If you expose it (a shared box, a container), lock it down:
@@ -299,7 +332,7 @@ directly. See [OPERATIONS.md](OPERATIONS.md) and [DEPLOY.md](DEPLOY.md).
 
 ---
 
-## 10. Where things live · stopping · resetting
+## 11. Where things live · stopping · resetting
 
 - **Workspace state:** `~/.lakeleto/workspaces/<id>/` (`workspace.json`,
   `history.jsonl`, `results/*.parquet`). Override the base with `LAKELETO_HOME`.
@@ -307,7 +340,7 @@ directly. See [OPERATIONS.md](OPERATIONS.md) and [DEPLOY.md](DEPLOY.md).
 - **Reset a workspace:** delete its folder under `~/.lakeleto/workspaces/`, or use
   **Delete** in the workspace bar.
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |

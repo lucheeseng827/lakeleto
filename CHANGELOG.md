@@ -8,6 +8,30 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [0.1.4] - 2026-07-21
+
+### Added
+- **Bring your own database** — read-only connectors for **SQLite, Postgres, and
+  MySQL** behind the same `Engine` trait (via sqlx). Address a table with a
+  connection URI (`sqlite:///…?table=…`, `postgres://…`, `mysql://…`); a URI with
+  no `?table=` browses the database's tables. Credentials can use `{{VAR}}`
+  placeholders so they aren't stored in the workspace. NUMERIC/DECIMAL render as
+  numbers and dates as text (via bigdecimal/chrono). New sidebar **＋ Add
+  connection** form (SQLite / Postgres / MySQL / File) with editable properties.
+- **Delta Lake tables** — a correct, self-contained reader that replays the
+  `_delta_log` transaction log (add/remove, latest schema, partition columns from
+  add-actions), so overwrites/deletes read the right snapshot instead of stale
+  files. (JSON commit log; checkpoints not consulted.)
+- **Iceberg on object storage** (`s3://` / `gs://` / `az://`) — an object-store
+  Iceberg table is mirrored to a local temp dir and read with your own env
+  credentials; a bare prefix with a `metadata/` child auto-detects as Iceberg.
+
+### Fixed
+- **SQL over Iceberg and over a Hive-partitioned Parquet directory** — the SQL
+  engine now reads both (partition columns included) by materializing them through
+  the local reader; previously Iceberg was unsupported in SQL and a partitioned
+  directory dropped its partition columns.
+
 ## [0.1.3] - 2026-07-20
 
 ### Fixed

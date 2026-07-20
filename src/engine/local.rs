@@ -46,9 +46,23 @@ impl Default for LocalReaderEngine {
 }
 
 impl LocalReaderEngine {
+    /// Resolve the Iceberg read plan for `source`. A local table plans directly; an object-store
+    /// table (`s3://…`) is first mirrored to a local temp dir (once per process) and planned
+    /// against the mirror, with the absolute object URIs in its metadata remapped to the mirror.
+    #[cfg(feature = "iceberg")]
+    fn iceberg_plan(&self, source: &Source) -> Result<crate::iceberg::TablePlan> {
+        #[cfg(feature = "object-store")]
+        if source.is_remote() {
+            let uri = source.path.to_string_lossy();
+            let local = crate::objstore::materialize_prefix(uri.as_ref())?;
+            return crate::iceberg::plan_object(&local, uri.as_ref());
+        }
+        crate::iceberg::plan(&source.path)
+    }
+
     /// Open just the schema (+ a cheap row count when the format carries one).
     fn open_schema(&self, source: &Source) -> Result<(SchemaRef, Option<u64>)> {
-        if source.is_remote() {
+        if source.is_remote() && !matches!(source.format, Format::Iceberg) {
             return self.remote_schema(source);
         }
         if is_parquet_dataset(source) {
@@ -70,7 +84,7 @@ impl LocalReaderEngine {
             )),
             #[cfg(feature = "iceberg")]
             Format::Iceberg => {
-                let plan = crate::iceberg::plan(&source.path)?;
+                let plan = self.iceberg_plan(source)?;
                 let first = plan
                     .files
                     .first()
@@ -103,6 +117,14 @@ impl LocalReaderEngine {
                 }
                 Ok((schema, (total >= 0).then_some(total as u64)))
             }
+            #[cfg(feature = "delta")]
+            Format::Delta => {
+                let plan = crate::engine::delta::plan(&source.path)?;
+                Ok((
+                    crate::engine::delta::schema(&plan)?,
+                    Some(crate::engine::delta::row_count(&plan)?),
+                ))
+            }
             other => Err(EngineError::unsupported_format(other, self.name())),
         }
     }
@@ -130,7 +152,7 @@ impl LocalReaderEngine {
         source: &Source,
         row_limit: Option<usize>,
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>)> {
-        if source.is_remote() {
+        if source.is_remote() && !matches!(source.format, Format::Iceberg) {
             return self.remote_window(source, 0, row_limit.unwrap_or(usize::MAX));
         }
         if is_parquet_dataset(source) {
@@ -194,6 +216,8 @@ impl LocalReaderEngine {
             }
             #[cfg(feature = "iceberg")]
             Format::Iceberg => self.read_window(source, 0, row_limit.unwrap_or(usize::MAX), None),
+            #[cfg(feature = "delta")]
+            Format::Delta => self.read_window(source, 0, row_limit.unwrap_or(usize::MAX), None),
             other => Err(EngineError::unsupported_format(other, self.name())),
         }
     }
@@ -210,7 +234,7 @@ impl LocalReaderEngine {
         limit: usize,
         projection: Option<&[String]>,
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>)> {
-        if source.is_remote() {
+        if source.is_remote() && !matches!(source.format, Format::Iceberg) {
             return self.remote_window(source, offset, limit);
         }
         if is_parquet_dataset(source) {
@@ -256,8 +280,13 @@ impl LocalReaderEngine {
             }
             #[cfg(feature = "iceberg")]
             Format::Iceberg => {
-                let plan = crate::iceberg::plan(&source.path)?;
+                let plan = self.iceberg_plan(source)?;
                 self.read_iceberg(source, &plan, offset, limit, None)
+            }
+            #[cfg(feature = "delta")]
+            Format::Delta => {
+                let plan = crate::engine::delta::plan(&source.path)?;
+                crate::engine::delta::read_window(&plan, offset, limit)
             }
             other => Err(EngineError::unsupported_format(other, self.name())),
         }
@@ -509,7 +538,7 @@ impl LocalReaderEngine {
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>, usize)> {
         #[cfg(feature = "iceberg")]
         if source.format == Format::Iceberg && !filters.is_empty() {
-            let plan = crate::iceberg::plan(&source.path)?;
+            let plan = self.iceberg_plan(source)?;
             let (pruned, skipped) = crate::iceberg::prune(&plan, filters);
             if skipped > 0 && pruned.files.is_empty() {
                 // Every file pruned out → an empty result under the table's schema (not an error).

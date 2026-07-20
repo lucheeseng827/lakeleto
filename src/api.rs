@@ -56,7 +56,7 @@ use crate::engine::{
     ScanSpec, SortSpec, TableProfile, TableSchema,
 };
 use crate::error::EngineError;
-use crate::source::{list_dir, DirListing, Format, Source};
+use crate::source::{list_dir, DirEntry, DirListing, Format, Source};
 use crate::workspace::{RunRecord, RunStatus, Workspace, WorkspaceBundle, WorkspaceStore};
 
 /// Export view cap — the most rows `GET /v1/export` will materialize.
@@ -103,6 +103,9 @@ const ENDPOINTS: &[&str] = &[
 pub struct AppState {
     read: Arc<dyn Engine>,
     sql: Option<Arc<dyn Engine>>,
+    /// The BYO-database engine (sqlx). Present when a DB backend feature is compiled in. Every
+    /// `Format::Database` source is routed here (the file engines can't read a live DB).
+    db: Option<Arc<dyn Engine>>,
     default_scan: usize,
     /// When set, `/v1/*` requires this bearer token (header always; `?token=` only on a loopback
     /// bind). The SPA + `/healthz` are exempt so the page can load and health checks stay open.
@@ -123,6 +126,7 @@ pub struct AppState {
 pub fn router(
     read: Arc<dyn Engine>,
     sql: Option<Arc<dyn Engine>>,
+    db: Option<Arc<dyn Engine>>,
     default_scan: usize,
     token: Option<String>,
     root: Option<PathBuf>,
@@ -132,6 +136,7 @@ pub fn router(
     let state = AppState {
         read,
         sql,
+        db,
         default_scan,
         token: token.map(Arc::from),
         root: root.map(Arc::new),
@@ -284,6 +289,7 @@ pub fn serve(
     addr: &str,
     read: Arc<dyn Engine>,
     sql: Option<Arc<dyn Engine>>,
+    db: Option<Arc<dyn Engine>>,
     default_scan: usize,
     open_url: Option<String>,
     token: Option<String>,
@@ -301,6 +307,7 @@ pub fn serve(
     let app = router(
         read,
         sql,
+        db,
         default_scan,
         token.clone(),
         root,
@@ -387,8 +394,8 @@ fn out_of_root() -> ApiError {
 /// No-op when no root is configured (the default "point at any file" behaviour).
 fn confine_entry(root: &Option<Arc<PathBuf>>, path: &str) -> Result<(), ApiError> {
     let Some(root) = root else { return Ok(()) };
-    if crate::source::is_object_uri(path) {
-        return Err(out_of_root()); // --root is local-filesystem only
+    if crate::source::is_object_uri(path) || crate::source::is_database_uri(path) {
+        return Err(out_of_root()); // --root is local-filesystem only (no object-store / DB URIs)
     }
     // Walk up to the nearest existing ancestor and canonicalize it (symlinks resolved). If that
     // lies under the root the request is in-root (a missing leaf 404s later); otherwise — or when
@@ -608,7 +615,7 @@ async fn schema(
     confine_entry(&st.root, &q.path)?;
     let source = Source::resolve(&q.path, q.format.as_deref())?;
     confine_members(&st.root, &source)?;
-    let engine = st.read.clone();
+    let engine = read_engine(&st, &source)?;
     Ok(Json(blocking(move || engine.schema(&source)).await?))
 }
 
@@ -622,8 +629,8 @@ async fn info(
     let size_bytes = std::fs::metadata(&source.path).map(|m| m.len()).ok();
     let format = source.format.to_string();
     let path = source.display();
-    let engine_name = st.read.name().to_string();
-    let engine = st.read.clone();
+    let engine = read_engine(&st, &source)?;
+    let engine_name = engine.name().to_string();
     let schema = blocking(move || engine.schema(&source)).await?;
     Ok(Json(InfoResponse {
         path,
@@ -643,7 +650,7 @@ async fn preview(
     let source = Source::resolve(&q.path, q.format.as_deref())?;
     confine_members(&st.root, &source)?;
     let limit = q.limit.unwrap_or(50);
-    let engine = st.read.clone();
+    let engine = read_engine(&st, &source)?;
     let resp = blocking(move || rows_response(engine.preview(&source, limit)?)).await?;
     Ok(Json(resp))
 }
@@ -656,7 +663,7 @@ async fn profile(
     let source = Source::resolve(&q.path, q.format.as_deref())?;
     confine_members(&st.root, &source)?;
     let scan = q.scan.unwrap_or(st.default_scan);
-    let engine = st.read.clone();
+    let engine = read_engine(&st, &source)?;
     Ok(Json(blocking(move || engine.profile(&source, scan)).await?))
 }
 
@@ -692,10 +699,16 @@ async fn query(
         )));
     }
 
-    let engine = st
-        .sql
-        .clone()
-        .ok_or_else(|| ApiError(EngineError::missing_feature("run SQL", "sql")))?;
+    let engine = if named.iter().any(|n| n.source.format == Format::Database) {
+        // A DB table routes to the DB engine (it runs the SQL against the first table's connection).
+        st.db
+            .clone()
+            .ok_or_else(|| ApiError(EngineError::missing_feature("query a database", "sqlite")))?
+    } else {
+        st.sql
+            .clone()
+            .ok_or_else(|| ApiError(EngineError::missing_feature("run SQL", "sql")))?
+    };
     let sql = body.sql.clone();
     let resp = blocking(move || rows_response(engine.query(&sql, &named)?)).await?;
     Ok(Json(resp))
@@ -711,7 +724,7 @@ async fn rows(
     let source = Source::resolve(&params.path, params.format.as_deref())?;
     confine_members(&st.root, &source)?;
     let spec = params.spec;
-    let engine = scan_engine(&st, &spec);
+    let engine = scan_engine_for(&st, &source, &spec)?;
     let res = blocking(move || engine.scan(&source, &spec)).await?;
     rows_window(res)
 }
@@ -727,7 +740,7 @@ async fn stats(
     confine_members(&st.root, &source)?;
     let filters = params.spec.filters;
     let scan = st.default_scan;
-    let engine = st.read.clone();
+    let engine = read_engine(&st, &source)?;
     Ok(Json(
         blocking(move || engine.stats(&source, &filters, scan)).await?,
     ))
@@ -744,7 +757,7 @@ async fn export(State(st): State<AppState>, RawQuery(q): RawQuery) -> Result<Res
     let source = Source::resolve(&params.path, params.format.as_deref())?;
     confine_members(&st.root, &source)?;
     let spec = params.spec;
-    let engine = scan_engine(&st, &spec);
+    let engine = scan_engine_for(&st, &source, &spec)?;
 
     let (body, mime, ext) = blocking(move || {
         let rb = engine.scan(&source, &spec)?.batch;
@@ -793,6 +806,20 @@ async fn list(
         .find(|(k, _)| k == "dir")
         .map(|(_, v)| v.clone())
         .unwrap_or_else(|| default_dir(&st.root));
+    // A database URI lists its tables instead of a directory — each table becomes a "file" entry
+    // deep-linked with `?table=<name>`. Refused under `--root` (local-filesystem only), like an
+    // object-store prefix.
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    if crate::source::is_database_uri(&dir) {
+        if st.root.is_some() {
+            return Err(out_of_root());
+        }
+        let listing = tokio::task::spawn_blocking(move || db_listing(&dir))
+            .await
+            .map_err(|e| ApiError(EngineError::Other(format!("worker task failed: {e}"))))?
+            .map_err(ApiError)?;
+        return Ok(Json(listing));
+    }
     // Confine browsing to the root when set (also refuses object-store prefixes — `--root` is
     // local-filesystem only). Uses the same pre-access gate as the read handlers.
     confine_entry(&st.root, &dir)?;
@@ -801,6 +828,33 @@ async fn list(
         .map_err(|e| ApiError(EngineError::Other(format!("worker task failed: {e}"))))?
         .map_err(ApiError)?;
     Ok(Json(listing))
+}
+
+/// List a database's tables as a [`DirListing`] — each table an entry deep-linked `?table=<name>`
+/// so clicking it opens that table as a `Format::Database` source.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+fn db_listing(dir: &str) -> Result<DirListing, EngineError> {
+    // Strip any existing `?table=…` so we always list the whole database.
+    let base = dir.split('?').next().unwrap_or(dir).to_string();
+    let tables = crate::engine::database::list_tables(dir)?;
+    let entries = tables
+        .into_iter()
+        .map(|name| {
+            let path = format!("{base}?table={name}");
+            DirEntry {
+                name,
+                path,
+                kind: "file",
+                format: Some("database".to_string()),
+                size: None,
+            }
+        })
+        .collect();
+    Ok(DirListing {
+        dir: base,
+        parent: None,
+        entries,
+    })
 }
 
 // ---- workspaces (Postman-style data plane) --------------------------------------------
@@ -933,7 +987,12 @@ async fn ws_run(
     let sql = req.sql.filter(|s| !s.trim().is_empty());
     let cap = req.limit.unwrap_or(10_000).clamp(1, WORKSPACE_RUN_CAP);
     let preview_n = req.preview.unwrap_or(200).clamp(1, cap);
-    let engine = if sql.is_some() {
+    let engine = if source.format == Format::Database {
+        // A DB source always goes to the DB engine — for both a raw SQL run and a plain scan.
+        st.db
+            .clone()
+            .ok_or_else(|| ApiError(EngineError::missing_feature("query a database", "sqlite")))?
+    } else if sql.is_some() {
         st.sql
             .clone()
             .ok_or_else(|| ApiError(EngineError::missing_feature("run SQL", "sql")))?
@@ -1188,6 +1247,33 @@ fn scan_engine(st: &AppState, spec: &ScanSpec) -> Arc<dyn Engine> {
     match &st.sql {
         Some(sql) if !spec.is_plain_window() => sql.clone(),
         _ => st.read.clone(),
+    }
+}
+
+/// Route a source to the engine that can read it: the DB engine for a `Format::Database` source,
+/// else the file read engine. Errors clearly when a DB source arrives with no DB backend compiled.
+fn read_engine(st: &AppState, source: &Source) -> Result<Arc<dyn Engine>, ApiError> {
+    if source.format == Format::Database {
+        st.db
+            .clone()
+            .ok_or_else(|| ApiError(EngineError::missing_feature("query a database", "sqlite")))
+    } else {
+        Ok(st.read.clone())
+    }
+}
+
+/// Like [`scan_engine`] but routes a DB source to the DB engine (which does its own filter/sort).
+fn scan_engine_for(
+    st: &AppState,
+    source: &Source,
+    spec: &ScanSpec,
+) -> Result<Arc<dyn Engine>, ApiError> {
+    if source.format == Format::Database {
+        st.db
+            .clone()
+            .ok_or_else(|| ApiError(EngineError::missing_feature("query a database", "sqlite")))
+    } else {
+        Ok(scan_engine(st, spec))
     }
 }
 

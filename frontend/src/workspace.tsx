@@ -279,6 +279,111 @@ function VariablesEditor({ variables, mutate }: { variables: WsVariable[]; mutat
   );
 }
 
+type ConnKind = "sqlite" | "postgres" | "mysql" | "file";
+// Split a stored connection back into editable form fields (kind / path / table / label / desc).
+function connToForm(c: WsConnection): { kind: ConnKind; path: string; table: string } {
+  const m = /^(sqlite|postgres|postgresql|mysql):/i.exec(c.path);
+  if (m) {
+    const [base, qs] = c.path.split("?");
+    const table = new URLSearchParams(qs || "").get("table") || "";
+    const scheme = m[1].toLowerCase();
+    if (scheme === "sqlite") return { kind: "sqlite", path: base.replace(/^sqlite:\/\/\/?/i, ""), table };
+    return { kind: scheme === "mysql" ? "mysql" : "postgres", path: base, table };
+  }
+  return { kind: "file", path: c.path, table: "" };
+}
+
+// Add/edit connection form: a local file/URI, or a SQLite database (built into a
+// `sqlite:///…?table=` URI). Shown inline in the Connections section via ＋ (add) or the ✎ on a
+// row (edit its properties). `initial` prefills for editing.
+function AddConnectionForm({ initial, onSubmit, onCancel }: {
+  initial?: WsConnection | null;
+  onSubmit: (c: { label: string; path: string; format?: string | null; description?: string | null }) => void;
+  onCancel: () => void;
+}) {
+  const pre = initial ? connToForm(initial) : null;
+  const [kind, setKind] = useState<ConnKind>(pre?.kind ?? "sqlite");
+  const [path, setPath] = useState(pre?.path ?? "");
+  const [table, setTable] = useState(pre?.table ?? "");
+  const [label, setLabel] = useState(initial?.label ?? "");
+  const [desc, setDesc] = useState(initial?.description ?? "");
+  const isDb = kind !== "file";
+  const submit = () => {
+    const p = path.trim();
+    if (!p) return;
+    const description = desc.trim() || null;
+    const withTable = (uri: string) => {
+      const t = table.trim();
+      return t && !/[?&]table=/.test(uri) ? uri + (uri.includes("?") ? "&" : "?") + "table=" + encodeURIComponent(t) : uri;
+    };
+    if (kind === "sqlite") {
+      const file = p.replace(/\\/g, "/");
+      // A non-sqlite URI pasted into the SQLite tab (e.g. s3:// / gs:// / az://) is a plain source,
+      // not a SQLite file — don't wrap it in sqlite:///. (Handles the common mistake.)
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(file) && !/^sqlite:/i.test(file)) {
+        onSubmit({ label: label.trim() || basename(file.split("?")[0]), path: file, format: null, description });
+        return;
+      }
+      const uri = withTable(/^sqlite:/i.test(file) ? file : `sqlite:///${file.replace(/^\/+/, "")}`);
+      onSubmit({ label: label.trim() || table.trim() || basename(file.split("?")[0]), path: uri, format: "database", description });
+    } else if (kind === "postgres" || kind === "mysql") {
+      const scheme = kind === "mysql" ? "mysql" : "postgres";
+      const uri = withTable(/^(postgres|postgresql|mysql):\/\//i.test(p) ? p : `${scheme}://${p}`);
+      onSubmit({ label: label.trim() || table.trim() || kind, path: uri, format: "database", description });
+    } else {
+      onSubmit({ label: label.trim() || basename(p), path: p, format: null, description });
+    }
+  };
+  const lbl: CSSProperties = { fontSize: "var(--text-xs)", color: "var(--muted)", display: "block", marginBottom: 2 };
+  const field: CSSProperties = { marginBottom: 6 };
+  const pathLabel = kind === "sqlite" ? "Database file path" : kind === "file" ? "File path or URI" : "Connection URI";
+  const pathPlaceholder = kind === "sqlite" ? "C:\\data\\app.db"
+    : kind === "postgres" ? "postgres://user:{{PGPASS}}@host:5432/db"
+    : kind === "mysql" ? "mysql://user:{{MYSQLPASS}}@host:3306/db"
+    : "C:\\data\\file.parquet  ·  s3://bucket/x.parquet";
+  return (
+    <div style={{ border: "var(--border-hairline)", borderRadius: "var(--radius-sm)", padding: "var(--space-5)", marginBottom: 8, background: "var(--bg)" }}>
+      <div style={{ display: "flex", gap: 3, marginBottom: 8 }}>
+        {(["sqlite", "postgres", "mysql", "file"] as const).map((k) => (
+          <button key={k} onClick={() => setKind(k)}
+            style={{ flex: 1, padding: "4px 2px", fontSize: "var(--text-xs)", border: "var(--border-hairline)", borderRadius: "var(--radius-sm)", cursor: "pointer",
+              background: kind === k ? "var(--accent)" : "var(--panel)", color: kind === k ? "var(--accent-fg)" : "var(--fg)" }}>
+            {k === "sqlite" ? "SQLite" : k === "postgres" ? "Postgres" : k === "mysql" ? "MySQL" : "File"}
+          </button>
+        ))}
+      </div>
+      <div style={field}>
+        <label style={lbl}>{pathLabel}</label>
+        <TextInput value={path} onChange={setPath} placeholder={pathPlaceholder}
+          onKeyDown={(e) => { if (e.key === "Enter") submit(); }} />
+      </div>
+      {(kind === "postgres" || kind === "mysql") && (
+        <div style={{ ...lbl, marginTop: -2, marginBottom: 6 }}>
+          Tip: put the password in a <code>{"{{VAR}}"}</code> and define it under Variables, so it isn't stored in the workspace file.
+        </div>
+      )}
+      {isDb && (
+        <div style={field}>
+          <label style={lbl}>Table (optional — leave blank to browse tables)</label>
+          <TextInput value={table} onChange={setTable} placeholder="orders" onKeyDown={(e) => { if (e.key === "Enter") submit(); }} />
+        </div>
+      )}
+      <div style={field}>
+        <label style={lbl}>Label (optional)</label>
+        <TextInput value={label} onChange={setLabel} placeholder="my connection" onKeyDown={(e) => { if (e.key === "Enter") submit(); }} />
+      </div>
+      <div style={field}>
+        <label style={lbl}>Description (optional)</label>
+        <TextInput value={desc} onChange={setDesc} mono={false} placeholder="notes" onKeyDown={(e) => { if (e.key === "Enter") submit(); }} />
+      </div>
+      <div style={{ display: "flex", gap: 6, justifyContent: "flex-end", marginTop: 2 }}>
+        <Button size="sm" onClick={onCancel}>Cancel</Button>
+        <Button size="sm" variant="primary" disabled={!path.trim()} onClick={submit}>{initial ? "Save" : "Add"}</Button>
+      </div>
+    </div>
+  );
+}
+
 // ======================================================================
 // Sidebar — connections, saved queries (grouped into folders), variables, files
 // ======================================================================
@@ -330,6 +435,21 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
   const pinQuery = (id: string) => mutate((w) => ({ ...w, saved_queries: w.saved_queries.map((q) => (q.id === id ? { ...q, pinned: !q.pinned } : q)) }));
   const delQuery = (id: string) => mutate((w) => ({ ...w, saved_queries: w.saved_queries.filter((q) => q.id !== id) }));
 
+  // Add/edit-connection form (a file path or a database URI) shown inline in the Connections section.
+  const [addingConn, setAddingConn] = useState(false);
+  const [editingConn, setEditingConn] = useState<WsConnection | null>(null);
+  type ConnForm = { label: string; path: string; format?: string | null; description?: string | null };
+  const addConn = (c: ConnForm) => {
+    const conn: WsConnection = { id: "conn-" + newTabId(), label: c.label, path: c.path, format: c.format ?? null, description: c.description ?? null };
+    mutate((w) => ({ ...w, connections: [...w.connections, conn] }));
+    setAddingConn(false);
+    onOpenConnection(conn);
+  };
+  const updateConn = (id: string, c: ConnForm) => {
+    mutate((w) => ({ ...w, connections: w.connections.map((x) => (x.id === id ? { ...x, label: c.label, path: c.path, format: c.format ?? null, description: c.description ?? null } : x)) }));
+    setEditingConn(null);
+  };
+
   // group queries by folder (undefined → ungrouped, rendered first)
   const folders = new Map<string, WsSavedQuery[]>();
   const ungrouped: WsSavedQuery[] = [];
@@ -344,7 +464,7 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
   );
 
   // Each section rendered by id, so the order can be reordered + persisted.
-  const sections: Record<string, { title: string; body: ReactNode }> = {
+  const sections: Record<string, { title: string; body: ReactNode; action?: ReactNode }> = {
     files: {
       title: `Files${listing ? ` · ${listing.entries.filter((e) => e.kind === "dir").length} dirs / ${listing.entries.filter((e) => e.kind === "file").length} files` : ""}`,
       body: listing ? (
@@ -363,13 +483,25 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
     },
     connections: {
       title: `Connections (${connections.length})`,
+      action: (
+        <span role="button" tabIndex={0} title="add a connection (file or database)"
+          onClick={(e) => { e.stopPropagation(); setEditingConn(null); setAddingConn((v) => !v); }}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setEditingConn(null); setAddingConn((v) => !v); } }}
+          style={{ cursor: "pointer", color: "var(--muted)", fontSize: "var(--text-ui)", lineHeight: 1, padding: "0 2px" }}>＋</span>
+      ),
       body: (
         <>
-          {connections.length === 0 && <div style={hint}>Save a source with ⭑ in a tab.</div>}
+          {(addingConn || editingConn) && (
+            <AddConnectionForm initial={editingConn}
+              onSubmit={editingConn ? (c) => updateConn(editingConn.id, c) : addConn}
+              onCancel={() => { setAddingConn(false); setEditingConn(null); }} />
+          )}
+          {connections.length === 0 && !addingConn && <div style={hint}>Add a source with ＋, or save one with ⭑ in a tab.</div>}
           {[...connections].sort(byPinned).map((c) => (
-            <SideRow key={c.id} icon="▤" label={c.label} sub={c.description || undefined}
+            <SideRow key={c.id} icon={c.format === "database" ? "🗄" : "▤"} label={c.label}
+              sub={c.description || (c.format === "database" ? "database" : undefined)}
               onClick={() => onOpenConnection(c)} onDelete={() => delConn(c.id)} onPin={() => pinConn(c.id)} pinned={c.pinned}
-              onEdit={() => editDesc("conn", c.id, c.description)} title={c.path} />
+              onEdit={() => { setAddingConn(false); setEditingConn(c); }} title={c.path} />
           ))}
         </>
       ),
@@ -411,7 +543,7 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
   return (
     <aside style={aside}>
       {order.filter((id) => sections[id]).map((id) => (
-        <Section key={id} title={sections[id].title}
+        <Section key={id} title={sections[id].title} action={sections[id].action}
           collapsed={!!secCollapsed[id]} onToggle={() => toggleSec(id)}
           drag={{
             onDragStart: () => setDragId(id),

@@ -78,8 +78,13 @@ export function App() {
   const loadListingFor = (path: string) => backend && backend.list(dirOf(path)).then(setListing).catch(() => { /* ignore */ });
   const openDir = (d: string) => backend && backend.list(d).then((l) => { setListing(l); setErr(null); }).catch((e) => setErr((e as Error).message));
 
+  // A whole-database URI (a DB URI with no `?table=`) has no single grid to show — browse its
+  // tables instead of opening it as a table (which would error). Guarded HERE so every caller
+  // (sidebar click, workspace auto-open, a persisted tab, the launcher) is covered.
+  const isWholeDbUri = (p: string) => /^(sqlite|postgres|postgresql|mysql):\/\//i.test(p) && !/[?&]table=/.test(p);
   const openPath = (path: string, opts: { connId?: string | null; title?: string } = {}) => {
     setErr(null);
+    if (isWholeDbUri(path)) { openDir(path); return; }
     const existing = tabs.find((t) => t.kind === "data" && t.path === path);
     if (existing) { setActiveId(existing.id); if (opts.connId) patchTab(existing.id, { connId: opts.connId }); }
     else addTab(newDataTab(path, opts));
@@ -110,9 +115,13 @@ export function App() {
       const w = await backend.wsGet(id);
       setWs(w); setWsId(id); setSavedKey(null); setCompareSel(null);
       let t = docToTabs(w);
-      if (t.length === 0 && w.connections[0]) t = [newDataTab(w.connections[0].path, { connId: w.connections[0].id })];
+      const conn0 = w.connections[0];
+      // Auto-open the first connection as a grid — but NOT a whole-database URI (it has no single
+      // table; browse its tables instead so we don't open a tab that errors).
+      if (t.length === 0 && conn0 && !isWholeDbUri(conn0.path)) t = [newDataTab(conn0.path, { connId: conn0.id })];
       setTabs(t); setActiveId(t[0]?.id ?? null);
       if (t[0]) loadListingFor(t[0].path);
+      else if (conn0 && isWholeDbUri(conn0.path)) { backend.list(conn0.path).then(setListing).catch(() => { /* ignore */ }); }
       else {
         // Fresh workspace: show the server's default dir and auto-open its first data file so the
         // grid isn't empty on first load (no hardcoded sample path — works against any root).
@@ -211,6 +220,7 @@ export function App() {
   };
 
   // ---- connection / saved-query actions ----
+  // openPath handles a whole-database URI (no ?table=) by browsing its tables.
   const openConnection = (c: WsConnection) => openPath(c.path, { connId: c.id, title: c.label });
   const saveConnection = () => {
     if (!active || active.kind !== "data" || !ws) return;

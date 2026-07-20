@@ -22,9 +22,14 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
 }) {
   const { sub, sort, filters, sql } = tab;
   const rpath = resolve(tab.path);          // {{var}} → value; the engine only ever sees resolved paths
+  // A whole-database URI (a DB URI with no ?table=) has no single grid — never fetch schema/rows for
+  // it (that errors "names a whole database"); show a table picker instead. Guarded HERE so a tab
+  // that lands on a whole-DB path by ANY route (restore, launcher, add) browses rather than errors.
+  const wholeDb = /^(sqlite|postgres|postgresql|mysql):\/\//i.test(rpath) && !/[?&]table=/.test(rpath);
   const [grid, setGrid] = useState<RowsResp | null>(null);
   const [schema, setSchema] = useState<SchemaResp | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [dbTables, setDbTables] = useState<{ name: string; path: string }[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [exportFmt, setExportFmt] = useState("csv");
   const [resultSearch, setResultSearch] = useState("");
@@ -39,6 +44,13 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
     setErr(null);
     let cancelled = false;
     const fail = (e: unknown) => { if (!cancelled) setErr((e as Error).message); };
+    if (wholeDb) {
+      // Browse the database's tables instead of querying it as one.
+      backend.list(rpath)
+        .then((l) => { if (!cancelled) setDbTables(l.entries.map((e) => ({ name: e.name, path: e.path }))); })
+        .catch((e) => { if (!cancelled) { setDbTables(null); fail(e); } });
+      return () => { cancelled = true; };
+    }
     if (sub === "Grid") backend.rows({ path: rpath, offset: 0, limit: 200, sort, filters })
       .then((r) => { if (!cancelled) setGrid(r); }).catch((e) => { if (!cancelled) setGrid(null); fail(e); });
     else if (sub === "Schema") backend.schema(rpath)
@@ -98,6 +110,24 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
       </div>
 
       {err && <div style={{ padding: "var(--gutter)" }}><Banner tone="err">{err}</Banner></div>}
+
+      {!err && wholeDb && (
+        <div style={pane}>
+          <div style={{ color: "var(--muted)", fontSize: "var(--text-12)", marginBottom: 10 }}>
+            This is a database — pick a table to open{dbTables ? ` (${dbTables.length} tables)` : "…"}.
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, maxWidth: 480 }}>
+            {(dbTables || []).map((t) => (
+              <button key={t.path} title={t.path}
+                onClick={() => onPatch({ path: t.path, title: t.name, sub: "Grid", sort: null, filters: {} })}
+                style={{ display: "flex", alignItems: "center", gap: 8, textAlign: "left", padding: "7px 10px", border: "var(--border-hairline)", borderRadius: "var(--radius-sm)", background: "var(--bg)", color: "var(--fg)", cursor: "pointer", font: "inherit" }}>
+                <span style={{ color: "var(--accent)" }}>▦</span>{t.name}
+              </button>
+            ))}
+            {dbTables && dbTables.length === 0 && <div style={{ color: "var(--muted)" }}>No tables found.</div>}
+          </div>
+        </div>
+      )}
 
       {!err && sub === "Grid" && grid && (
         <DataGrid columns={grid.columns} rows={grid.rows} sort={sort} onSort={toggleSort}

@@ -209,6 +209,7 @@ pub fn run(cli: Cli) -> Result<i32> {
                 addr,
                 read,
                 sql_engine_arc(),
+                db_engine_arc(),
                 *default_scan,
                 None,
                 token.clone(),
@@ -236,6 +237,7 @@ pub fn run(cli: Cli) -> Result<i32> {
                 addr,
                 read,
                 sql_engine_arc(),
+                db_engine_arc(),
                 *default_scan,
                 Some(url),
                 token.clone(),
@@ -298,6 +300,27 @@ fn sql_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
 
 #[cfg(all(feature = "serve", not(feature = "sql")))]
 fn sql_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
+    None
+}
+
+/// The BYO-database engine (sqlx) for `Format::Database` sources — `None` unless built with a DB
+/// backend feature (`sqlite`/`postgres`/`mysql`); the engine dispatches per dialect. Gate matches
+/// `engine::database` and `engine::mod`.
+#[cfg(all(
+    feature = "serve",
+    any(feature = "sqlite", feature = "postgres", feature = "mysql")
+))]
+fn db_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
+    Some(std::sync::Arc::new(
+        crate::engine::database::DatabaseEngine::new(),
+    ))
+}
+
+#[cfg(all(
+    feature = "serve",
+    not(any(feature = "sqlite", feature = "postgres", feature = "mysql"))
+))]
+fn db_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
     None
 }
 

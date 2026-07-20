@@ -16,7 +16,10 @@
 //! plus the row groups a window touches are fetched — so remote reads stay larger-than-memory
 //! just like the local engine's. CSV, being line-oriented, is fetched whole.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -61,6 +64,91 @@ fn parse_uri(uri: &str) -> Result<Url> {
     Url::parse(uri).map_err(|e| EngineError::UnsupportedFormat {
         detail: format!("not a valid object-store URL `{uri}`: {e}"),
     })
+}
+
+/// Cheap probe: does the object-store prefix look like an Iceberg table? True when it has a
+/// `metadata/` child object. Lets `Source::detect` classify an extensionless `s3://…/table` prefix
+/// as Iceberg (one `list` call; only reached when the name has no data-file extension).
+pub fn looks_like_iceberg(uri: &str) -> bool {
+    // `Source::detect` runs on the serve async thread; calling `block_on` there would panic
+    // ("Cannot start a runtime from within a runtime"). Run the probe on a scratch OS thread, which
+    // is not a Tokio worker, so `block_on` on our own runtime is legal.
+    let uri = uri.to_string();
+    std::thread::spawn(move || {
+        let Ok((store, prefix)) = store_for(&uri) else {
+            return false;
+        };
+        let meta = ObjPath::from(format!("{}/metadata", prefix.as_ref().trim_end_matches('/')));
+        runtime().block_on(async {
+            let mut listing = store.list(Some(&meta));
+            matches!(listing.next().await, Some(Ok(_)))
+        })
+    })
+    .join()
+    .unwrap_or(false)
+}
+
+/// Mirror an object-store prefix (an Iceberg table directory) to a local temp directory, **once
+/// per process** (cached by URI). Returns the local mirror root.
+///
+/// The Iceberg reader is filesystem-based; this shim lets it read a table that lives in a bucket:
+/// download the whole prefix (metadata + Avro manifests + Parquet data), then plan against the
+/// mirror with [`crate::iceberg::plan_object`], which remaps the absolute object URIs stored in the
+/// metadata back to the mirror. Keys are laid out relative to the prefix (so `…/metadata/x.avro`
+/// mirrors to `<dest>/metadata/x.avro`), matching how `plan_object` strips the origin URI. Trades
+/// ranged reads for simplicity — appropriate for exploring a table, not a streaming path.
+pub fn materialize_prefix(uri: &str) -> Result<PathBuf> {
+    static CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(p) = cache.lock().unwrap().get(uri) {
+        return Ok(p.clone());
+    }
+    let (store, prefix) = store_for(uri)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&uri, &mut hasher);
+    let dest = std::env::temp_dir().join(format!(
+        "lakeleto-obj-{:016x}",
+        std::hash::Hasher::finish(&hasher)
+    ));
+    let prefix_str = prefix.as_ref().to_string();
+    runtime().block_on(async {
+        let mut listing = store.list(Some(&prefix));
+        let mut n = 0usize;
+        while let Some(meta) = listing.next().await {
+            let meta =
+                meta.map_err(|e| EngineError::Other(format!("object-store list {uri}: {e}")))?;
+            let key = meta.location.as_ref();
+            let rel = key
+                .strip_prefix(&prefix_str)
+                .unwrap_or(key)
+                .trim_start_matches('/');
+            let out = dest.join(rel);
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let bytes = store
+                .get(&meta.location)
+                .await
+                .map_err(|e| {
+                    EngineError::Other(format!("object-store get {}: {e}", meta.location))
+                })?
+                .bytes()
+                .await
+                .map_err(|e| {
+                    EngineError::Other(format!("object-store read {}: {e}", meta.location))
+                })?;
+            std::fs::File::create(&out)?.write_all(&bytes)?;
+            n += 1;
+        }
+        if n == 0 {
+            return Err(EngineError::UnsupportedFormat {
+                detail: format!("no objects under `{uri}` (empty prefix or wrong path)"),
+            });
+        }
+        Ok::<(), EngineError>(())
+    })?;
+    cache.lock().unwrap().insert(uri.to_string(), dest.clone());
+    Ok(dest)
 }
 
 /// Build a ranged Parquet reader, hinting the file size (from a cheap `head`) so the reader

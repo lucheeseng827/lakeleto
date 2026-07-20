@@ -48,8 +48,9 @@ permissions: {}
 env:
   BIN: lakeleto
   IMAGE: docker.io/mancube/lakeleto
-  # Server build profile: HTTP/JSON API + embedded SPA, SQL engine, Iceberg reader, object-store.
-  FEATURES: serve,sql,iceberg,object-store
+  # Server build profile: HTTP/JSON API + embedded SPA, SQL engine, Iceberg + Delta readers,
+  # object-store, plus read-only SQLite/Postgres/MySQL database backends.
+  FEATURES: serve,sql,iceberg,object-store,sqlite,postgres,mysql,delta
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:

@@ -24,7 +24,7 @@ fn generic_store() -> Arc<dyn WorkspaceStore> {
 
 fn app() -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
-    router(read, None, 10_000, None, None, true, generic_store())
+    router(read, None, None, 10_000, None, None, true, generic_store())
 }
 
 fn app_auth(token: &str) -> axum::Router {
@@ -32,6 +32,7 @@ fn app_auth(token: &str) -> axum::Router {
     // loopback = true, so the `?token=` query form is accepted (the local browser flow).
     router(
         read,
+        None,
         None,
         10_000,
         Some(token.to_string()),
@@ -48,6 +49,7 @@ fn app_auth_net(token: &str) -> axum::Router {
     router(
         read,
         None,
+        None,
         10_000,
         Some(token.to_string()),
         None,
@@ -61,14 +63,23 @@ fn app_auth_net(token: &str) -> axum::Router {
 fn app_root(root: std::path::PathBuf) -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
     let root = std::fs::canonicalize(&root).unwrap();
-    router(read, None, 10_000, None, Some(root), true, generic_store())
+    router(
+        read,
+        None,
+        None,
+        10_000,
+        None,
+        Some(root),
+        true,
+        generic_store(),
+    )
 }
 
 /// A router over an explicit workspace store (for the workspace-endpoint tests). loopback, no
 /// token, no root — pass a store shared across requests within a test to observe persistence.
 fn app_store(store: Arc<dyn WorkspaceStore>) -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
-    router(read, None, 10_000, None, None, true, store)
+    router(read, None, None, 10_000, None, None, true, store)
 }
 
 async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
@@ -747,6 +758,7 @@ async fn workspace_run_is_confined_by_root() {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
     let confined = router(
         read,
+        None,
         None,
         10_000,
         None,
