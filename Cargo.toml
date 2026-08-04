@@ -24,6 +24,22 @@ path = "src/lib.rs"
 name = "lakeleto"
 path = "src/main.rs"
 
+# The double-click launcher the .msi/.dmg install and the Start Menu / Applications
+# entry points at. Separate from the `lakeleto` binary on purpose: it links a tray
+# icon and an event loop, and the CLI's whole pitch is a lean single static binary
+# that also runs in a locked-down CI runner. Nothing here is in a default build.
+[[bin]]
+name = "lakeleto-desktop"
+path = "src/bin/lakeleto-desktop.rs"
+required-features = ["desktop"]
+
+# Regenerates the installer icon art. Needs `serve`, which is what gates the
+# `desktop`/`icon` modules — without this a default `cargo test` tries to build
+# the example and fails on the missing imports.
+[[example]]
+name = "gen_icons"
+required-features = ["serve"]
+
 # cargo-binstall: fetch the prebuilt `lakeleto` binary from a GitHub release instead of
 # compiling — part of the "frictionless distribution" MVP lever (no account, no server,
 # works air-gapped). `{ repo }` resolves from `repository` above (rewritten to the public
@@ -97,6 +113,11 @@ futures = { version = "0.3", optional = true }        # `object-store` — drive
 # `sqlite`/`postgres`/`mysql` (umbrella `database`) — read-only BYO-database connectors. rustls TLS
 # (no OpenSSL); per-backend drivers are gated by their own feature so nothing unused is pulled in.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls"], optional = true }
+# `desktop` only. `tray-icon` needs a platform event loop to pump its messages —
+# a Win32 message loop on Windows, an NSApplication on macOS — which is what winit
+# is here for. Neither is pulled into the CLI build.
+tray-icon = { version = "0.24", optional = true }
+winit = { version = "0.30", optional = true }
 
 [features]
 default = []
@@ -117,6 +138,10 @@ object-store = [
     "dep:tokio", "tokio/rt-multi-thread", "tokio/net", "tokio/time",
     "parquet/object_store",
 ]
+# `desktop` builds `lakeleto-desktop`, the launcher installed by the .msi/.dmg: no
+# console window, picks its own port, opens the browser, and lives in the tray so
+# there is something to quit. Implies `serve` — it has nothing to show otherwise.
+desktop = ["serve", "dep:tray-icon", "dep:winit"]
 duckdb = []    # Phase 2: alternate commodity backend (libduckdb-sys, C++ toolchain)
 # `ee` — marker for the Lakeleto Cloud (paid) edition. Off in the OSS build; when set, `/v1/engines`
 # reports `ee:true`, which lifts the UI's open-source DB-connection cap (2 databases at once). The

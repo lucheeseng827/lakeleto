@@ -4,7 +4,7 @@
 // `Tab.view` (opaque grid state), so open tabs + their sort/filter/sql survive a reload.
 import { useEffect, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode, type SyntheticEvent } from "react";
 import type { Conn, Filters, Row, RunRecord, RunResponse, Sort, Workspace, WsConnection, WsMeta, WsSavedQuery, WsVariable, QueryResp } from "./api";
-import { Button, Chip, filterRows, Select, StatTable, TextInput, ThemeToggle } from "./components";
+import { Button, Chip, filterRows, LakeletoMark, Select, StatTable, TextInput, ThemeToggle } from "./components";
 
 const VAR_RE = /\{\{\s*([\w.-]+)\s*\}\}/g;
 /** Substitute `{{key}}` with the workspace variable's value (client-side, Postman-style). Unknown
@@ -121,13 +121,16 @@ export function WorkspaceBar({ conn, engineName, sqlAvailable, workspaces, wsId,
   const header: CSSProperties = { display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap", padding: "var(--pad-chrome)", borderBottom: "var(--border-hairline)", background: "var(--panel)", flex: "0 0 auto" };
   return (
     <header style={header}>
-      <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.15 }}>
-        <h1 style={{ fontSize: "var(--text-ui)", margin: 0, fontWeight: "var(--weight-h1)", whiteSpace: "nowrap" }}>
-          Lakeleto <span style={{ color: "var(--muted)", fontWeight: "var(--weight-normal)" }}>· the Postman of lakehouse tables</span>
-        </h1>
-        {conn.caps.version && (
-          <span style={{ color: "var(--muted)", fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)" }}>v{conn.caps.version}</span>
-        )}
+      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+        <LakeletoMark size={22} />
+        <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.15 }}>
+          <h1 style={{ fontSize: "var(--text-ui)", margin: 0, fontWeight: "var(--weight-h1)", whiteSpace: "nowrap" }}>
+            Lakeleto
+          </h1>
+          {conn.caps.version && (
+            <span style={{ color: "var(--muted)", fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)" }}>v{conn.caps.version}</span>
+          )}
+        </div>
       </div>
       <span style={{ color: "var(--muted)", fontSize: "var(--text-12)" }}>workspace</span>
       <Select value={wsId || ""} onChange={onSelect} options={workspaces.map((w) => ({ value: w.id, label: w.name }))} title="switch workspace" style={{ minWidth: 160 }} />

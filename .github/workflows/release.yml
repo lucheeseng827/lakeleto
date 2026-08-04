@@ -188,6 +188,206 @@ jobs:
             ${{ steps.pkg.outputs.asset }}.pem
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
+  # Double-click installers. Separate from `build` because they need the
+  # `desktop` feature (tray icon + event loop), which the CLI tarballs
+  # deliberately do not carry, and because each needs platform-only tooling:
+  # WiX on Windows, iconutil/hdiutil/notarytool on macOS.
+  # ---------------------------------------------------------------------------
+  installer-windows:
+    name: windows installer (.msi)
+    runs-on: windows-latest
+    needs: validate
+    permissions:
+      contents: read
+      id-token: write # cosign keyless
+    env:
+      # Authenticode. Absent on a fork or before certs are bought, in which case
+      # the .msi still builds and the signing step is skipped with a warning
+      # rather than failing the release.
+      WINDOWS_CERT_P12: ${{ secrets.WINDOWS_CERT_P12 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Derive version from the tag
+        id: ver
+        shell: bash
+        # MSI ProductVersion is numeric: strip the leading v and any -rc.N, or
+        # `wix build` rejects it.
+        run: echo "version=$(echo "${TAG#v}" | sed 's/-.*//')" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries (desktop launcher + CLI)
+        shell: bash
+        run: cargo build --release --features "desktop,$FEATURES"
+
+      # WiX 5 on purpose: 6 and 7 refuse to run until the Open Source Maintenance
+      # Fee EULA is accepted (error WIX7015). See packaging/windows/build-msi.ps1.
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Build the .msi
+        shell: pwsh
+        run: >
+          ./packaging/windows/build-msi.ps1
+          -Version ${{ steps.ver.outputs.version }}
+          -SkipBuild
+
+      - name: Sign the .msi (Authenticode)
+        if: env.WINDOWS_CERT_P12 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERT_P12))
+          $msi = "packaging/windows/lakeleto-${{ steps.ver.outputs.version }}-x64.msi"
+          # RFC 3161 timestamp so the signature stays valid after the cert expires.
+          & signtool sign /f $pfx /p $env:WINDOWS_CERT_PASSWORD `
+            /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $msi
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+          & signtool verify /pa /v $msi
+          Remove-Item $pfx -Force
+
+      - name: Warn when unsigned
+        if: env.WINDOWS_CERT_P12 == ''
+        run: echo "::warning::WINDOWS_CERT_P12 unset - shipping an UNSIGNED .msi; SmartScreen will warn on first run"
+
+      - name: Checksum
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="packaging/windows/lakeleto-${{ steps.ver.outputs.version }}-x64.msi"
+          sha256sum "$asset" | awk -v n="$(basename "$asset")" '{print $1"  "n}' > "$asset.sha256"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - name: cosign sign-blob
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="${{ steps.pkg.outputs.asset }}"
+          cosign sign-blob --yes --output-signature "$asset.sig" --output-certificate "$asset.pem" "$asset"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installer-windows
+          path: |
+            packaging/windows/*.msi
+            packaging/windows/*.msi.sha256
+            packaging/windows/*.msi.sig
+            packaging/windows/*.msi.pem
+          if-no-files-found: error
+
+  installer-macos:
+    name: macos installer (.dmg)
+    runs-on: macos-14
+    needs: validate
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Derive version from the tag
+        id: ver
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      # One universal .dmg rather than two downloads: a user who has to work out
+      # whether their Mac is Intel or Apple Silicon is a user the installer has
+      # already failed.
+      - name: Build both architectures and lipo them
+        run: |
+          set -euo pipefail
+          for target in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --release --features "desktop,$FEATURES" --target "$target"
+          done
+          mkdir -p target/release
+          for bin in lakeleto lakeleto-desktop; do
+            lipo -create -output "target/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin" \
+              "target/aarch64-apple-darwin/release/$bin"
+            lipo -info "target/release/$bin"
+          done
+
+      - name: Import the Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/build.keychain"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo -n "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          # Without this, codesign blocks on a GUI prompt that no runner can answer.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      # Gate these on what build-dmg.sh actually tests, not on the cert alone.
+      # The cert import only populates the keychain; `codesign` runs off
+      # MACOS_SIGN_IDENTITY and `notarytool` off the three Apple values. Warning
+      # on MACOS_CERT_P12 alone stays silent in the likeliest misconfiguration —
+      # cert uploaded, identity forgotten — and ships an unsigned .dmg quietly.
+      - name: Warn when unsigned
+        if: env.MACOS_CERT_P12 == '' || env.MACOS_SIGN_IDENTITY == ''
+        run: echo "::warning::MACOS_CERT_P12 or MACOS_SIGN_IDENTITY unset - shipping an UNSIGNED .dmg; Gatekeeper will refuse it"
+
+      - name: Warn when not notarized
+        if: env.APPLE_ID == '' || env.APPLE_TEAM_ID == '' || env.APPLE_APP_PASSWORD == ''
+        run: echo "::warning::Apple notarization credentials unset - shipping a NOT NOTARIZED .dmg; first launch needs a network round-trip to Apple, and Gatekeeper blocks it offline"
+
+      - name: Build the .dmg
+        run: ./packaging/macos/build-dmg.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Checksum
+        id: pkg
+        run: |
+          set -euo pipefail
+          asset="packaging/macos/Lakeleto-${{ steps.ver.outputs.version }}.dmg"
+          shasum -a 256 "$asset" | awk -v n="$(basename "$asset")" '{print $1"  "n}' > "$asset.sha256"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - name: cosign sign-blob
+        run: |
+          set -euo pipefail
+          asset="${{ steps.pkg.outputs.asset }}"
+          cosign sign-blob --yes --output-signature "$asset.sig" --output-certificate "$asset.pem" "$asset"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installer-macos
+          path: |
+            packaging/macos/*.dmg
+            packaging/macos/*.dmg.sha256
+            packaging/macos/*.dmg.sig
+            packaging/macos/*.dmg.pem
+          if-no-files-found: error
+
   sbom:
     name: cyclonedx sbom
     runs-on: ubuntu-latest
@@ -220,7 +420,7 @@ jobs:
 
   release:
     name: github release
-    needs: [build, sbom]
+    needs: [build, installer-windows, installer-macos, sbom]
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub release + upload assets
@@ -243,6 +443,8 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.msi
+            dist/*.dmg
             dist/*.sha256
             dist/*.sig
             dist/*.pem

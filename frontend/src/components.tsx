@@ -3,6 +3,33 @@
 import { useEffect, useState, type CSSProperties, type ReactNode, type KeyboardEvent } from "react";
 import type { Column, Filters, Sort, Row } from "./api";
 
+/** The Strata mark: a rounded tile of lake water with sediment bands — the table's rows.
+ *
+ * Inline SVG rather than an <img>: it costs no extra request, it scales for free, and it is the
+ * same geometry the tray icon and the installer icons are drawn from (see `src/desktop.rs`), so
+ * the brand has one shape wherever it appears. Kept decorative (`aria-hidden`) because the
+ * wordmark beside it already carries the name. */
+export function LakeletoMark({ size = 22 }: { size?: number }) {
+  const id = "lakeleto-mark-gradient";
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64" aria-hidden="true" focusable="false" style={{ display: "block", flex: "0 0 auto" }}>
+      <defs>
+        <linearGradient id={id} x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#2563eb" />
+          <stop offset="1" stopColor="#22d3ee" />
+        </linearGradient>
+      </defs>
+      <rect x="6" y="6" width="52" height="52" rx="14" fill={`url(#${id})`} />
+      <g fill="#fff">
+        <rect x="15" y="14.5" width="34" height="5" rx="2.5" />
+        <rect x="15" y="24.5" width="22" height="5" rx="2.5" fillOpacity=".92" />
+        <rect x="15" y="34.5" width="29" height="5" rx="2.5" fillOpacity=".84" />
+        <rect x="15" y="44.5" width="14" height="5" rx="2.5" fillOpacity=".76" />
+      </g>
+    </svg>
+  );
+}
+
 /** Theme switch — cycles Auto → Light → Dark, persisted in localStorage. "auto" follows the OS
  * (`prefers-color-scheme`); Light/Dark set `data-theme` on <html> and override the OS. */
 export function ThemeToggle() {

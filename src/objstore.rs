@@ -78,7 +78,10 @@ pub fn looks_like_iceberg(uri: &str) -> bool {
         let Ok((store, prefix)) = store_for(&uri) else {
             return false;
         };
-        let meta = ObjPath::from(format!("{}/metadata", prefix.as_ref().trim_end_matches('/')));
+        let meta = ObjPath::from(format!(
+            "{}/metadata",
+            prefix.as_ref().trim_end_matches('/')
+        ));
         runtime().block_on(async {
             let mut listing = store.list(Some(&meta));
             matches!(listing.next().await, Some(Ok(_)))

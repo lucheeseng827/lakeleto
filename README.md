@@ -99,7 +99,18 @@ sequenceDiagram
 
 ## Install
 
-Prebuilt, signed binaries ship on every [release](https://github.com/lucheeseng827/lakeleto/releases) for **Linux** (x86_64/aarch64, static musl), **macOS** (Intel/Apple Silicon), and **Windows** (x86_64). Every artifact carries a cosign signature (`.sig`/`.pem`), a SHA256, and SLSA build provenance.
+**Windows and macOS: download the installer.** Double-click it, and Lakeleto lands in the Start Menu / Applications like any other app — no terminal, nothing to configure.
+
+| | Download | What you get |
+|---|---|---|
+| **Windows** | `lakeleto-<version>-x64.msi` | Installs for your user (no admin prompt), adds a **Lakeleto** Start Menu entry, and puts the `lakeleto` CLI on your PATH |
+| **macOS** | `Lakeleto-<version>.dmg` | Universal (Intel + Apple Silicon). Drag to **Applications** |
+
+Clicking the Start Menu / Applications entry starts the local viewer and opens your browser at it. Lakeleto then lives in the **system tray / menu bar** — that is where **Quit** is. Clicking it a second time just reopens the tab rather than starting a second copy. Everything runs on your own machine; nothing is uploaded.
+
+> The installed app asks the OS for a free port rather than taking `8080`, so the address bar shows something like `http://127.0.0.1:53863/` and the number differs between runs. That is deliberate: `8080` is one of the most contended ports on a working machine, and an app that insists on it is an app that regularly cannot start. Don't bookmark the URL — use the tray icon. (`lakeleto serve` is unchanged and still defaults to `8080`, because there you chose it.)
+
+The rest of the channels are unchanged, and remain the right answer for servers, CI and scripting. Prebuilt binaries ship on every [release](https://github.com/lucheeseng827/lakeleto/releases) for **Linux** (x86_64/aarch64, static musl), **macOS** (Intel/Apple Silicon), and **Windows** (x86_64). Every artifact — installers included — carries a cosign signature (`.sig`/`.pem`), a SHA256, and SLSA build provenance.
 
 ```bash
 # cargo-binstall — fetches the right prebuilt binary for your platform (no compile)
@@ -119,35 +130,45 @@ cargo install lakeleto --features serve,sql,iceberg,object-store
 
 ## Running it — step by step (no terminal experience needed)
 
-Lakeleto is **one self-contained program** — no installer, no account, nothing to configure. The friendliest way in is `lakeleto open <your file>`: it starts the local viewer and **opens your web browser automatically**. Everything runs on your own machine; your data is never uploaded.
-
-> **Double-clicking the file won't work.** Lakeleto is a command-line program — if you double-click it, a black window flashes and closes. You run it by typing one short command in a terminal, as shown below. It only takes a minute.
+Everything runs on your own machine; your data is never uploaded.
 
 ### Windows
 
-1. Download **`lakeleto-x86_64-pc-windows-msvc.zip`** from the [latest release](https://github.com/lucheeseng827/lakeleto/releases/latest).
-2. In your Downloads folder, **right-click the zip → Extract All**. You now have a folder containing `lakeleto.exe`.
-3. **Open a terminal in that folder:** open the folder, click the address bar at the top, type `powershell`, and press **Enter**. A blue terminal window opens, already pointed at the folder.
-4. **Open a data file** (drag your `.parquet` / `.csv` / `.tsv` file onto the terminal to paste its full path):
-   ```powershell
-   .\lakeleto.exe open "C:\Users\you\Downloads\yourfile.parquet"
-   ```
-   Your browser opens with the table loaded. **Or browse a whole folder** at http://127.0.0.1:8080:
-   ```powershell
-   .\lakeleto.exe serve --root "C:\Users\you\Documents\data"
-   ```
-5. **First run:** Windows SmartScreen may warn "Windows protected your PC / unknown publisher." Click **More info → Run anyway**. (The download is cosign-signed and ships a `.sha256` you can verify.)
-6. **To stop it:** click the terminal and press **Ctrl + C**.
+1. Download **`lakeleto-<version>-x64.msi`** from the [latest release](https://github.com/lucheeseng827/lakeleto/releases/latest).
+2. **Double-click it.** It installs for your user only, so there is no admin prompt.
+3. Open **Lakeleto** from the Start Menu. Your browser opens with the viewer; point it at a file or a folder.
+4. **To quit:** right-click the Lakeleto icon in the system tray (bottom-right, possibly under the `^` arrow) → **Quit Lakeleto**. Closing the browser tab leaves it running so you can come back to it.
+
+> **First run:** if the release is not yet signed with an Authenticode certificate, SmartScreen warns "Windows protected your PC / unknown publisher" — click **More info → Run anyway**. Every artifact is cosign-signed and ships a `.sha256` you can verify.
 
 ### macOS
 
-1. `brew install lucheeseng827/lakeleto/lakeleto` — or download the `…apple-darwin.tar.gz` (Apple Silicon = `aarch64`, older Intel Macs = `x86_64`) and double-click it to unpack `lakeleto`.
-2. Open **Terminal** (Spotlight → type "Terminal"). Type `lakeleto ` (or drag the unpacked `lakeleto` file in), then `open `, then drag your data file in, and press **Enter**:
-   ```bash
-   lakeleto open ~/Downloads/yourfile.parquet      # browser opens automatically
-   lakeleto serve --root ~/Documents/data          # or browse a folder at http://127.0.0.1:8080
-   ```
-3. **First run:** if macOS blocks it ("cannot verify the developer"), right-click the `lakeleto` file in Finder → **Open** once, or run `xattr -d com.apple.quarantine ./lakeleto`.
+1. Download **`Lakeleto-<version>.dmg`** — one universal download; you do not need to know whether your Mac is Intel or Apple Silicon.
+2. Open it and **drag Lakeleto to Applications**.
+3. Launch it from Applications (or Spotlight). Your browser opens with the viewer.
+4. **To quit:** click the Lakeleto icon in the menu bar (top-right) → **Quit Lakeleto**. It has no Dock icon by design — it is a menu-bar app.
+
+> **First run:** if the release is not yet notarized, macOS says "cannot be opened because the developer cannot be verified" — right-click **Lakeleto.app** in Finder → **Open** once, which offers an Open button the plain double-click does not.
+
+### Prefer the terminal?
+
+**The CLI is installed too**, with the same feature set as the release tarballs — SQL, Iceberg, Delta, `s3://`/`gs://`/`az://`, and the SQLite/Postgres/MySQL connectors.
+
+| | Where it lands | On your PATH? |
+|---|---|---|
+| **Windows** | `%LOCALAPPDATA%\Lakeleto\lakeleto.exe` | **Yes** — the `.msi` adds the install folder to your user PATH. Open a *new* terminal; one already running won't have picked it up. |
+| **macOS** | `Lakeleto.app/Contents/MacOS/lakeleto` | **Not by default.** Use the tray menu's **Install command line tool…**, which links it into `/usr/local/bin` — that one is in `/etc/paths`, so a new shell finds it with nothing to edit. If that directory is not writable it falls back to `~/.local/bin`, which is *not* on the default macOS `PATH`: the dialog then gives you the `export PATH` line to add to your shell profile, and until you do, `lakeleto` stays `command not found`. |
+
+Both platforms also have **Copy CLI path** in the tray menu, which puts the full path on your clipboard — the installed app is otherwise silent about the CLI existing at all.
+
+`brew install lucheeseng827/lakeleto/lakeleto` still installs the CLI on its own, and remains the tidiest route on macOS if you only want the terminal half. **Install command line tool…** only ever claims `/usr/local/bin/lakeleto` when nothing is using it. A real file stays; so does a **symlink that still resolves** — which is the form `brew` actually writes, a link into `../Cellar`. Either way that install keeps working and you're told to remove it first. The one thing it does take over is a symlink pointing at nothing, left behind by a `Lakeleto.app` you moved or deleted.
+
+> **One caveat if you run both at once.** The tray app and a terminal `lakeleto serve` are separate processes on different ports, but they share the workspace store under `$LAKELETO_HOME`. Its write locks are in-process, so they don't coordinate across processes. What that costs you: a workspace file is written to a temporary file and renamed over the old one, so a reader never sees a half-written one — but two simultaneous *edits* can still lose one, and a `save` racing a `delete` can leave the workspace either gone or back from the dead. Run history is appended in `O_APPEND` mode, which keeps each process writing at the end but does not guarantee that two processes' records stay whole and separate. Read commands (`schema`, `head`, `profile`, `query`) are unaffected.
+
+```bash
+lakeleto open ~/Downloads/yourfile.parquet      # browser opens automatically
+lakeleto serve --root ~/Documents/data          # or browse a folder at http://127.0.0.1:8080
+```
 
 ### Linux
 
@@ -171,7 +192,7 @@ Point at a file or a folder and you get, with no setup:
 - **SQL** — run read-only `SELECT …` over the table (the current file is the table `t`).
 - **Export / Download view** — save the current (filtered/sorted) view as CSV, JSON, or Parquet.
 
-Stop the server anytime with **Ctrl + C** in the terminal.
+Stop it from the tray / menu-bar icon (**Quit Lakeleto**) if you installed it, or with **Ctrl + C** in the terminal if you started it there.
 
 ## Command-line reference
 
@@ -237,12 +258,16 @@ it browses larger-than-memory Parquet. Hiding/reordering columns pushes a projec
 so the fetch and the download match what's on screen. Non-API routes fall back to the SPA;
 `/v1/*` misses return `404` JSON.
 
-![Lakeleto workspace — a SQL result grid over a local CSV, with the file browser and query history](docs/screenshots/lakeleto-sql-workspace.png)
+![Lakeleto workspace — a SQL result grid over a local CSV, with the file browser and run history](docs/screenshots/lakeleto-sql-workspace.png)
 
 The multi-tab workbench: saved queries, per-tab variables, run history, and multiple
 connections — every query cached to a re-openable result.
 
-![Lakeleto workbench — saved queries, variables, and run history across multiple tabs](docs/screenshots/lakeleto-workbench.png)
+![Lakeleto workbench — two saved sources, a query filed under a reports folder, a variable named active, and a run history where every result is cached](docs/screenshots/lakeleto-workbench.png)
+
+> Both screenshots are of the shipped **v0.1.4** build reading `examples/people.csv`. They are
+> regenerated when the UI changes — a screenshot showing an older layout (or, as these once did,
+> an older product name) is a documentation bug, not a cosmetic one.
 
 | Method | Path | Purpose |
 |--------|------|---------|

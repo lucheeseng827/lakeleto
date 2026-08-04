@@ -14,6 +14,12 @@ use crate::error::{EngineError, Result};
 use crate::render::{self, Output};
 use crate::source::Source;
 
+/// Rows a profile scans when nobody says otherwise — the `--scan` default, the
+/// `serve --default-scan` default, and what the desktop launcher serves with.
+/// Shared so those three cannot drift into disagreeing about what "default"
+/// means for the same computation.
+pub const DEFAULT_SCAN: usize = 10_000;
+
 /// Lakeleto — instant local Parquet/Iceberg/CSV explorer ("the Postman of lakehouse tables").
 ///
 /// This MVP reads Parquet and CSV locally (and Iceberg tables with `--features iceberg`); a
@@ -71,7 +77,7 @@ pub enum Cmd {
     Profile {
         path: PathBuf,
         /// Max rows to scan for the profile.
-        #[arg(long, default_value_t = 10_000)]
+        #[arg(long, default_value_t = DEFAULT_SCAN)]
         scan: usize,
         /// Near-instant profile from the Parquet footer statistics — no row scan (exact
         /// nulls/min/max over the whole file; distinct + samples aren't computed).
@@ -104,7 +110,7 @@ pub enum Cmd {
         #[arg(long, default_value = "127.0.0.1:8080", env = "LAKELETO_ADDR")]
         addr: String,
         /// Default row cap for `/v1/profile` when the request omits `scan`.
-        #[arg(long, default_value_t = 10_000)]
+        #[arg(long, default_value_t = DEFAULT_SCAN)]
         default_scan: usize,
         /// Require this bearer token on `/v1/*` (else the API is open). Env: LAKELETO_TOKEN.
         #[arg(long, env = "LAKELETO_TOKEN", hide_env_values = true)]
@@ -129,7 +135,7 @@ pub enum Cmd {
         path: PathBuf,
         #[arg(long, default_value = "127.0.0.1:8080", env = "LAKELETO_ADDR")]
         addr: String,
-        #[arg(long, default_value_t = 10_000)]
+        #[arg(long, default_value_t = DEFAULT_SCAN)]
         default_scan: usize,
         /// Require this bearer token on `/v1/*`. Env: LAKELETO_TOKEN.
         #[arg(long, env = "LAKELETO_TOKEN", hide_env_values = true)]
@@ -292,14 +298,14 @@ fn remote_store(
 
 /// The SQL engine for `/v1/query`, as a shared handle — `None` unless built with `sql`.
 #[cfg(all(feature = "serve", feature = "sql"))]
-fn sql_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
+pub(crate) fn sql_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
     Some(std::sync::Arc::new(
         crate::engine::sql::DataFusionEngine::new(),
     ))
 }
 
 #[cfg(all(feature = "serve", not(feature = "sql")))]
-fn sql_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
+pub(crate) fn sql_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
     None
 }
 
@@ -310,7 +316,7 @@ fn sql_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
     feature = "serve",
     any(feature = "sqlite", feature = "postgres", feature = "mysql")
 ))]
-fn db_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
+pub(crate) fn db_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
     Some(std::sync::Arc::new(
         crate::engine::database::DatabaseEngine::new(),
     ))
@@ -320,7 +326,7 @@ fn db_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
     feature = "serve",
     not(any(feature = "sqlite", feature = "postgres", feature = "mysql"))
 ))]
-fn db_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
+pub(crate) fn db_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
     None
 }
 

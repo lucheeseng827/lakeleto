@@ -27,8 +27,14 @@
 #[cfg(feature = "serve")]
 pub mod api;
 pub mod cli;
+/// The double-click launcher's port/reuse logic (see `bin/lakeleto-desktop.rs`).
+#[cfg(feature = "serve")]
+pub mod desktop;
 pub mod engine;
 pub mod error;
+/// PNG/ICO encoding for the installer icon sets (see `examples/gen_icons.rs`).
+#[cfg(feature = "serve")]
+pub mod icon;
 #[cfg(feature = "iceberg")]
 pub mod iceberg;
 #[cfg(feature = "object-store")]

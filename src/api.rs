@@ -475,7 +475,7 @@ async fn shutdown_signal() {
 
 /// Best-effort browser launch. Never fails the server — on error we just print the URL so the
 /// user can open it manually (e.g. headless / CI, where there is no browser).
-fn open_browser(url: &str) {
+pub(crate) fn open_browser(url: &str) {
     let (cmd, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
         ("open", &[])
     } else if cfg!(target_os = "windows") {

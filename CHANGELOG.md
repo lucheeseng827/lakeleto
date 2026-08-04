@@ -6,7 +6,91 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- **Double-click installers for Windows and macOS.** Getting started used to mean
+  download a zip, extract it, open a terminal in the right folder, and type a
+  command — a sequence the README had to preface with *"double-clicking the file
+  won't work"*. It now means downloading `lakeleto-<version>-x64.msi` or
+  `Lakeleto-<version>.dmg` and double-clicking it.
+
+  The `.msi` installs per-user, which is what keeps it free of a UAC elevation
+  prompt: Lakeleto is a personal read-only viewer, not a service, so it has no
+  business writing to Program Files. It adds a Start Menu entry, and puts the CLI
+  on PATH so the terminal audience loses nothing. The `.dmg` is a universal
+  build — one download, no asking people whether their Mac is Intel or Apple
+  Silicon — presented as the usual drag-to-Applications window.
+
+- **`lakeleto-desktop`, the launcher behind those entries** (`--features desktop`).
+  It is what makes the icon work, and it exists because a GUI launch cannot assume
+  any of the things `serve` gets from a terminal. It has no console window, opens
+  the browser itself, and lives in the tray / menu bar, because a process with no
+  console and no window is one the user otherwise cannot quit. Fatal errors go to
+  `$LAKELETO_HOME/launcher.log`, since a windowless process reporting to a stderr
+  nobody is attached to makes "I clicked it and nothing happened" unanswerable.
+
+  It takes **a port the OS says is free**, never a well-known one. `8080` is among
+  the most contended ports on a working machine — a spare Tomcat, a
+  `python -m http.server`, a colleague's dev server — so a launcher that wants it
+  is one that regularly cannot have it, and there is no terminal in which to
+  report the bind failure. Binding to port 0 asks the kernel for a port nothing is
+  using, which is by construction the least contended choice available. The
+  consequence is that the URL differs between runs, so the running instance
+  publishes its port to `$LAKELETO_HOME/desktop.port` and a second double-click
+  finds it there and reopens the tab, rather than starting a rival server that
+  would silently split the user's workspaces across two stores. The record is
+  treated as evidence rather than truth — a killed launcher leaves a stale one —
+  so the port is confirmed with a `GET /v1/engines` probe before it is reused.
+  `lakeleto serve` is unchanged and still defaults to `8080`.
+
+  Shipped as a separate binary, and off by default: it links a tray icon and an
+  event loop, and the CLI's pitch is a lean static binary that also runs in a
+  locked-down CI runner. Nothing here reaches a default build.
+
+- **The Strata mark as icon art, generated rather than committed.** `src/icon.rs`
+  writes PNG and multi-size ICO with no image dependency — PNG mandates zlib but
+  permits *stored* (uncompressed) deflate, which costs a few KB per icon and saves
+  a compression crate. `cargo run --features serve --example gen_icons` emits the
+  Windows `.ico` and the macOS `.iconset` from the same geometry the tray icon
+  draws, so the mark has one definition. The output is ~7 MB and is regenerated in
+  CI rather than committed.
+
+- **The tray menu can put the CLI on your PATH, and can tell you where it is.**
+  Both installers ship `lakeleto` beside the launcher, but nothing in the
+  installed experience said so — the Start Menu entry and the `.app` open a
+  browser tab, and that was the whole story a user got.
+
+  **Copy CLI path** (both platforms) puts the full path on the clipboard, via
+  `pbcopy` / `clip` / `wl-copy` / `xclip` rather than a clipboard dependency.
+
+  **Install command line tool…** is macOS-only, because the `.msi` already adds
+  its install directory to the user's PATH and a menu item that answers "already
+  installed" forever is worse than no menu item. A `.dmg` has no install step to
+  run, and `Lakeleto.app/Contents/MacOS/` is on nobody's PATH, so this links the
+  bundled binary into `/usr/local/bin` — chosen because it is in `/etc/paths` and
+  therefore works in a new shell with no profile editing — falling back to
+  `~/.local/bin` when that is root-owned, with the `export PATH` line the user
+  then needs. It resolves the CLI as the running launcher's sibling, so moving or
+  renaming the `.app` does not break it, and it replaces a stale symlink from an
+  older location but **refuses to overwrite a real file**: that is almost
+  certainly Homebrew's `lakeleto`, and clobbering someone's package manager is
+  not a menu item's business. From a menu rather than on first launch, because
+  symlinking into a shared bin directory unasked is not something a table viewer
+  should do merely because it started.
+
+### Changed
+- **The Strata mark is now in the UI**, in the workspace header and as the favicon,
+  as inline SVG drawn from the same geometry as the tray and installer icons — so
+  the brand is one shape everywhere rather than three that drift. The header's
+  `· the Postman of lakehouse tables` subtitle is gone, and the browser tab now
+  reads `Lakeleto` rather than `Lakeleto — the Postman of lakehouse tables`. The
+  phrase stays in the README and the docs, where it is positioning; in the chrome
+  of a tool you use daily it was a tagline occupying the space a logo should.
+- The release workflow gained `installer-windows` and `installer-macos` jobs, both
+  cosign-signed and checksummed like every other artifact. Authenticode signing and
+  Apple notarization are wired but **credential-gated**: with the secrets unset the
+  installers still build, and the job logs a warning rather than failing the
+  release. Windows packaging pins **WiX 5** — 6 and 7 refuse to run until the Open
+  Source Maintenance Fee EULA is accepted (`error WIX7015`).
 
 ## [0.1.4] - 2026-07-21
 

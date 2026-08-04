@@ -483,7 +483,7 @@ pub fn now_ms() -> u64 {
 
 /// The default home dir: `$LAKELETO_HOME`, else `$HOME/.lakeleto` (unix) / `%USERPROFILE%\.lakeleto`
 /// (windows), else a temp fallback so the store always has somewhere to live.
-fn default_home() -> PathBuf {
+pub(crate) fn default_home() -> PathBuf {
     if let Some(h) = std::env::var_os("LAKELETO_HOME") {
         return PathBuf::from(h);
     }
