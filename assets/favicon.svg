@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Lakeleto">
+  <!-- Strata, re-cut as registered colour blocks: the keyblock frame is printed
+       first, then each band lands as its own flat pigment. Same geometry as the
+       original mark; the gradient was a rendition, the bands are the idea. -->
+  <rect x="4" y="4" width="56" height="56" fill="#14161a"/>
+  <rect x="8" y="8" width="48" height="48" fill="#f2e6ce"/>
+  <rect x="15" y="15" width="34" height="6" fill="#14161a"/>
+  <rect x="15" y="26" width="22" height="6" fill="#1e3a5f"/>
+  <rect x="15" y="37" width="29" height="6" fill="#d14a3a"/>
+  <rect x="15" y="48" width="14" height="6" fill="#5a3e2b"/>
+</svg>

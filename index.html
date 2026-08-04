@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lakeleto — see inside any table, without moving it</title>
+<meta name="description" content="Lakeleto opens Parquet, CSV, Iceberg and Delta tables on your own machine: schema, rows, per-column profile and read-only SQL. No account, no upload, works offline. Free and open source under Apache-2.0.">
+<meta property="og:title" content="Lakeleto — see inside any table, without moving it">
+<meta property="og:description" content="A single binary that prints your data file back to you: schema, rows, profile, SQL. Nothing is uploaded, because nothing leaves your machine.">
+<meta property="og:type" content="website">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<!--
+  THESIS: A table is understood the way a woodblock print is made, keyline first
+  and then one registered pigment at a time. Refuses the dev-tool hero with a
+  framed screenshot over a feature triptych.
+  OWN-WORLD: Aizuri-e. Deep indigo pigment field as the ground; warm kozo paper
+  only where a block is actually printed. Black keyblock line on every edge,
+  kento notches chamfering each corner, safflower seals as furniture. Shippori
+  Mincho display, JetBrains Mono for data.
+  STORY: You cannot see inside your own file. Lakeleto prints it back to you,
+  schema then rows then profile, and nothing is uploaded. Download and run it.
+  FIRST VIEWPORT: Indigo field. Vertical title slug in the left margin, display
+  headline in paper, the download pair in notched blocks, a seal cluster carrying
+  real facts, and a paper sheet below where people.csv registers layer by layer.
+  FORM: Registered Blocks (edo woodblock colour registration), user-chosen
+  challenger over assigned index 5; seed fefcd20b.
+  FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
+-->
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="index.html" aria-label="Lakeleto home">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <rect x="4" y="4" width="56" height="56" fill="#14161a"/>
+        <rect x="8" y="8" width="48" height="48" fill="#f2e6ce"/>
+        <rect x="15" y="15" width="34" height="6" fill="#14161a"/>
+        <rect x="15" y="26" width="22" height="6" fill="#1e3a5f"/>
+        <rect x="15" y="37" width="29" height="6" fill="#d14a3a"/>
+        <rect x="15" y="48" width="14" height="6" fill="#5a3e2b"/>
+      </svg>
+      <span>Lakeleto</span>
+    </a>
+    <div class="nav-spacer"></div>
+    <nav aria-label="Primary"><ul class="nav" id="nav">
+      <li><a href="#views">What it prints</a></li>
+      <li><a href="#plates">The workbench</a></li>
+      <li><a href="#formats">Formats</a></li>
+      <li><a href="#private">Privacy</a></li>
+      <li><a href="#register">Questions</a></li>
+    <li class="nav-cta"><a href="#download">Download</a></li>
+    </ul></nav>
+    <a class="btn btn-primary" href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download</a>
+    <button class="nav-toggle" data-nav-toggle aria-controls="nav" aria-expanded="false" aria-label="Menu">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<!-- ============================ HERO ============================ -->
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div class="cartouche-v">Lakeleto · v0.1.4 · free and open source</div>
+    <div>
+      <h1 class="display-1">You cannot see inside your own file.</h1>
+      <p class="lede">
+        A Parquet file tells you nothing until something opens it. Lakeleto prints it back to
+        you: the schema, the real rows, and what every column actually contains. One small
+        program, running on your machine, on your data. Nothing is uploaded, because nothing
+        leaves.
+      </p>
+
+      <div class="getit" id="download">
+        <div class="getit-row">
+          <a class="btn btn-primary" href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download Lakeleto</a>
+          <a class="btn btn-quiet" href="https://github.com/lucheeseng827/lakeleto">View source</a>
+        </div>
+        <p class="hint">
+          macOS, Linux and Windows. One executable — unzip it and run it. Nothing to sign up for.
+        </p>
+      </div>
+
+      <div class="seals hero-seals">
+        <span class="seal">Apache<br>2.0</span>
+        <span class="seal">No<br>account</span>
+        <span class="seal">Runs<br>offline</span>
+        <span class="seal">Read<br>only</span>
+        <span class="seal">One<br>binary</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- The one authored motion moment: a real file registering, layer by layer.
+       Printed by default; app.js only replays the pull. -->
+  <div class="wrap">
+    <div class="press block" id="press">
+      <div class="ink sheet">
+        <span class="kento tl"></span><span class="kento tr"></span>
+        <span class="kento bl"></span><span class="kento br"></span>
+        <div class="press-head">
+          <span class="press-path">examples/people.csv</span>
+          <span class="pulls" aria-hidden="true">
+            <span class="pull-tag on">keyblock</span>
+            <span class="pull-tag on">indigo</span>
+            <span class="pull-tag on">safflower</span>
+          </span>
+        </div>
+        <div class="press-scroll">
+          <table class="press-table">
+            <caption class="hp">The first eight rows of examples/people.csv, with null cells marked</caption>
+            <thead>
+              <tr>
+                <th scope="col">id <span class="ty">Int64</span></th>
+                <th scope="col">name <span class="ty">Utf8</span></th>
+                <th scope="col">city <span class="ty">Utf8</span></th>
+                <th scope="col">score <span class="ty">Float64</span></th>
+                <th scope="col">active <span class="ty">Boolean</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td class="num">1</td><td>Ada</td><td>London</td><td class="num">91.5</td><td>true</td></tr>
+              <tr><td class="num">2</td><td>Grace</td><td>New York</td><td class="num">88.0</td><td>false</td></tr>
+              <tr><td class="num">3</td><td>Linus</td><td>Helsinki</td><td class="null">·</td><td>true</td></tr>
+              <tr><td class="num">4</td><td>Alan</td><td>London</td><td class="num">79.25</td><td>true</td></tr>
+              <tr><td class="num">5</td><td>Katherine</td><td>Hampton</td><td class="num">95.0</td><td class="null">·</td></tr>
+              <tr><td class="num">6</td><td>Edsger</td><td>Rotterdam</td><td class="num">84.0</td><td>false</td></tr>
+              <tr><td class="num">7</td><td>Barbara</td><td>New York</td><td class="null">·</td><td>true</td></tr>
+              <tr><td class="num">8</td><td>Donald</td><td>Pittsburgh</td><td class="num">90.5</td><td>true</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="press-foot">
+          <span>5 columns · 8 rows · read in full</span>
+          <span>score 25% null · active 12.5% null</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ THE UNPRINTED BLOCK ============================ -->
+<section class="field--sheet">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">Today the block stays uncut.</h2>
+      <p>
+        You want three ordinary things: what columns are in here, what the rows look like, and
+        whether this column is full of nulls. Every route to them costs more than the question
+        is worth.
+      </p>
+    </div>
+    <div class="blocks blocks--3">
+      <article class="block keyline-only">
+        <div class="ink" style="padding:26px">
+          <h3>The throwaway script</h3>
+          <p>
+            Ten lines of pandas to answer a ten-second question, rewritten tomorrow for a
+            different file in a different folder.
+          </p>
+        </div>
+      </article>
+      <article class="block keyline-only">
+        <div class="ink" style="padding:26px">
+          <h3>The heavyweight tool</h3>
+          <p>
+            A notebook server, a warehouse connection or a cluster. A great many moving parts
+            for a file already sitting on your laptop.
+          </p>
+        </div>
+      </article>
+      <article class="block keyline-only">
+        <div class="ink" style="padding:26px">
+          <h3>The upload you cannot make</h3>
+          <p>
+            Convenient web viewers all want your file. When the data is customer records or
+            under a compliance regime, that is simply not available to you.
+          </p>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ FOUR BLOCKS ============================ -->
+<section class="field" id="views">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">One keyline, six views.</h2>
+      <p class="lede">
+        Lakeleto starts a viewer on your machine and opens your browser at it. Every view below
+        reads the same file on your own disk. The server is your laptop.
+      </p>
+    </div>
+    <div class="blocks">
+      <article class="block">
+        <div class="ink sheet">
+          <h3>Schema</h3>
+          <p>
+            Every column, its type, whether it is nullable, and the exact row count. For Parquet
+            that count is read straight from the footer rather than counted, so it is instant and
+            it is exact.
+          </p>
+        </div>
+      </article>
+      <article class="block">
+        <div class="ink sheet ink-indigo">
+          <h3>Grid</h3>
+          <p>
+            Scroll the real rows. Click a header to sort, type in a column's filter box to narrow,
+            drag to resize and reorder, click a cell to copy it. Only the rows on screen are
+            fetched, so a file larger than memory still scrolls.
+          </p>
+        </div>
+      </article>
+      <article class="block">
+        <div class="ink sheet ink-saff">
+          <h3>Profile</h3>
+          <p>
+            Per column: null percentage, distinct count, minimum, maximum and sample values. You
+            see the empty column or the impossible maximum before you build anything on top of
+            it.
+          </p>
+        </div>
+      </article>
+      <article class="block">
+        <div class="ink sheet ink-clove">
+          <h3>SQL</h3>
+          <p>
+            Run read-only <code class="inline">SELECT</code> over the open table, powered by
+            DataFusion. Filters and sorts push down into the engine, so the answer is exact
+            rather than a sample of the first rows.
+          </p>
+        </div>
+      </article>
+      <article class="block">
+        <div class="ink sheet ink-clove">
+          <h3>Export</h3>
+          <p>
+            Save exactly what is on screen, filtered and sorted with hidden columns dropped, as
+            CSV, JSON or Parquet. What you exported matches what you were looking at.
+          </p>
+        </div>
+      </article>
+      <article class="block">
+        <div class="ink sheet ink-indigo">
+          <h3>Workbench</h3>
+          <p>
+            Tabs, saved queries, per-tab variables and a run history where every result is cached.
+            Reopen yesterday's query without re-scanning the file. A command palette
+            (<code class="inline">Ctrl</code> or <code class="inline">Cmd</code> + K) reaches all
+            of it from the keyboard.
+          </p>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ PLATES ============================ -->
+<section class="field--sheet" id="plates">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">This is the whole thing, running.</h2>
+      <p>
+        Not a rendering of it. These are impressions of the v0.1.4 you can download above, doing
+        its job on a local file — the same eight rows the sheet at the top of this page prints.
+      </p>
+    </div>
+    <div class="plates">
+      <figure class="plate-figure">
+        <div class="block">
+          <div class="ink" style="background:var(--keyline);padding:0">
+            <img src="assets/plate-sql-workspace.png" width="1400" height="720"
+                 alt="The Lakeleto window: the query SELECT city, count(*) AS n FROM t GROUP BY city ORDER BY n DESC over a local CSV, its six-row result, the file browser on the left and the run history on the right.">
+          </div>
+        </div>
+        <figcaption><b>Plate I</b><span>A SQL result grid over a local CSV, with the file browser and the run history. The tab's own file is registered as the table <code class="inline">t</code>.</span></figcaption>
+      </figure>
+      <figure class="plate-figure">
+        <div class="block">
+          <div class="ink" style="background:var(--keyline);padding:0">
+            <img src="assets/plate-workbench.png" width="1500" height="720" loading="lazy"
+                 alt="The Lakeleto workbench: two saved sources, a saved query filed under a reports folder, a variable named active set to true, and a four-entry run history where every result is marked cached.">
+          </div>
+        </div>
+        <figcaption><b>Plate II</b><span>Saved sources, a query filed under <code class="inline">reports/</code>, and a variable the query on screen actually reads. Every run is cached, so reopening a result costs nothing.</span></figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ INVENTORY ============================ -->
+<section class="field" id="formats">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">It reads what you already have.</h2>
+      <p class="lede">
+        Files, table formats, and, because half of "a table" lives in a database, read-only
+        database connections. All of it behind the same viewer.
+      </p>
+    </div>
+    <div class="two-col">
+      <div class="inv-col">
+        <h3 style="color:var(--paper)">Files and table formats</h3>
+        <div class="inventory">
+          <span class="slug">Parquet</span>
+          <span class="slug">CSV</span>
+          <span class="slug">TSV</span>
+          <span class="slug">Apache Iceberg</span>
+          <span class="slug">Delta Lake</span>
+          <span class="slug">Hive-partitioned directories</span>
+        </div>
+        <p class="dim">
+          Point it at a directory of Parquet parts, or at Hive-style
+          <code class="inline">year=2024/month=03</code> folders, and it reads them as one table
+          with the partition keys as real columns.
+        </p>
+      </div>
+      <div class="inv-col">
+        <h3 style="color:var(--paper)">Databases and object storage</h3>
+        <div class="inventory">
+          <span class="slug">SQLite</span>
+          <span class="slug">PostgreSQL</span>
+          <span class="slug">MySQL</span>
+          <span class="slug">s3://</span>
+          <span class="slug">gs://</span>
+          <span class="slug">az://</span>
+        </div>
+        <p class="dim">
+          Database connections are strictly read-only. Bucket reads use your own credentials from
+          your own environment and pull bytes straight from your bucket to your machine, with
+          ranged requests, so a remote Parquet file stays as browsable as a local one.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ PRIVACY ============================ -->
+<section class="field--sheet" id="private">
+  <div class="wrap">
+    <div class="two-col">
+      <div>
+        <h2 class="display-2">The sheet never leaves the workshop.</h2>
+        <p class="lede" style="margin-top:22px">
+          Lakeleto is a program on your computer reading a file on your computer. There is no
+          Lakeleto account, no Lakeleto server in the path, and nothing to opt out of. That is
+          what makes it usable on data you are not allowed to move.
+        </p>
+        <div class="seals" style="margin-top:30px">
+          <span class="seal">No<br>upload</span>
+          <span class="seal">No<br>telemetry</span>
+          <span class="seal">Air<br>gapped</span>
+          <span class="seal">Root<br>confined</span>
+          <span class="seal">Cosign<br>signed</span>
+        </div>
+        <div class="stack-lg" style="margin-top:34px">
+          <p><b>Works air-gapped.</b> The interface is bundled inside the binary. No CDN, no fonts to fetch, nothing to phone home to, so it runs on a locked-down CI box or on a plane.</p>
+          <p><b>Locked to a folder.</b> Start it with a root directory and it refuses to read outside it. Expose it beyond localhost and a bearer token is required on every request.</p>
+          <p><b>Verifiable builds.</b> Every released binary carries a cosign signature, a SHA-256 and SLSA build provenance, so you can check what you are about to run. That is not the same thing as an operating-system code-signing certificate, and Lakeleto does not have one yet — expect your OS to warn you on first launch, and see the FAQ for what it looks like.</p>
+        </div>
+      </div>
+      <div>
+        <div class="slip">
+          <div class="slip-head"><span>Reading a private bucket</span><span>your keys</span></div>
+<pre><code><span class="c"># credentials come from your environment,</span>
+<span class="c"># exactly as the cloud SDKs expect them</span>
+<span class="k">export</span> AWS_ACCESS_KEY_ID=…
+<span class="k">export</span> AWS_SECRET_ACCESS_KEY=…
+
+<span class="c"># bytes go bucket → your machine</span>
+<span class="k">lakeleto</span> schema <span class="s">s3://analytics/events.parquet</span>
+
+<span class="c"># browse the prefix in the viewer</span>
+<span class="k">lakeleto</span> serve <span class="f">--root</span> <span class="s">s3://analytics/warehouse/</span></code></pre>
+        </div>
+        <p style="margin-top:20px;color:var(--clove);font-size:.95rem">
+          No Lakeleto service sits between you and that bucket. There is nothing for anyone to
+          log, because nobody else is in the request path.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ ORDER SLIP ============================ -->
+<section class="field">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">Every view is also one command.</h2>
+      <p class="lede">
+        The viewer is the friendly way in. When you are scripting, the same answers print to
+        stdout: no server, pipe-friendly, easy to drop into CI.
+      </p>
+    </div>
+    <div class="two-col">
+      <div class="slip">
+        <div class="slip-head"><span>Inspect</span><span>no server</span></div>
+<pre><code><span class="c"># open it in the browser</span>
+<span class="k">lakeleto</span> open <span class="s">events.parquet</span>
+
+<span class="c"># columns, types, exact row count</span>
+<span class="k">lakeleto</span> schema <span class="s">events.parquet</span>
+
+<span class="c"># the first five rows</span>
+<span class="k">lakeleto</span> head <span class="s">events.parquet</span> <span class="f">-n</span> 5
+
+<span class="c"># nulls, min and max from the footer,</span>
+<span class="c"># with no row scan at all</span>
+<span class="k">lakeleto</span> profile <span class="f">--fast</span> <span class="s">events.parquet</span></code></pre>
+      </div>
+      <div class="slip">
+        <div class="slip-head"><span>Query and pipe</span><span>read only</span></div>
+<pre><code><span class="c"># the open table is `t`</span>
+<span class="k">lakeleto</span> query <span class="s">"SELECT city, count(*) n
+   FROM t GROUP BY city
+   ORDER BY n DESC"</span> <span class="f">--file</span> <span class="s">people.csv</span>
+
+<span class="c"># JSON out, straight into jq</span>
+<span class="k">lakeleto</span> head <span class="s">people.csv</span> <span class="f">-o</span> json \
+  | jq <span class="s">'.[0]'</span></code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ REGISTER ============================ -->
+<section class="field--sheet" id="register">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">Before you download.</h2>
+    </div>
+    <div class="register">
+      <details>
+        <summary>How finished is this, honestly?</summary>
+        <div class="answer">
+          <p>
+            Lakeleto is at v0.1.4 and the maintainers describe it as an early release, not a
+            mature product. The core is real and the maintainers run it daily: the grid, schema, profile, SQL,
+            export and the Parquet, CSV, Iceberg and Delta readers all work today.
+          </p>
+          <p>
+            You are getting it before it is polished, and your bug reports shape what gets fixed
+            first. If you need something battle-tested for a critical pipeline this week, wait for
+            a later release.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>What will it cost?</summary>
+        <div class="answer">
+          <p>
+            The tool you run on your own machine is open source under Apache-2.0, and that is not
+            going to change.
+          </p>
+          <p>
+            A hosted, team-oriented edition is on the roadmap and would be the paid piece, but it
+            is not built yet and nothing on this page depends on it. There is no pricing to quote
+            because there is nothing to sell you yet.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Can it handle a file bigger than my memory?</summary>
+        <div class="answer">
+          <p>
+            Yes for browsing. The grid renders only the rows on screen and fetches windows as you
+            scroll, and Parquet is read by row group, so file size is not bounded by memory.
+          </p>
+          <p>
+            For sorting and filtering across a very large file, the SQL engine does it exactly and
+            without bound. Without SQL enabled, sorts and filters run over a capped working set,
+            and the interface says plainly when you are looking at a partial view. It does not
+            quietly show you a subset.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Which platforms?</summary>
+        <div class="answer">
+          <p>
+            macOS on Apple Silicon and Intel, Linux on x86-64 and ARM64 statically linked, and
+            Windows on x86-64. Each is a single executable. Unzip it and run it; there is no installer and
+            no runtime to set up first.
+          </p>
+          <p>
+            Windows on ARM64 is not built — that one you compile from source today. And "run it"
+            means from a terminal: you start it once with a command, and everything after that
+            happens in your browser.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Does it change my data?</summary>
+        <div class="answer">
+          <p>
+            No. Every path is read-only: the file readers only read, SQL is restricted to
+            <code class="inline">SELECT</code>, and the database connectors cannot write. Export
+            creates a new file where you ask for one and never touches the source.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Do I need to know SQL or Python?</summary>
+        <div class="answer">
+          <p>
+            No. You start it once from a terminal, and from then on it is a normal window in your
+            browser: click a file, scroll the rows, click a column heading to sort, type in a box
+            to filter. The schema and profile views are just tables you read.
+          </p>
+          <p>
+            SQL is there when you want it and ignorable when you do not. Nothing in the grid,
+            schema, profile or export views requires writing a query.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Will my computer trust it on first launch?</summary>
+        <div class="answer">
+          <p>
+            No, and we would rather you heard that here than from the warning. Windows SmartScreen
+            says <i>"Windows protected your PC — unknown publisher"</i>; macOS says the developer
+            <i>cannot be verified</i>. Nothing is wrong with the download. Lakeleto has no
+            Authenticode certificate and no Apple notarization yet, and those cost money and an
+            identity a project this young has not set up.
+          </p>
+          <p>
+            To get past it: on Windows, <b>More info → Run anyway</b>. On macOS, right-click the
+            file in Finder and choose <b>Open</b> once — that offers an Open button the plain
+            double-click does not.
+          </p>
+          <p>
+            The cosign signature and SHA-256 on every release are the real check, and they are a
+            stronger one than a code-signing certificate: they tie the binary to the exact public
+            build that produced it. They just are not the check your OS knows how to read.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>What do I have to hand over to get it?</summary>
+        <div class="answer">
+          <p>
+            Nothing. There is no account, no email address, and no licence key. The download is a
+            release asset on GitHub: take the archive for your platform, unzip it, and run it.
+          </p>
+          <p>
+            You do give GitHub a request for a file, which is the ordinary cost of downloading
+            anything. Nothing is asked of you by us, and nothing about the file you later open
+            ever reaches anyone.
+          </p>
+        </div>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ CLOSE ============================ -->
+<section class="field field--tight">
+  <div class="wrap">
+    <h2 class="display-2" style="max-width:18ch">Stop guessing what is in the file.</h2>
+    <p class="lede" style="margin-top:20px">
+      Download it and point it at a table. There is nothing to sign up for.
+    </p>
+    <div class="getit">
+      <div class="getit-row">
+        <a class="btn btn-primary" href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download Lakeleto</a>
+        <a class="btn btn-quiet" href="https://github.com/lucheeseng827/lakeleto">Star on GitHub</a>
+      </div>
+      <p class="hint">Free and open source, under Apache-2.0.</p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <div class="wrap">
+    <div class="colophon-grid">
+      <div>
+        <a class="brand" href="index.html" aria-label="Lakeleto home">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <rect x="4" y="4" width="56" height="56" fill="#14161a"/>
+            <rect x="8" y="8" width="48" height="48" fill="#f2e6ce"/>
+            <rect x="15" y="15" width="34" height="6" fill="#14161a"/>
+            <rect x="15" y="26" width="22" height="6" fill="#1e3a5f"/>
+            <rect x="15" y="37" width="29" height="6" fill="#d14a3a"/>
+            <rect x="15" y="48" width="14" height="6" fill="#5a3e2b"/>
+          </svg>
+          <span>Lakeleto</span>
+        </a>
+        <p>
+          See inside any table, on your own machine, with your own data, without asking anyone's
+          permission.
+        </p>
+      </div>
+      <nav class="colophon-links" aria-label="Footer">
+        <a href="#views">What it prints</a>
+        <a href="#plates">The workbench</a>
+        <a href="#formats">Formats</a>
+        <a href="#private">Privacy</a>
+        <a href="#register">Questions</a>
+        <a href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download</a>
+        <a href="https://github.com/lucheeseng827/lakeleto">Source and docs</a>
+      </nav>
+    </div>
+    <p class="colophon-legal">
+      © <span data-year>2026</span> Lakeleto · Apache-2.0 · Lakeleto is a working product name.
+      Screenshots are of the running v0.1.4 build.
+    </p>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>
