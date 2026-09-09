@@ -361,7 +361,11 @@ jobs:
         run: echo "::warning::Apple notarization credentials unset - shipping a NOT NOTARIZED .dmg; first launch needs a network round-trip to Apple, and Gatekeeper blocks it offline"
 
       - name: Build the .dmg
-        run: ./packaging/macos/build-dmg.sh "${{ steps.ver.outputs.version }}"
+        # Invoked through bash rather than as ./script: the monorepo is authored on
+        # Windows, where the executable bit is not meaningful, so it was committed
+        # 100644 and the mirror faithfully published a script the runner refused with
+        # "Permission denied". The bit is set now; this makes losing it again harmless.
+        run: bash ./packaging/macos/build-dmg.sh "${{ steps.ver.outputs.version }}"
 
       - name: Checksum
         id: pkg

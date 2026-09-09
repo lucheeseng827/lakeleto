@@ -96,11 +96,23 @@ foreach ($exe in 'lakeleto.exe', 'lakeleto-desktop.exe') {
 
 $msi = Join-Path $packagingWindows "lakeleto-$Version-x64.msi"
 Write-Host "==> packaging $msi"
-& wix build (Join-Path $packagingWindows 'lakeleto.wxs') `
-    -o $msi `
-    -d Version=$Version `
-    -d BinDir=$releaseDir
-if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
+# WiX resolves a relative SourceFile - lakeleto.wxs has one, <Icon SourceFile=
+# "lakeleto.ico"> - against the CURRENT DIRECTORY, not the .wxs location. Running
+# from packaging/windows is what the .EXAMPLE above does, so it worked by hand and
+# broke the moment CI invoked the script from the repo root: WIX0103, "Cannot find
+# the Icon file 'lakeleto.ico'". Everything else the .wxs needs is absolute, passed
+# in as -d BinDir, so pinning the working directory here is the whole fix.
+Push-Location $packagingWindows
+try {
+    & wix build (Join-Path $packagingWindows 'lakeleto.wxs') `
+        -o $msi `
+        -d Version=$Version `
+        -d BinDir=$releaseDir
+    if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
+}
+finally {
+    Pop-Location
+}
 
 Write-Host ''
 Write-Host "built $msi"
