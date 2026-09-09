@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Lakeleto</string>
+    <key>CFBundleDisplayName</key>
+    <string>Lakeleto</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.lakeleto.desktop</string>
+    <key>CFBundleExecutable</key>
+    <string>lakeleto-desktop</string>
+    <key>CFBundleIconFile</key>
+    <string>Lakeleto</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!-- Menu-bar app, no Dock icon and no menu bar of its own. The launcher owns
+         no windows: the UI is a browser tab, and the only thing to click is the
+         status-item menu. Without this the user gets a bouncing Dock icon for an
+         app that never opens a window, and "Quit" in two places that behave
+         differently. -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- winit + tray-icon both require a reasonably modern AppKit; 10.15 is also
+         the floor for notarized Developer ID distribution in practice. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+</dict>
+</plist>
