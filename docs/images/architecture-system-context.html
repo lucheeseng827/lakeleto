@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>System context — two load-bearing seams</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f4f2ee;   /* bone */
+      --color-ink:     #1c1f26;   /* graphite */
+      --color-muted:   #4a5361;   /* slate */
+      --color-accent:  #a13d24;   /* oxide */
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1280px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Architecture · lakeleto</p>
+    <h1>System context — two load-bearing seams</h1>
+
+    <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="lakeleto-title lakeleto-desc">
+      <title id="lakeleto-title">System context — two load-bearing seams</title>
+      <desc id="lakeleto-desc">Architecture diagram showing Lakeleto's CLI and embedded SPA reaching one axum server whose data-read paths are confined to --root, then crossing one of two trait seams: Engine for reads, backed by local arrow/parquet, DataFusion or a remote cloud engine over the tables themselves, and WorkspaceStore for the workbench, backed by a local JSON and Parquet cache or a later cloud store.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4a5361"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#a13d24"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f4f2ee"/>
+
+      <!-- ============ Connectors ============ -->
+
+      <line x1="184" y1="316" x2="232" y2="316" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <line x1="400" y1="316" x2="448" y2="316" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 600,280 H 620 Q 628,280 628,272 V 220 Q 628,212 636,212 H 656"
+            fill="none" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+      <!-- lakeleto serve (WSAPI /v1/workspaces/*) -> WorkspaceStore : direct, bypasses --root -->
+      <path d="M 316,384 V 448 Q 316,456 324,456 H 656"
+            fill="none" stroke="#4a5361" stroke-width="1.4" marker-end="url(#arrow)"/>
+      <line x1="832" y1="212" x2="880" y2="212" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="832" y1="436" x2="880" y2="436" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="1072" y1="212" x2="1120" y2="212" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="1072" y1="436" x2="1120" y2="436" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- ============ Arrow labels ============ -->
+
+      <rect x="186" y="296" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="208" y="305" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">HTTP</text>
+
+      <rect x="402" y="296" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="424" y="305" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PATH</text>
+
+      <rect x="568" y="232" width="52" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="594" y="241" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">READS</text>
+
+      <rect x="508" y="450" width="72" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="544" y="459" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">WORKBENCH</text>
+
+      <rect x="834" y="192" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="856" y="201" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">impl</text>
+
+      <rect x="834" y="416" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="856" y="425" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">impl</text>
+
+      <rect x="1074" y="192" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="1096" y="201" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">READ</text>
+
+      <rect x="1074" y="416" width="44" height="12" rx="2" fill="#f4f2ee"/>
+      <text x="1096" y="425" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">WRITE</text>
+
+      <!-- ============ Editorial callout ============ -->
+
+      <text x="40" y="560" fill="#4a5361" font-size="14" font-style="italic"
+            font-family="'Instrument Serif', serif">every data-read path is confined to --root before the Engine seam</text>
+      <path d="M 330,550 Q 420,470 522,390" fill="none"
+            stroke="rgba(28,31,38,0.30)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="528" cy="384" r="2" fill="#1c1f26"/>
+
+      <!-- ============ Nodes ============ -->
+
+      <!-- Clients (input) -->
+      <rect x="40" y="248" width="144" height="136" rx="6" fill="#f4f2ee"/>
+      <rect x="40" y="248" width="144" height="136" rx="6" fill="rgba(74,83,97,0.10)" stroke="#79818f" stroke-width="1"/>
+      <rect x="48" y="254" width="24" height="12" rx="2" fill="transparent" stroke="rgba(121,129,143,0.40)" stroke-width="0.8"/>
+      <text x="60" y="263" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">IN</text>
+      <text x="112" y="300" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Clients</text>
+      <text x="112" y="324" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">lakeleto CLI</text>
+      <text x="112" y="340" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">embedded SPA</text>
+      <text x="112" y="356" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">multi-tab workspace</text>
+
+      <!-- lakeleto serve -->
+      <rect x="232" y="248" width="168" height="136" rx="6" fill="#f4f2ee"/>
+      <rect x="232" y="248" width="168" height="136" rx="6" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <rect x="240" y="254" width="36" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.40)" stroke-width="0.8"/>
+      <text x="258" y="263" fill="#1c1f26" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SERVE</text>
+      <text x="316" y="296" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">lakeleto serve</text>
+      <text x="316" y="320" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">--features serve</text>
+      <text x="316" y="336" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">axum</text>
+      <text x="316" y="352" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/v1/* reads</text>
+      <text x="316" y="368" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">/v1/workspaces/*</text>
+
+      <!-- --root confinement -->
+      <rect x="448" y="248" width="152" height="136" rx="6" fill="#f4f2ee"/>
+      <rect x="448" y="248" width="152" height="136" rx="6" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <rect x="456" y="254" width="40" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.40)" stroke-width="0.8"/>
+      <text x="476" y="263" fill="#1c1f26" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">GUARD</text>
+      <text x="524" y="300" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">--root</text>
+      <text x="524" y="324" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">confine_entry</text>
+      <text x="524" y="340" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">confine_members</text>
+      <text x="524" y="356" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">every data-read path</text>
+
+      <!-- trait Engine (FOCAL 1) -->
+      <rect x="656" y="152" width="176" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="656" y="152" width="176" height="120" rx="6" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <rect x="664" y="158" width="32" height="12" rx="2" fill="transparent" stroke="rgba(161,61,36,0.50)" stroke-width="0.8"/>
+      <text x="680" y="167" fill="#a13d24" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SEAM</text>
+      <text x="744" y="208" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">trait Engine</text>
+      <text x="744" y="232" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">carries reads</text>
+      <text x="744" y="248" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">the only read contract</text>
+
+      <!-- Engine impls -->
+      <rect x="880" y="152" width="192" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="880" y="152" width="192" height="120" rx="6" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <rect x="888" y="158" width="32" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.40)" stroke-width="0.8"/>
+      <text x="904" y="167" fill="#1c1f26" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">IMPL</text>
+      <text x="976" y="196" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Engine impls</text>
+      <text x="976" y="216" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">LocalReaderEngine</text>
+      <text x="976" y="232" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">arrow + parquet + csv</text>
+      <text x="976" y="248" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">DataFusion (--sql)</text>
+      <text x="976" y="264" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Remote → Cloud</text>
+
+      <!-- Tables (store) -->
+      <rect x="1120" y="152" width="120" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="1120" y="152" width="120" height="120" rx="6" fill="rgba(28,31,38,0.05)" stroke="#4a5361" stroke-width="1"/>
+      <rect x="1128" y="158" width="32" height="12" rx="2" fill="transparent" stroke="rgba(74,83,97,0.50)" stroke-width="0.8"/>
+      <text x="1144" y="167" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">DATA</text>
+      <text x="1180" y="204" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Tables</text>
+      <text x="1180" y="228" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Parquet · CSV</text>
+      <text x="1180" y="244" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Iceberg</text>
+      <text x="1180" y="260" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">disk · s3/gs/az://</text>
+
+      <!-- trait WorkspaceStore (FOCAL 2) -->
+      <rect x="656" y="376" width="176" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="656" y="376" width="176" height="120" rx="6" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <rect x="664" y="382" width="32" height="12" rx="2" fill="transparent" stroke="rgba(161,61,36,0.50)" stroke-width="0.8"/>
+      <text x="680" y="391" fill="#a13d24" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SEAM</text>
+      <text x="744" y="424" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">WorkspaceStore</text>
+      <text x="744" y="448" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">carries the workbench</text>
+      <text x="744" y="464" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">connections · queries</text>
+      <text x="744" y="480" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">run history</text>
+
+      <!-- Store impls -->
+      <rect x="880" y="376" width="192" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="880" y="376" width="192" height="120" rx="6" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <rect x="888" y="382" width="32" height="12" rx="2" fill="transparent" stroke="rgba(28,31,38,0.40)" stroke-width="0.8"/>
+      <text x="904" y="391" fill="#1c1f26" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">IMPL</text>
+      <text x="976" y="420" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Store impls</text>
+      <text x="976" y="440" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">LocalStore · JSON docs</text>
+      <text x="976" y="456" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">+ Parquet result cache</text>
+      <text x="976" y="472" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">CloudStore (ee/, later)</text>
+      <text x="976" y="488" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">same contract</text>
+
+      <!-- ~/.lakeleto (store) -->
+      <rect x="1120" y="376" width="120" height="120" rx="6" fill="#f4f2ee"/>
+      <rect x="1120" y="376" width="120" height="120" rx="6" fill="rgba(28,31,38,0.05)" stroke="#4a5361" stroke-width="1"/>
+      <rect x="1128" y="382" width="32" height="12" rx="2" fill="transparent" stroke="rgba(74,83,97,0.50)" stroke-width="0.8"/>
+      <text x="1144" y="391" fill="#4a5361" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOME</text>
+      <text x="1180" y="428" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">~/.lakeleto</text>
+      <text x="1180" y="452" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">workspace.json</text>
+      <text x="1180" y="468" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">history.jsonl</text>
+      <text x="1180" y="484" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">results/*.parquet</text>
+
+      <!-- ============ Legend ============ -->
+
+      <line x1="40" y1="604" x2="1240" y2="604" stroke="rgba(28,31,38,0.12)" stroke-width="0.8"/>
+      <text x="40" y="620" fill="#4a5361" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <rect x="40" y="640" width="14" height="10" rx="2" fill="rgba(161,61,36,0.10)" stroke="#a13d24" stroke-width="1"/>
+      <text x="60" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Focal · the two load-bearing seams</text>
+
+      <rect x="380" y="640" width="14" height="10" rx="2" fill="#ffffff" stroke="#1c1f26" stroke-width="1"/>
+      <text x="400" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Binds to the trait</text>
+
+      <rect x="580" y="640" width="14" height="10" rx="2" fill="rgba(28,31,38,0.05)" stroke="#4a5361" stroke-width="1"/>
+      <text x="600" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">On disk</text>
+
+      <rect x="720" y="640" width="14" height="10" rx="2" fill="rgba(74,83,97,0.10)" stroke="#79818f" stroke-width="1"/>
+      <text x="740" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">Client</text>
+
+      <line x1="860" y1="645" x2="888" y2="645" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <text x="896" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">HTTP</text>
+
+      <line x1="1010" y1="645" x2="1038" y2="645" stroke="#4a5361" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="1046" y="648" fill="#4a5361" font-size="8.5" font-family="'Geist', sans-serif">In-process call</text>
+    </svg>
+  </div>
+</body>
+</html>

@@ -33,6 +33,18 @@ pub struct LocalReaderEngine {
     pub batch_size: usize,
     /// Max rows read into memory for a sort/filter grid scan (bounded working set).
     pub scan_cap: usize,
+    /// How this engine's object-store reads are configured.
+    ///
+    /// Only one read here is remote — the Iceberg mirror in [`Self::iceberg_plan`] — but that one
+    /// is enough to matter: without this field it called the environment-reading
+    /// `materialize_prefix`, so an engine built for one identity mirrored the table as whatever
+    /// principal the process happened to carry. Same reasoning as
+    /// [`crate::engine::sql::DataFusionEngine::store_options`]: a field rather than an [`Engine`]
+    /// trait parameter, because the trait is object-safe and shared by every backend and must not
+    /// grow a cloud-specific argument. Defaults to the process environment, which is what every
+    /// existing caller gets.
+    #[cfg(feature = "object-store")]
+    store_options: crate::objstore::StoreOptions,
 }
 
 impl Default for LocalReaderEngine {
@@ -41,7 +53,22 @@ impl Default for LocalReaderEngine {
             csv_infer_max: 1000,
             batch_size: 8192,
             scan_cap: 200_000,
+            #[cfg(feature = "object-store")]
+            store_options: crate::objstore::StoreOptions::from_env(),
         }
+    }
+}
+
+impl LocalReaderEngine {
+    /// This engine, reading object storage as `opts` says rather than as the environment says.
+    ///
+    /// The counterpart of [`crate::engine::sql::DataFusionEngine::with_store_options`]; the SQL
+    /// engine hands its own options down when it falls back to this reader, so a single query
+    /// cannot read half its tables as one principal and half as another.
+    #[cfg(feature = "object-store")]
+    pub fn with_store_options(mut self, opts: crate::objstore::StoreOptions) -> Self {
+        self.store_options = opts;
+        self
     }
 }
 
@@ -54,7 +81,8 @@ impl LocalReaderEngine {
         #[cfg(feature = "object-store")]
         if source.is_remote() {
             let uri = source.path.to_string_lossy();
-            let local = crate::objstore::materialize_prefix(uri.as_ref())?;
+            let local =
+                crate::objstore::materialize_prefix_with(uri.as_ref(), &self.store_options)?;
             return crate::iceberg::plan_object(&local, uri.as_ref());
         }
         crate::iceberg::plan(&source.path)
@@ -82,6 +110,7 @@ impl LocalReaderEngine {
                 self.infer_csv(&source.path, self.csv_infer_max, source.format.delimiter())?,
                 None,
             )),
+            Format::Json => Ok((self.json_schema(&source.path)?, None)),
             #[cfg(feature = "iceberg")]
             Format::Iceberg => {
                 let plan = self.iceberg_plan(source)?;
@@ -144,6 +173,70 @@ impl LocalReaderEngine {
             .infer_schema(&mut rdr, Some(max_rows))
             .map_err(EngineError::arrow)?;
         Ok(Arc::new(schema))
+    }
+
+    /// Infer a `.json`/`.ndjson`/`.jsonl` schema over up to `csv_infer_max` records. A top-level
+    /// array is normalised to newline-delimited JSON first (see [`json_array_to_ndjson`]); NDJSON
+    /// is inferred by streaming.
+    fn json_schema(&self, path: &std::path::Path) -> Result<SchemaRef> {
+        if json_is_array(path)? {
+            let nd = json_array_to_ndjson(path)?;
+            let (schema, _) = arrow_json::reader::infer_json_schema(
+                std::io::Cursor::new(&nd),
+                Some(self.csv_infer_max),
+            )
+            .map_err(EngineError::arrow)?;
+            Ok(Arc::new(schema))
+        } else {
+            let (schema, _) = arrow_json::reader::infer_json_schema(
+                BufReader::new(File::open(path)?),
+                Some(self.csv_infer_max),
+            )
+            .map_err(EngineError::arrow)?;
+            Ok(Arc::new(schema))
+        }
+    }
+
+    /// Read a `.json`/`.ndjson`/`.jsonl` file into Arrow batches, stopping once `row_limit` rows
+    /// are gathered (all rows when `None`). Newline-delimited JSON streams straight through the
+    /// arrow-json reader; a top-level array is parsed and re-emitted as newline-delimited so a
+    /// single reader path serves both shapes. The schema is inferred over at least the read window
+    /// (mirroring the CSV path) so a column that only widens later does not error the fixed reader.
+    fn read_json_batches(
+        &self,
+        path: &std::path::Path,
+        row_limit: Option<usize>,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        let infer_rows = row_limit
+            .map(|n| n.max(self.csv_infer_max))
+            .unwrap_or(self.csv_infer_max);
+        let bs = row_limit
+            .map(|n| n.clamp(1, self.batch_size))
+            .unwrap_or(self.batch_size);
+        if json_is_array(path)? {
+            let nd = json_array_to_ndjson(path)?;
+            let (schema, _) =
+                arrow_json::reader::infer_json_schema(std::io::Cursor::new(&nd), Some(infer_rows))
+                    .map_err(EngineError::arrow)?;
+            let schema = Arc::new(schema);
+            let reader = arrow_json::ReaderBuilder::new(schema.clone())
+                .with_batch_size(bs)
+                .build(std::io::Cursor::new(&nd))
+                .map_err(EngineError::arrow)?;
+            Ok((schema, collect_batches(reader, row_limit)?))
+        } else {
+            let (schema, _) = arrow_json::reader::infer_json_schema(
+                BufReader::new(File::open(path)?),
+                Some(infer_rows),
+            )
+            .map_err(EngineError::arrow)?;
+            let schema = Arc::new(schema);
+            let reader = arrow_json::ReaderBuilder::new(schema.clone())
+                .with_batch_size(bs)
+                .build(BufReader::new(File::open(path)?))
+                .map_err(EngineError::arrow)?;
+            Ok((schema, collect_batches(reader, row_limit)?))
+        }
     }
 
     /// Read up to `row_limit` rows (all rows when `None`).
@@ -214,6 +307,7 @@ impl LocalReaderEngine {
                 }
                 Ok((schema, batches))
             }
+            Format::Json => self.read_json_batches(&source.path, row_limit),
             #[cfg(feature = "iceberg")]
             Format::Iceberg => self.read_window(source, 0, row_limit.unwrap_or(usize::MAX), None),
             #[cfg(feature = "delta")]
@@ -275,7 +369,13 @@ impl LocalReaderEngine {
                 Ok((schema, batches))
             }
             Format::Csv | Format::Tsv => {
-                let (schema, batches) = self.read_batches(source, Some(offset + limit))?;
+                let (schema, batches) =
+                    self.read_batches(source, Some(offset.saturating_add(limit)))?;
+                Ok((schema, window_batches(batches, offset, limit)))
+            }
+            Format::Json => {
+                let (schema, batches) =
+                    self.read_batches(source, Some(offset.saturating_add(limit)))?;
                 Ok((schema, window_batches(batches, offset, limit)))
             }
             #[cfg(feature = "iceberg")]
@@ -717,8 +817,54 @@ impl LocalReaderEngine {
                     None,
                 ))
             }
+            Format::Json => {
+                let bytes = crate::objstore::fetch_all(&uri)?;
+                Ok((self.json_schema_bytes(&bytes)?, None))
+            }
             other => Err(EngineError::unsupported_format(other, self.name())),
         }
+    }
+
+    /// Infer a JSON schema from an in-memory buffer (remote `.json`/`.ndjson`/`.jsonl`).
+    #[cfg(feature = "object-store")]
+    fn json_schema_bytes(&self, bytes: &[u8]) -> Result<SchemaRef> {
+        let nd = json_bytes_to_ndjson(bytes)?;
+        let (schema, _) = arrow_json::reader::infer_json_schema(
+            std::io::Cursor::new(nd.as_ref()),
+            Some(self.csv_infer_max),
+        )
+        .map_err(EngineError::arrow)?;
+        Ok(Arc::new(schema))
+    }
+
+    /// Read JSON from an in-memory buffer into Arrow batches (remote `.json`/`.ndjson`/`.jsonl`),
+    /// stopping at `row_limit`. Mirrors the local [`read_json_batches`](Self::read_json_batches)
+    /// but over bytes already fetched, since a remote object is fetched whole (it cannot be
+    /// row-windowed at the source, exactly like remote CSV).
+    #[cfg(feature = "object-store")]
+    fn read_json_bytes(
+        &self,
+        bytes: &[u8],
+        row_limit: Option<usize>,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        let nd = json_bytes_to_ndjson(bytes)?;
+        let infer_rows = row_limit
+            .map(|n| n.max(self.csv_infer_max))
+            .unwrap_or(self.csv_infer_max);
+        let bs = row_limit
+            .map(|n| n.clamp(1, self.batch_size))
+            .unwrap_or(self.batch_size);
+        let (schema, _) = arrow_json::reader::infer_json_schema(
+            std::io::Cursor::new(nd.as_ref()),
+            Some(infer_rows),
+        )
+        .map_err(EngineError::arrow)?;
+        let schema = Arc::new(schema);
+        let reader = arrow_json::ReaderBuilder::new(schema.clone())
+            .with_batch_size(bs)
+            .build(std::io::Cursor::new(nd.as_ref()))
+            .map_err(EngineError::arrow)?;
+        Ok((schema, collect_batches(reader, row_limit)?))
     }
 
     #[cfg(feature = "object-store")]
@@ -756,6 +902,13 @@ impl LocalReaderEngine {
                         break;
                     }
                 }
+                Ok((schema, window_batches(batches, offset, limit)))
+            }
+            Format::Json => {
+                // Like remote CSV: fetch once, read + slice locally (no remote row-windowing).
+                let bytes = crate::objstore::fetch_all(&uri)?;
+                let want = offset.saturating_add(limit);
+                let (schema, batches) = self.read_json_bytes(&bytes, Some(want))?;
                 Ok((schema, window_batches(batches, offset, limit)))
             }
             other => Err(EngineError::unsupported_format(other, self.name())),
@@ -796,6 +949,97 @@ impl LocalReaderEngine {
 /// Is this source a directory of Parquet files (a multi-file dataset) rather than a single file?
 fn is_parquet_dataset(source: &Source) -> bool {
     source.format == Format::Parquet && !source.is_remote() && source.path.is_dir()
+}
+
+/// Whether a JSON file's first non-whitespace byte is `[` — a top-level array, as opposed to
+/// newline-delimited JSON (`.ndjson`/`.jsonl`, or a `.json` written one record per line). The two
+/// shapes are read by different paths, so the reader peeks a single byte to pick one.
+fn json_is_array(path: &std::path::Path) -> Result<bool> {
+    use std::io::Read;
+    let mut r = BufReader::new(File::open(path)?);
+    let mut b = [0u8; 1];
+    while r.read(&mut b)? == 1 {
+        if !b[0].is_ascii_whitespace() {
+            return Ok(b[0] == b'[');
+        }
+    }
+    // Empty (or all-whitespace) file: no records — treat as newline-delimited (zero rows).
+    Ok(false)
+}
+
+/// Upper bound on the size of a top-level JSON **array** the reader will buffer. A bracketed array
+/// cannot be line-streamed, so it is parsed into memory in full before the caller's row window
+/// applies; without a ceiling a large `.json` array would let a single `preview?limit=50` request
+/// exhaust server memory. Arrays above this size are rejected before any allocation. Newline-
+/// delimited JSON has no such limit — it streams and is bounded by the row window directly.
+const JSON_ARRAY_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Parse a top-level JSON **array** file and re-emit it as newline-delimited JSON (one array
+/// element per line), so the newline-delimited arrow-json reader can consume it. A bracketed array
+/// cannot be line-streamed, so it is read into memory in full — the same shape `duckdb`/`pandas`
+/// take for a JSON array. The file's size is checked against [`JSON_ARRAY_MAX_BYTES`] *before* it is
+/// read, so an oversized array is rejected without ever allocating it.
+fn json_array_to_ndjson(path: &std::path::Path) -> Result<Vec<u8>> {
+    let len = std::fs::metadata(path)?.len();
+    if len > JSON_ARRAY_MAX_BYTES {
+        return Err(json_array_too_large(len));
+    }
+    Ok(json_bytes_to_ndjson(&std::fs::read(path)?)?.into_owned())
+}
+
+/// Normalise raw JSON bytes to newline-delimited JSON: a top-level `[...]` array is parsed and
+/// re-emitted one element per line (owned); anything already newline-delimited is returned
+/// borrowed, unchanged. Shared by the local array path and the remote reader, which both hold the
+/// bytes in memory (a bracketed array cannot be line-streamed). An array larger than
+/// [`JSON_ARRAY_MAX_BYTES`] is rejected before the parse, so it is never deserialised.
+fn json_bytes_to_ndjson(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
+    let is_array = bytes
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'[');
+    if !is_array {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    if bytes.len() as u64 > JSON_ARRAY_MAX_BYTES {
+        return Err(json_array_too_large(bytes.len() as u64));
+    }
+    let values: Vec<serde_json::Value> = serde_json::from_slice(bytes)
+        .map_err(|e| EngineError::Query(format!("invalid JSON array: {e}")))?;
+    let mut out = Vec::new();
+    for v in &values {
+        serde_json::to_writer(&mut out, v).map_err(|e| EngineError::Other(e.to_string()))?;
+        out.push(b'\n');
+    }
+    Ok(std::borrow::Cow::Owned(out))
+}
+
+/// The error returned when a top-level JSON array exceeds [`JSON_ARRAY_MAX_BYTES`]. Names the limit
+/// and points at the newline-delimited alternative, which streams instead of buffering.
+fn json_array_too_large(len: u64) -> EngineError {
+    EngineError::Query(format!(
+        "JSON array is {len} bytes, over the {JSON_ARRAY_MAX_BYTES}-byte limit for a bracketed \
+         array; convert it to newline-delimited JSON (one record per line) to read it in a bounded \
+         stream"
+    ))
+}
+
+/// Drain an Arrow-batch iterator into a vec, stopping once `row_limit` rows are gathered (all rows
+/// when `None`). Shared by the JSON reader's two source shapes (file stream vs. in-memory buffer).
+fn collect_batches<I>(iter: I, row_limit: Option<usize>) -> Result<Vec<RecordBatch>>
+where
+    I: IntoIterator<Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>>,
+{
+    let mut batches = Vec::new();
+    let mut rows = 0usize;
+    for b in iter {
+        let b = b.map_err(EngineError::arrow)?;
+        rows += b.num_rows();
+        batches.push(b);
+        if row_limit.is_some_and(|n| rows >= n) {
+            break;
+        }
+    }
+    Ok(batches)
 }
 
 /// The physical layout of a multi-file Parquet dataset: `data` columns (the union of file schemas)
@@ -946,7 +1190,7 @@ impl Engine for LocalReaderEngine {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             engine: "local (arrow/parquet/csv reader)".to_string(),
-            formats: vec!["parquet".to_string(), "csv".to_string()],
+            formats: crate::engine::readable_formats(),
             sql: false,
             profile: true,
             remote: false,

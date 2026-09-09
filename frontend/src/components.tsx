@@ -298,7 +298,9 @@ export function DataGrid({ columns = [], rows = [], sort = null, onSort, filters
             {columns.map((c) => (
               <div key={c.name} style={{ ...gcell, width: width(c), background: "var(--panel)", padding: "3px 5px" }}>
                 <input value={filters[c.name] || ""} placeholder="filter…"
-                  title="contains by default; prefix >  <  >=  <=  =  != for comparisons"
+                  title={"contains by default. Prefix:  >  <  >=  <=  =  !=  for comparisons; "
+                    + "~ contains, !~ does not contain, ^ starts with, $ ends with. "
+                    + "Type  in:a,b,c  for any of a list, or  null  /  !null  for empty cells."}
                   onChange={(e) => onFilter && onFilter(c.name, e.target.value)}
                   style={{ width: "100%", padding: "2px 5px", border: "var(--border-hairline)", borderRadius: "var(--radius-sm)", background: "var(--bg)", color: "var(--fg)", fontFamily: "var(--font-mono)", fontSize: "var(--text-12)" }} />
               </div>

@@ -2,9 +2,10 @@
 // TableView: a workspace switcher, the open-tab strip, the sidebar (saved connections + queries +
 // file tree), and the run-history panel. The client tab model round-trips through the backend
 // `Tab.view` (opaque grid state), so open tabs + their sort/filter/sql survive a reload.
-import { useEffect, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode, type SyntheticEvent } from "react";
+import { useEffect, useMemo, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode, type SyntheticEvent } from "react";
 import type { Conn, Filters, Row, RunRecord, RunResponse, Sort, Workspace, WsConnection, WsMeta, WsSavedQuery, WsVariable, QueryResp } from "./api";
 import { Button, Chip, filterRows, LakeletoMark, Select, StatTable, TextInput, ThemeToggle } from "./components";
+import { isDatabaseUri } from "./api";
 
 const VAR_RE = /\{\{\s*([\w.-]+)\s*\}\}/g;
 /** Substitute `{{key}}` with the workspace variable's value (client-side, Postman-style). Unknown
@@ -55,6 +56,12 @@ let seq = 0;
 export const newTabId = () => `tab-${Date.now().toString(36)}-${(seq++).toString(36)}`;
 export const basename = (p: string) => { const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); return i >= 0 ? p.slice(i + 1) : p; };
 const fmtInt = (n?: number | null) => (n == null ? "?" : Number(n).toLocaleString());
+/** Durations, at the precision a person cares about: milliseconds while they are small enough to
+ *  read, seconds once they are not, minutes once seconds stop being a number you scan. */
+const fmtMs = (ms: number): string =>
+  ms < 1000 ? `${Math.round(ms)} ms`
+    : ms < 60_000 ? `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`
+      : `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
 
 export function agoStr(ms: number): string {
   const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
@@ -390,7 +397,7 @@ function AddConnectionForm({ initial, onSubmit, onCancel }: {
 // ======================================================================
 // Sidebar — connections, saved queries (grouped into folders), variables, files
 // ======================================================================
-export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, onRunFolder, onOpenFile, onOpenDir, ee }: {
+export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, onRunFolder, onOpenFile, onOpenDir, ee, dbConnectionLimit }: {
   ws: Workspace | null;
   listing: { dir: string; parent?: string | null; entries: { name: string; path: string; kind: "dir" | "file"; size?: number | null }[] } | null;
   mutate: (fn: (ws: Workspace) => Workspace) => void;
@@ -398,6 +405,8 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
   onRunFolder: (folder: string) => void;
   onOpenFile: (p: string) => void; onOpenDir: (d: string) => void;
   ee?: boolean;   // Lakeleto Cloud edition — lifts the open-source DB-connection cap
+  /** Simultaneous DB connections the server allows; `null` = unlimited, `undefined` = not reported. */
+  dbConnectionLimit?: number | null;
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({}); // saved-query FOLDER collapse (keyed by folder name)
   const aside: CSSProperties = { flex: "0 0 260px", borderRight: "var(--border-hairline)", overflow: "auto", padding: "var(--space-5)", background: "var(--panel)", display: "flex", flexDirection: "column" };
@@ -444,16 +453,25 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
   const [editingConn, setEditingConn] = useState<WsConnection | null>(null);
   const [capMsg, setCapMsg] = useState<string | null>(null);
   type ConnForm = { label: string; path: string; format?: string | null; description?: string | null };
-  // Open-source edition connects up to 2 databases at once (any mix of SQLite/Postgres/MySQL);
-  // Lakeleto Cloud (ee) lifts the cap. File/object connections are uncapped.
-  const OSS_DB_LIMIT = 2;
+  // The cap comes from the server (`/v1/engines` -> limits.max_db_connections; null = unlimited),
+  // so an edition's terms are one server constant rather than a literal compiled into this bundle.
+  // The fallback is the value this UI used before the server reported it, for an older server.
+  const dbLimit = dbConnectionLimit ?? (ee ? null : 2);
+  // Classified by scheme as well as by the form's format field: a `postgres://` URI saved with
+  // the format left blank is still a database connection, and a cap that misses it is theater.
+  const isDbConn = (path: string, format?: string | null) => format === "database" || isDatabaseUri(path);
+  /** The cap check for ANY database-connection change; `excludeId` keeps an edit of an existing
+   *  connection from counting against itself. Returns true when the change must be refused. */
+  const overDbCap = (path: string, format: string | null | undefined, excludeId: string | null) => {
+    if (dbLimit == null || !isDbConn(path, format)) return false;
+    const have = (ws?.connections || []).filter((x) => x.id !== excludeId && isDbConn(x.path, x.format)).length;
+    return have >= dbLimit;
+  };
+  const capMessage = `Open-source Lakeleto connects up to ${dbLimit} databases at once. Lakeleto Cloud unlocks unlimited connections + more databases.`;
   const addConn = (c: ConnForm) => {
-    if (c.format === "database" && !ee) {
-      const have = (ws?.connections || []).filter((x) => x.format === "database").length;
-      if (have >= OSS_DB_LIMIT) {
-        setCapMsg(`Open-source Lakeleto connects up to ${OSS_DB_LIMIT} databases at once. Lakeleto Cloud unlocks unlimited connections + more databases.`);
-        return;
-      }
+    if (overDbCap(c.path, c.format, null)) {
+      setCapMsg(capMessage);
+      return;
     }
     setCapMsg(null);
     const conn: WsConnection = { id: "conn-" + newTabId(), label: c.label, path: c.path, format: c.format ?? null, description: c.description ?? null };
@@ -462,6 +480,14 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
     onOpenConnection(conn);
   };
   const updateConn = (id: string, c: ConnForm) => {
+    // An edit can turn a file connection into a database one, so the cap applies here too — with
+    // the edited record excluded from the count, or editing the Nth connection at the cap would
+    // refuse itself.
+    if (overDbCap(c.path, c.format, id)) {
+      setCapMsg(capMessage);
+      return;
+    }
+    setCapMsg(null);
     mutate((w) => ({ ...w, connections: w.connections.map((x) => (x.id === id ? { ...x, label: c.label, path: c.path, format: c.format ?? null, description: c.description ?? null } : x)) }));
     setEditingConn(null);
   };
@@ -583,9 +609,62 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
 // ======================================================================
 // History panel — the workspace run store
 // ======================================================================
-export function HistoryPanel({ history, onOpenRun, onCompare, compareId, onRefresh, onClose, busy }: {
+/** What this workspace has actually done, computed from the run history already on screen.
+ *
+ *  No new endpoint and no new state: `RunRecord` carries `at_ms`, `status`, `row_count` and
+ *  `duration_ms`, and the history call already returns them. The panel listed those runs one by
+ *  one and never added them up, which is the one question you cannot answer by reading a list —
+ *  "is this getting slower, and what is the slow one".
+ */
+function UsageSummary({ history }: { history: RunRecord[] }) {
+  const stats = useMemo(() => {
+    if (!history.length) return null;
+    const ok = history.filter((r) => r.status === "ok");
+    const rows = ok.reduce((a, r) => a + (r.row_count || 0), 0);
+    const ms = history.reduce((a, r) => a + (r.duration_ms || 0), 0);
+    // Slowest *successful* run: a failure's duration measures how long it took to give up, which
+    // is not the same quantity and would sit at the top of the list for the wrong reason.
+    const slowest = ok.reduce<RunRecord | null>(
+      (best, r) => (!best || r.duration_ms > best.duration_ms ? r : best), null);
+    return { runs: history.length, failed: history.length - ok.length, rows, ms, slowest };
+  }, [history]);
+  if (!stats) return null;
+  const cell: CSSProperties = { display: "flex", flexDirection: "column", gap: 1 };
+  const num: CSSProperties = { fontFamily: "var(--font-mono)", fontSize: "var(--text-12)", color: "var(--fg)" };
+  const cap: CSSProperties = { fontSize: "var(--text-xs)", color: "var(--muted)" };
+  return (
+    <div style={{ padding: "8px var(--space-4)", borderBottom: "var(--border-hairline)", display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ display: "flex", gap: 14 }}>
+        <div style={cell}>
+          <span style={num}>{fmtInt(stats.runs)}{stats.failed > 0 && <span style={{ color: "var(--err-fg)" }}> ({stats.failed} failed)</span>}</span>
+          <span style={cap}>runs</span>
+        </div>
+        <div style={cell}>
+          <span style={num}>{fmtInt(stats.rows)}</span>
+          <span style={cap}>rows read</span>
+        </div>
+        <div style={cell}>
+          <span style={num}>{fmtMs(stats.ms)}</span>
+          <span style={cap}>total time</span>
+        </div>
+      </div>
+      {stats.slowest && (
+        <div style={{ ...cap, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+          title={stats.slowest.sql || stats.slowest.source_path}>
+          slowest {fmtMs(stats.slowest.duration_ms)} ·{" "}
+          <span style={{ fontFamily: "var(--font-mono)" }}>
+            {stats.slowest.sql ? stats.slowest.sql.replace(/\s+/g, " ").trim() : "scan " + basename(stats.slowest.source_path)}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function HistoryPanel({ history, onOpenRun, onCompare, compareId, onRefresh, onClose, busy, cacheResults, onToggleCache }: {
   history: RunRecord[]; onOpenRun: (r: RunRecord) => void; onCompare: (r: RunRecord) => void; compareId?: string | null;
   onRefresh: () => void; onClose: () => void; busy?: boolean;
+  cacheResults: boolean; onToggleCache: (v: boolean) => void;
 }) {
   const panel: CSSProperties = { flex: "0 0 300px", borderLeft: "var(--border-hairline)", overflow: "auto", background: "var(--panel)", display: "flex", flexDirection: "column" };
   return (
@@ -596,9 +675,20 @@ export function HistoryPanel({ history, onOpenRun, onCompare, compareId, onRefre
         <Button size="sm" onClick={onRefresh} title="refresh history">↻</Button>
         <Button size="sm" onClick={onClose} title="hide history">×</Button>
       </div>
+      <UsageSummary history={history} />
+      {/* Caching a run writes its full result to the workspace store, and the store may be remote —
+          so this is off until asked for, and says plainly what turning it on does. */}
+      <label style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px var(--space-4)", borderBottom: "var(--border-hairline)", fontSize: "var(--text-xs)", color: "var(--muted)", cursor: "pointer" }}
+        title={cacheResults
+          ? "Results of new runs are saved to this workspace, so you can re-open and compare them. If this workspace syncs to a server, the rows are sent there."
+          : "Runs are recorded in history, but their rows are not saved. Clicking a run reopens its query in a SQL tab, ready to run again."}>
+        <input type="checkbox" checked={cacheResults} onChange={(e) => onToggleCache(e.target.checked)} />
+        <span>Save result rows{cacheResults ? "" : " (off)"}</span>
+      </label>
       <div style={{ padding: "var(--space-4)" }}>
         {busy && <div style={{ color: "var(--muted)", fontSize: "var(--text-xs)", padding: "4px 6px" }}>loading…</div>}
         {!busy && history.length === 0 && <div style={{ color: "var(--muted)", fontSize: "var(--text-xs)", padding: "4px 6px" }}>No runs yet. Run a query in a SQL tab.</div>}
+        {!busy && history.length > 0 && !cacheResults && <div style={{ ...hint, color: "var(--muted)" }}>Result rows are not being saved — clicking a run reopens its query in a SQL tab.</div>}
         {compareId && <div style={{ ...hint, color: "var(--accent)" }}>compare: baseline A picked — click ⇄ on another cached run.</div>}
         {history.map((r) => {
           const ok = r.status === "ok";
@@ -609,7 +699,7 @@ export function HistoryPanel({ history, onOpenRun, onCompare, compareId, onRefre
                 <span style={{ color: ok ? "var(--accent)" : "var(--err-fg)" }}>{ok ? "●" : "▲"}</span>
                 <span role="button" tabIndex={0} onClick={() => onOpenRun(r)}
                   onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpenRun(r); } }}
-                  title={r.cached ? "open the cached result" : ok ? "re-run" : r.error || "failed run"}
+                  title={r.cached ? "open the cached result" : ok ? "open this query in a SQL tab" : r.error || "failed run"}
                   style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "var(--font-mono)", cursor: "pointer" }}>
                   {r.sql ? r.sql.replace(/\s+/g, " ").trim() : "scan " + basename(r.source_path)}
                 </span>

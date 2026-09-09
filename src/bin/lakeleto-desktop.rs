@@ -204,9 +204,11 @@ fn build_tray() -> Result<(tray_icon::TrayIcon, Items), String> {
     menu.append(&open).map_err(|e| format!("tray menu: {e}"))?;
     menu.append(&PredefinedMenuItem::separator())
         .map_err(|e| format!("tray menu: {e}"))?;
-    menu.append(&copy_cli).map_err(|e| format!("tray menu: {e}"))?;
+    menu.append(&copy_cli)
+        .map_err(|e| format!("tray menu: {e}"))?;
     #[cfg(target_os = "macos")]
-    menu.append(&install_cli).map_err(|e| format!("tray menu: {e}"))?;
+    menu.append(&install_cli)
+        .map_err(|e| format!("tray menu: {e}"))?;
     menu.append(&PredefinedMenuItem::separator())
         .map_err(|e| format!("tray menu: {e}"))?;
     menu.append(&quit).map_err(|e| format!("tray menu: {e}"))?;

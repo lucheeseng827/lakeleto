@@ -62,6 +62,19 @@ impl EngineError {
     }
 
     pub fn unsupported_format(format: Format, engine: &str) -> Self {
+        // `Unknown` is not a format this engine "cannot read yet" — it is a source that was
+        // never resolved on this machine because a server was supposed to resolve it (see
+        // `Source::unresolved`). Saying "cannot read unknown sources yet" would send a reader
+        // looking for a missing reader; say what actually went wrong instead.
+        if format == Format::Unknown {
+            return EngineError::UnsupportedFormat {
+                detail: format!(
+                    "the `{engine}` engine was given a source whose format was left for a \
+                     server to resolve — only a remote engine can read one (pass \
+                     `--remote-url`), or name the format explicitly with `--format`"
+                ),
+            };
+        }
         EngineError::UnsupportedFormat {
             detail: format!(
                 "the `{engine}` engine cannot read {} sources yet",

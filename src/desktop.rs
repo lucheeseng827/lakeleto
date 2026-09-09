@@ -228,7 +228,11 @@ pub fn open_browser(url: &str) {
 /// `Contents/MacOS/`, so the CLI is always the launcher's sibling — which also
 /// means this keeps working if the user moves or renames the `.app`.
 pub fn cli_beside(launcher: &Path) -> PathBuf {
-    let name = if cfg!(windows) { "lakeleto.exe" } else { "lakeleto" };
+    let name = if cfg!(windows) {
+        "lakeleto.exe"
+    } else {
+        "lakeleto"
+    };
     launcher.parent().unwrap_or(Path::new(".")).join(name)
 }
 
@@ -322,7 +326,10 @@ pub fn cli_link_dirs() -> Vec<PathBuf> {
 /// The outcome, in the words the user needs to see.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliInstall {
-    Linked { link: PathBuf, on_default_path: bool },
+    Linked {
+        link: PathBuf,
+        on_default_path: bool,
+    },
     AlreadyLinked(PathBuf),
     Occupied(PathBuf),
     Failed(String),
@@ -332,19 +339,28 @@ impl CliInstall {
     /// A message fit for a dialog: what happened, and what to do next.
     pub fn message(&self) -> String {
         match self {
-            CliInstall::Linked { link, on_default_path: true } => format!(
+            CliInstall::Linked {
+                link,
+                on_default_path: true,
+            } => format!(
                 "The lakeleto command is now available at {}.\n\n\
                  Open a new terminal and run: lakeleto --help",
                 link.display()
             ),
-            CliInstall::Linked { link, on_default_path: false } => format!(
+            CliInstall::Linked {
+                link,
+                on_default_path: false,
+            } => format!(
                 "The lakeleto command was linked to {}.\n\n\
                  That directory is not on the default PATH, so add this to your shell profile:\n\
                  export PATH=\"$HOME/.local/bin:$PATH\"",
                 link.display()
             ),
             CliInstall::AlreadyLinked(link) => {
-                format!("The lakeleto command is already installed at {}.", link.display())
+                format!(
+                    "The lakeleto command is already installed at {}.",
+                    link.display()
+                )
             }
             CliInstall::Occupied(link) => format!(
                 "{} already exists and is not a link created by Lakeleto — it is most \
@@ -396,12 +412,20 @@ pub fn install_cli() -> CliInstall {
 
         // `~/.local/bin` routinely does not exist yet; `/usr/local/bin` does.
         if !dir.is_dir() && std::fs::create_dir_all(&dir).is_err() {
-            last_error = Some(format!("{} does not exist and cannot be created", dir.display()));
+            last_error = Some(format!(
+                "{} does not exist and cannot be created",
+                dir.display()
+            ));
             continue;
         }
 
         match make_symlink(&source, &link) {
-            Ok(()) => return CliInstall::Linked { link, on_default_path },
+            Ok(()) => {
+                return CliInstall::Linked {
+                    link,
+                    on_default_path,
+                }
+            }
             Err(e) => last_error = Some(format!("{}: {e}", link.display())),
         }
     }
@@ -496,7 +520,10 @@ pub fn notify(body: &str) {
             "display dialog \"{escaped}\" with title \"Lakeleto\" buttons {{\"OK\"}} \
              default button \"OK\" with icon note"
         );
-        let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn();
     }
     #[cfg(windows)]
     {
@@ -538,10 +565,18 @@ pub fn report_fatal(message: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         // No timestamp crate in this dependency set, and pulling one in for a log
         // line is not worth it; the version plus the message is enough to act on.
-        let _ = writeln!(file, "[lakeleto-desktop {}] {message}", env!("CARGO_PKG_VERSION"));
+        let _ = writeln!(
+            file,
+            "[lakeleto-desktop {}] {message}",
+            env!("CARGO_PKG_VERSION")
+        );
     }
 }
 
@@ -781,7 +816,9 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
-            let Ok((mut sock, _)) = listener.accept() else { return };
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
             let mut scratch = [0u8; 512];
             let _ = sock.read(&mut scratch);
             // A byte at a time, comfortably inside PROBE_TIMEOUT each time, so
@@ -797,7 +834,10 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        assert!(!is_lakeleto(port), "a trickle of bytes is not an engines document");
+        assert!(
+            !is_lakeleto(port),
+            "a trickle of bytes is not an engines document"
+        );
         let elapsed = started.elapsed();
         assert!(
             elapsed < PROBE_TIMEOUT * 3,
@@ -841,7 +881,10 @@ mod tests {
     fn the_port_record_round_trips_and_clears() {
         with_port_file(|| {
             record_port(54_321);
-            assert_eq!(std::fs::read_to_string(port_file()).unwrap().trim(), "54321");
+            assert_eq!(
+                std::fs::read_to_string(port_file()).unwrap().trim(),
+                "54321"
+            );
             clear_port();
             assert!(!port_file().exists());
         });
@@ -891,7 +934,10 @@ mod tests {
             })
             .filter(|&(.., a)| a > 0 && a < 255)
             .collect();
-        assert!(!partial.is_empty(), "a rounded tile must have antialiased corner pixels");
+        assert!(
+            !partial.is_empty(),
+            "a rounded tile must have antialiased corner pixels"
+        );
 
         // Every colour the tile can hold is blue-dominant: the gradient runs
         // #2563eb -> #22d3ee, and the bands only lighten it toward white. So any
@@ -936,7 +982,11 @@ mod tests {
         assert_eq!(cli.parent(), launcher.parent());
         assert_eq!(
             cli.file_name().unwrap(),
-            if cfg!(windows) { "lakeleto.exe" } else { "lakeleto" }
+            if cfg!(windows) {
+                "lakeleto.exe"
+            } else {
+                "lakeleto"
+            }
         );
     }
 
@@ -983,7 +1033,11 @@ mod tests {
         let ours = dir.path().join("Lakeleto.app/Contents/MacOS/lakeleto");
         let state = link_state(&link, &ours);
 
-        assert_eq!(state, LinkState::ForeignLink, "a resolving link is not ours to reclaim");
+        assert_eq!(
+            state,
+            LinkState::ForeignLink,
+            "a resolving link is not ours to reclaim"
+        );
         assert_eq!(decide_link(&state), LinkAction::Refuse);
         assert!(link.exists(), "and it is still there");
     }
@@ -1008,7 +1062,10 @@ mod tests {
         // that happens to share the name — is never touched.
         let dir = tempfile::tempdir().unwrap();
         let nowhere = dir.path().join("no-such-link-at-all");
-        assert_eq!(link_state(&nowhere, Path::new("/whatever")), LinkState::Absent);
+        assert_eq!(
+            link_state(&nowhere, Path::new("/whatever")),
+            LinkState::Absent
+        );
     }
 
     /// A regular file must be recognised as such, not mistaken for our link.
@@ -1018,7 +1075,10 @@ mod tests {
         let file = dir.path().join("lakeleto");
         std::fs::write(&file, b"#!/bin/sh\n").unwrap();
 
-        assert_eq!(link_state(&file, Path::new("/somewhere/else")), LinkState::RealFile);
+        assert_eq!(
+            link_state(&file, Path::new("/somewhere/else")),
+            LinkState::RealFile
+        );
     }
 
     #[test]
@@ -1037,8 +1097,14 @@ mod tests {
     fn every_outcome_explains_itself() {
         let link = PathBuf::from("/usr/local/bin/lakeleto");
         let cases = [
-            CliInstall::Linked { link: link.clone(), on_default_path: true },
-            CliInstall::Linked { link: link.clone(), on_default_path: false },
+            CliInstall::Linked {
+                link: link.clone(),
+                on_default_path: true,
+            },
+            CliInstall::Linked {
+                link: link.clone(),
+                on_default_path: false,
+            },
             CliInstall::AlreadyLinked(link.clone()),
             CliInstall::Occupied(link),
             CliInstall::Failed("disk on fire".into()),
@@ -1049,9 +1115,15 @@ mod tests {
         }
         // The fallback directory is not on the default PATH, so the message has
         // to tell the user what to add; without it the link is invisible.
-        let off_path =
-            CliInstall::Linked { link: PathBuf::from("/home/x/.local/bin/lakeleto"), on_default_path: false };
-        assert!(off_path.message().contains("export PATH"), "{}", off_path.message());
+        let off_path = CliInstall::Linked {
+            link: PathBuf::from("/home/x/.local/bin/lakeleto"),
+            on_default_path: false,
+        };
+        assert!(
+            off_path.message().contains("export PATH"),
+            "{}",
+            off_path.message()
+        );
     }
 
     #[test]

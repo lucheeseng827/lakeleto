@@ -44,7 +44,7 @@
 #![cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 
 use std::collections::HashMap;
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -56,7 +56,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 #[cfg(feature = "mysql")]
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 #[cfg(feature = "postgres")]
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 #[cfg(feature = "sqlite")]
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 #[cfg(any(feature = "postgres", feature = "mysql"))]
@@ -139,26 +139,98 @@ fn get_pool(conn_url: &str) -> Result<SqlitePool> {
 
 /// Run a query on `pool` and collect every row (the async→sync bridge in one place).
 #[cfg(feature = "sqlite")]
-fn fetch_all(pool: &SqlitePool, sql: &str) -> Result<Vec<SqliteRow>> {
+fn fetch_all(pool: &SqlitePool, sql: &str, params: &[Bound]) -> Result<Vec<SqliteRow>> {
     runtime()
-        .block_on(async { sqlx::query(sql).fetch_all(pool).await })
+        .block_on(async {
+            let mut q = sqlx::query(sql);
+            for p in params {
+                q = match p {
+                    Bound::Text(v) => q.bind(v.as_str()),
+                    Bound::Int(v) => q.bind(*v),
+                    Bound::Num(v) => q.bind(*v),
+                };
+            }
+            q.fetch_all(pool).await
+        })
         .map_err(|e| EngineError::Query(format!("query failed: {e}")))
 }
 
+/// Like [`fetch_all`] but stops pulling rows at `cap`: the stream is dropped mid-flight, which
+/// closes the statement, so neither this process's memory nor (past the driver's buffer) the
+/// wire carries more than `cap` rows. The server still *executes* the full query — bounding that
+/// would mean rewriting the user's SQL, and a wrapped `LIMIT` subquery is exactly the kind of
+/// rewrite that breaks on dialect corners (MySQL ignores an inner `ORDER BY` without an inner
+/// `LIMIT`, for one). Stopping the fetch is the bound we can make honestly.
+#[cfg(feature = "sqlite")]
+fn fetch_capped(
+    pool: &SqlitePool,
+    sql: &str,
+    params: &[Bound],
+    cap: usize,
+) -> Result<Vec<SqliteRow>> {
+    use futures::TryStreamExt;
+    if cap == 0 {
+        return Ok(Vec::new());
+    }
+    runtime()
+        .block_on(async {
+            let mut q = sqlx::query(sql);
+            for p in params {
+                q = match p {
+                    Bound::Text(v) => q.bind(v.as_str()),
+                    Bound::Int(v) => q.bind(*v),
+                    Bound::Num(v) => q.bind(*v),
+                };
+            }
+            let mut stream = q.fetch(pool);
+            let mut out = Vec::new();
+            while let Some(row) = stream.try_next().await? {
+                out.push(row);
+                if out.len() >= cap {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+        .map_err(|e: sqlx::Error| EngineError::Query(format!("query failed: {e}")))
+}
+
+/// Begin an explicit **read-only transaction** before every Postgres/MySQL query.
+///
+/// This is the real read-only guarantee for the networked engines, and it is stronger than a
+/// session default. Connections are pooled and reused, so a crafted `SELECT
+/// set_config('default_transaction_read_only','off', false)` (Postgres) or a `MODIFIES SQL DATA`
+/// function call (MySQL) could otherwise leave a *writable* connection in the pool for the next
+/// query. Re-declaring `READ ONLY` at the start of each transaction pins the property per query
+/// regardless of session state, and makes the server itself refuse `SELECT … INTO`, data-modifying
+/// CTEs, and any write side-effect — no matter what the statement text looks like. Every query is
+/// rolled back afterwards (a read-only transaction has nothing to commit). Both dialects accept
+/// this exact statement. SQLite needs none of this: its pool is opened `SQLITE_OPEN_READONLY` at
+/// the file handle, which no statement can flip.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+const BEGIN_READ_ONLY: &str = "START TRANSACTION READ ONLY";
+
 /// Process-wide cache of open Postgres pools, keyed by connection URL (mirrors [`pools`]).
 ///
-/// Postgres has no portable "read-only pool" option, so — unlike SQLite — the read-only guarantee is
-/// enforced entirely on the query path by [`ensure_read_only`] (which never lets a non-SELECT
-/// through). `max_connections` is kept small: the engine is an interactive explorer, not a fan-out
-/// service.
+/// Unlike SQLite's `read_only(true)` file open, Postgres's read-only guarantee is set on the
+/// *session*: every connection this pool opens runs `default_transaction_read_only = on` (see
+/// [`get_pg_pool`]), so the server itself refuses any write — each autocommit statement is its own
+/// transaction, so the setting applies to all of them. [`ensure_read_only`] is then defence in
+/// depth on top of that, not the only line. `max_connections` is kept small: the engine is an
+/// interactive explorer, not a fan-out service.
 #[cfg(feature = "postgres")]
 fn pg_pools() -> &'static Mutex<HashMap<String, PgPool>> {
     static POOLS: OnceLock<Mutex<HashMap<String, PgPool>>> = OnceLock::new();
     POOLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Open (or reuse) a Postgres pool for `conn_url` (`postgres://user:pass@host:port/db`). sqlx parses
-/// the URL directly. See [`pg_pools`] on why read-only is enforced on the query path, not the pool.
+/// Open (or reuse) a Postgres pool for `conn_url` (`postgres://user:pass@host:port/db`).
+///
+/// The connection is opened with `default_transaction_read_only = on` passed as a startup
+/// `options` parameter, so the **server** enforces read-only for the whole session: a statement
+/// that somehow slipped past [`ensure_read_only`] (a data-modifying CTE, `EXPLAIN ANALYZE DELETE`)
+/// is rejected by Postgres itself with `cannot execute … in a read-only transaction`. This is the
+/// pool-level guarantee SQLite gets from `read_only(true)`.
 #[cfg(feature = "postgres")]
 fn get_pg_pool(conn_url: &str) -> Result<PgPool> {
     let mut guard = pg_pools()
@@ -167,11 +239,18 @@ fn get_pg_pool(conn_url: &str) -> Result<PgPool> {
     if let Some(pool) = guard.get(conn_url) {
         return Ok(pool.clone());
     }
+    let opts = PgConnectOptions::from_str(conn_url)
+        .map_err(|e| {
+            EngineError::Query(format!("invalid postgres connection url `{conn_url}`: {e}"))
+        })?
+        // Startup `options` are applied by the server before the first query runs, so every
+        // statement on every connection from this pool is read-only at the source.
+        .options([("default_transaction_read_only", "on")]);
     let pool = runtime()
         .block_on(async {
             PgPoolOptions::new()
                 .max_connections(4)
-                .connect(conn_url)
+                .connect_with(opts)
                 .await
         })
         .map_err(|e| {
@@ -185,10 +264,77 @@ fn get_pg_pool(conn_url: &str) -> Result<PgPool> {
 
 /// Run a query on a Postgres `pool` and collect every row.
 #[cfg(feature = "postgres")]
-fn pg_fetch_all(pool: &PgPool, sql: &str) -> Result<Vec<PgRow>> {
+fn pg_fetch_all(pool: &PgPool, sql: &str, params: &[Bound]) -> Result<Vec<PgRow>> {
     runtime()
-        .block_on(async { sqlx::query(sql).fetch_all(pool).await })
+        .block_on(async {
+            let mut conn = pool.acquire().await?;
+            sqlx::query(BEGIN_READ_ONLY).execute(&mut *conn).await?;
+            let mut q = sqlx::query(sql);
+            for p in params {
+                q = match p {
+                    Bound::Text(v) => q.bind(v.as_str()),
+                    Bound::Int(v) => q.bind(*v),
+                    Bound::Num(v) => q.bind(*v),
+                };
+            }
+            let res = q.fetch_all(&mut *conn).await;
+            // Roll back on every path (a read-only transaction has nothing to commit). The only
+            // early returns above are a failed acquire/BEGIN, where no transaction is open.
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            res
+        })
         .map_err(|e| EngineError::Query(format!("query failed: {e}")))
+}
+
+/// See the SQLite `fetch_capped` for why this streams and stops rather than rewriting the SQL.
+#[cfg(feature = "postgres")]
+fn pg_fetch_capped(pool: &PgPool, sql: &str, params: &[Bound], cap: usize) -> Result<Vec<PgRow>> {
+    use futures::TryStreamExt;
+    if cap == 0 {
+        return Ok(Vec::new());
+    }
+    runtime()
+        .block_on(async {
+            let mut conn = pool.acquire().await?;
+            sqlx::query(BEGIN_READ_ONLY).execute(&mut *conn).await?;
+            let mut q = sqlx::query(sql);
+            for p in params {
+                q = match p {
+                    Bound::Text(v) => q.bind(v.as_str()),
+                    Bound::Int(v) => q.bind(*v),
+                    Bound::Num(v) => q.bind(*v),
+                };
+            }
+            // Collect up to `cap` rows, capturing any stream error rather than early-returning past
+            // the ROLLBACK below. The stream is dropped before ROLLBACK so the `&mut conn` is free.
+            let collected = {
+                let mut stream = q.fetch(&mut *conn);
+                let mut out = Vec::new();
+                let mut err = None;
+                loop {
+                    match stream.try_next().await {
+                        Ok(Some(row)) => {
+                            out.push(row);
+                            if out.len() >= cap {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                match err {
+                    Some(e) => Err(e),
+                    None => Ok(out),
+                }
+            };
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            collected
+        })
+        .map_err(|e: sqlx::Error| EngineError::Query(format!("query failed: {e}")))
 }
 
 /// Process-wide cache of open MySQL pools, keyed by connection URL (mirrors [`pools`]).
@@ -227,10 +373,78 @@ fn get_mysql_pool(conn_url: &str) -> Result<MySqlPool> {
 
 /// Run a query on a MySQL `pool` and collect every row.
 #[cfg(feature = "mysql")]
-fn mysql_fetch_all(pool: &MySqlPool, sql: &str) -> Result<Vec<MySqlRow>> {
+fn mysql_fetch_all(pool: &MySqlPool, sql: &str, params: &[Bound]) -> Result<Vec<MySqlRow>> {
     runtime()
-        .block_on(async { sqlx::query(sql).fetch_all(pool).await })
+        .block_on(async {
+            let mut conn = pool.acquire().await?;
+            sqlx::query(BEGIN_READ_ONLY).execute(&mut *conn).await?;
+            let mut q = sqlx::query(sql);
+            for p in params {
+                q = match p {
+                    Bound::Text(v) => q.bind(v.as_str()),
+                    Bound::Int(v) => q.bind(*v),
+                    Bound::Num(v) => q.bind(*v),
+                };
+            }
+            let res = q.fetch_all(&mut *conn).await;
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            res
+        })
         .map_err(|e| EngineError::Query(format!("query failed: {e}")))
+}
+
+/// See the SQLite `fetch_capped` for why this streams and stops rather than rewriting the SQL.
+#[cfg(feature = "mysql")]
+fn mysql_fetch_capped(
+    pool: &MySqlPool,
+    sql: &str,
+    params: &[Bound],
+    cap: usize,
+) -> Result<Vec<MySqlRow>> {
+    use futures::TryStreamExt;
+    if cap == 0 {
+        return Ok(Vec::new());
+    }
+    runtime()
+        .block_on(async {
+            let mut conn = pool.acquire().await?;
+            sqlx::query(BEGIN_READ_ONLY).execute(&mut *conn).await?;
+            let mut q = sqlx::query(sql);
+            for p in params {
+                q = match p {
+                    Bound::Text(v) => q.bind(v.as_str()),
+                    Bound::Int(v) => q.bind(*v),
+                    Bound::Num(v) => q.bind(*v),
+                };
+            }
+            let collected = {
+                let mut stream = q.fetch(&mut *conn);
+                let mut out = Vec::new();
+                let mut err = None;
+                loop {
+                    match stream.try_next().await {
+                        Ok(Some(row)) => {
+                            out.push(row);
+                            if out.len() >= cap {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                match err {
+                    Some(e) => Err(e),
+                    None => Ok(out),
+                }
+            };
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            collected
+        })
+        .map_err(|e: sqlx::Error| EngineError::Query(format!("query failed: {e}")))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -374,22 +588,22 @@ fn engine_syntax(dialect: Dialect) -> SqlSyntax {
 }
 
 /// Fetch every row of `sql` against `uri`'s database and map it to an Arrow [`RowBatch`].
-fn fetch_batch(uri: &DbUri, sql: &str) -> Result<RowBatch> {
+fn fetch_batch(uri: &DbUri, sql: &str, params: &[Bound]) -> Result<RowBatch> {
     match uri.dialect {
         #[cfg(feature = "sqlite")]
         Dialect::Sqlite => {
             let pool = get_pool(&uri.conn_url)?;
-            rows_to_batch(fetch_all(&pool, sql)?)
+            rows_to_batch(fetch_all(&pool, sql, params)?)
         }
         #[cfg(feature = "postgres")]
         Dialect::Postgres => {
             let pool = get_pg_pool(&uri.conn_url)?;
-            pg_rows_to_batch(pg_fetch_all(&pool, sql)?)
+            pg_rows_to_batch(pg_fetch_all(&pool, sql, params)?)
         }
         #[cfg(feature = "mysql")]
         Dialect::MySql => {
             let pool = get_mysql_pool(&uri.conn_url)?;
-            mysql_rows_to_batch(mysql_fetch_all(&pool, sql)?)
+            mysql_rows_to_batch(mysql_fetch_all(&pool, sql, params)?)
         }
     }
 }
@@ -417,22 +631,22 @@ fn schema_of(uri: &DbUri, table: &str) -> Result<SchemaRef> {
 }
 
 /// Read the scalar from a `SELECT count(*)` query against `uri`'s database.
-fn count_scalar(uri: &DbUri, sql: &str) -> Result<usize> {
+fn count_scalar(uri: &DbUri, sql: &str, params: &[Bound]) -> Result<usize> {
     match uri.dialect {
         #[cfg(feature = "sqlite")]
         Dialect::Sqlite => {
             let pool = get_pool(&uri.conn_url)?;
-            Ok(count_value(&fetch_all(&pool, sql)?))
+            Ok(count_value(&fetch_all(&pool, sql, params)?))
         }
         #[cfg(feature = "postgres")]
         Dialect::Postgres => {
             let pool = get_pg_pool(&uri.conn_url)?;
-            Ok(pg_count_value(&pg_fetch_all(&pool, sql)?))
+            Ok(pg_count_value(&pg_fetch_all(&pool, sql, params)?))
         }
         #[cfg(feature = "mysql")]
         Dialect::MySql => {
             let pool = get_mysql_pool(&uri.conn_url)?;
-            Ok(mysql_count_value(&mysql_fetch_all(&pool, sql)?))
+            Ok(mysql_count_value(&mysql_fetch_all(&pool, sql, params)?))
         }
     }
 }
@@ -457,6 +671,7 @@ pub fn list_tables(url_path: &str) -> Result<Vec<String>> {
                 &pool,
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' \
                  ORDER BY name",
+                &[],
             )?;
             collect_names(rows.iter().map(|r| r.try_get::<String, _>(0)))
         }
@@ -467,6 +682,7 @@ pub fn list_tables(url_path: &str) -> Result<Vec<String>> {
                 &pool,
                 "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname NOT IN \
                  ('pg_catalog','information_schema') ORDER BY tablename",
+                &[],
             )?;
             collect_names(rows.iter().map(|r| r.try_get::<String, _>(0)))
         }
@@ -479,6 +695,7 @@ pub fn list_tables(url_path: &str) -> Result<Vec<String>> {
                 // sqlx won't decode straight to String ("VARCHAR is not compatible with VARBINARY").
                 "SELECT CAST(table_name AS CHAR) FROM information_schema.tables \
                  WHERE table_schema = DATABASE() ORDER BY table_name",
+                &[],
             )?;
             collect_names(rows.iter().map(|r| r.try_get::<String, _>(0)))
         }
@@ -558,7 +775,7 @@ impl Engine for DatabaseEngine {
             "SELECT * FROM {} LIMIT {limit}",
             quote_ident(syntax, &table)
         );
-        let mut rb = fetch_batch(&uri, &sql)?;
+        let mut rb = fetch_batch(&uri, &sql, &[])?;
         // Empty result: the mapper produced an empty schema. Fall back to the described/PRAGMA schema
         // so the grid still shows column headers.
         if rb.batches.is_empty() {
@@ -576,7 +793,7 @@ impl Engine for DatabaseEngine {
             "SELECT * FROM {} LIMIT {scan_limit}",
             quote_ident(syntax, &table)
         );
-        let rb = fetch_batch(&uri, &sql)?;
+        let rb = fetch_batch(&uri, &sql, &[])?;
         let scanned_rows = rb.num_rows() as u64;
         let columns = profile_columns(&rb.schema, &rb.batches);
         Ok(TableProfile {
@@ -603,14 +820,44 @@ impl Engine for DatabaseEngine {
         })?;
         let raw = source_uri(&first.source);
         let uri = parse_db_uri(&raw)?;
-        fetch_batch(&uri, sql)
+        fetch_batch(&uri, sql, &[])
     }
 
-    /// Bounded query. There is no cheap way to push an arbitrary user query into a plan-level cap
-    /// without breaking on trailing semicolons/`ORDER BY`, so we run the query and truncate the
-    /// materialised batches to `cap` rows (correct; bounds what the caller sees).
+    /// Bounded query: rows are pulled from a **stream** that stops at `cap`, so a `SELECT *` over
+    /// a huge table never materialises more than `cap` rows in this process regardless of what
+    /// the query would return. The bound the server itself does is stated honestly rather than
+    /// implied: the database still *executes* the full query (bounding that would mean rewriting
+    /// the user's SQL, which breaks on dialect corners), but neither this process's memory nor —
+    /// past the driver's buffer — the connection carries more than `cap` rows.
     fn query_capped(&self, sql: &str, tables: &[NamedSource], cap: usize) -> Result<RowBatch> {
-        let rb = self.query(sql, tables)?;
+        ensure_read_only(sql)?;
+        let first = tables.first().ok_or_else(|| {
+            EngineError::Query(
+                "the database engine needs a source table to know which database to query \
+                 (got none)"
+                    .to_string(),
+            )
+        })?;
+        let raw = source_uri(&first.source);
+        let uri = parse_db_uri(&raw)?;
+        let rb = match uri.dialect {
+            #[cfg(feature = "sqlite")]
+            Dialect::Sqlite => {
+                let pool = get_pool(&uri.conn_url)?;
+                rows_to_batch(fetch_capped(&pool, sql, &[], cap)?)?
+            }
+            #[cfg(feature = "postgres")]
+            Dialect::Postgres => {
+                let pool = get_pg_pool(&uri.conn_url)?;
+                pg_rows_to_batch(pg_fetch_capped(&pool, sql, &[], cap)?)?
+            }
+            #[cfg(feature = "mysql")]
+            Dialect::MySql => {
+                let pool = get_mysql_pool(&uri.conn_url)?;
+                mysql_rows_to_batch(mysql_fetch_capped(&pool, sql, &[], cap)?)?
+            }
+        };
+        // Belt over the stream's own stop, and the bound the type signature promises.
         Ok(RowBatch {
             schema: rb.schema,
             batches: truncate_batches(rb.batches, cap),
@@ -626,11 +873,33 @@ impl Engine for DatabaseEngine {
         let table = require_table(&uri, &raw)?;
         let syntax = engine_syntax(uri.dialect);
         let ident = quote_ident(syntax, &table);
-        let where_sql = build_where(syntax, &spec.filters);
+
+        // The column schema tells `build_where` which columns compare numerically (so a numeric
+        // column filtered with a number compares as a number, as the in-memory engine does, rather
+        // than binding text and — on Postgres — erroring on `int = text`). Fetch it only when there
+        // are filters; an unfiltered scan consults no column types, and the empty-result fallback
+        // below still fetches lazily on its own.
+        let schema = if spec.filters.is_empty() {
+            None
+        } else {
+            Some(schema_of(&uri, &table)?)
+        };
+        let kind_of = |col: &str| -> ColKind {
+            schema
+                .as_ref()
+                .and_then(|s| s.column_with_name(col))
+                .map(|(_, field)| col_kind(field.data_type()))
+                .unwrap_or(ColKind::Other)
+        };
+        let WhereClause {
+            sql: where_sql,
+            params,
+        } = build_where(syntax, &spec.filters, &kind_of);
 
         let matched = count_scalar(
             &uri,
             &format!("SELECT count(*) AS c FROM {ident}{where_sql}"),
+            &params,
         )?;
 
         let proj = match &spec.projection {
@@ -653,9 +922,14 @@ impl Engine for DatabaseEngine {
             "SELECT {proj} FROM {ident}{where_sql}{order} LIMIT {} OFFSET {}",
             spec.limit, spec.offset
         );
-        let mut batch = fetch_batch(&uri, &sql)?;
+        let mut batch = fetch_batch(&uri, &sql, &params)?;
         if batch.batches.is_empty() {
-            batch.schema = schema_of(&uri, &table)?;
+            // Reuse the schema fetched for numeric detection if we have it; otherwise (unfiltered
+            // scan) fetch it now so the grid still shows column headers.
+            batch.schema = match &schema {
+                Some(s) => Arc::clone(s),
+                None => schema_of(&uri, &table)?,
+            };
         }
         Ok(ScanResult {
             batch,
@@ -680,6 +954,10 @@ struct SqlSyntax {
     /// The `CAST(<col> AS <text_cast>)` target for the "contains" filter: `TEXT` (SQLite/Postgres)
     /// or `CHAR` (MySQL — `CAST(x AS TEXT)` is a syntax error there).
     text_cast: &'static str,
+    /// Whether bind placeholders are numbered (`$1`, `$2` — Postgres) or anonymous (`?` — SQLite,
+    /// MySQL). Filter VALUES are bound, never interpolated, so a value can never break out of a
+    /// literal and inject SQL; this only decides how the placeholders are spelled.
+    numbered_placeholders: bool,
 }
 
 impl SqlSyntax {
@@ -687,16 +965,19 @@ impl SqlSyntax {
     const SQLITE: SqlSyntax = SqlSyntax {
         ident_quote: '"',
         text_cast: "TEXT",
+        numbered_placeholders: false,
     };
     #[cfg(feature = "postgres")]
     const POSTGRES: SqlSyntax = SqlSyntax {
         ident_quote: '"',
         text_cast: "TEXT",
+        numbered_placeholders: true,
     };
     #[cfg(feature = "mysql")]
     const MYSQL: SqlSyntax = SqlSyntax {
         ident_quote: '`',
         text_cast: "CHAR",
+        numbered_placeholders: false,
     };
 }
 
@@ -708,49 +989,280 @@ fn quote_ident(syntax: SqlSyntax, s: &str) -> String {
     format!("{q}{}{q}", s.replace(q, &doubled))
 }
 
-/// `'value'` with embedded quotes doubled — a SQL string literal (single quotes in every dialect).
-fn sql_str(v: &str) -> String {
-    format!("'{}'", v.replace('\'', "''"))
+/// Escape the `LIKE` metacharacters in a filter value so it is matched **literally**, using
+/// `esc` as the escape character. Mirrors the DataFusion builder's helper; see the reasoning there.
+fn like_escape(v: &str, esc: char) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        if c == esc || c == '%' || c == '_' {
+            out.push(esc);
+        }
+        out.push(c);
+    }
+    out
 }
 
-/// Build a `WHERE` clause from the grid's filters (all ANDed together), quoting per `syntax`.
-fn build_where(syntax: SqlSyntax, filters: &[FilterSpec]) -> String {
+/// `#`, not the more usual `\`, and deliberately different from the DataFusion builder's choice.
+///
+/// MySQL processes backslash escapes **inside string literals** (unless `NO_BACKSLASH_ESCAPES` is
+/// set), so `'foo\%bar'` reaches `LIKE` as `foo%bar` with the escape already eaten and the
+/// wildcard live again — the exact bug this escaping exists to prevent, in one of the three
+/// dialects. `#` is inert in a string literal in SQLite, Postgres and MySQL alike, and all three
+/// accept an arbitrary `ESCAPE` character. DataFusion cannot use `#` (it accepts only `\`), which
+/// is why the two builders differ rather than sharing one constant.
+const LIKE_ESC: char = '#';
+
+/// A value bound into a query. Numeric-column comparisons bind [`Bound::Num`] so the driver sends a
+/// numeric parameter type — matching the in-memory engine's f64 comparison, and, on Postgres,
+/// avoiding the `operator does not exist: integer = text` error a text-typed bind would raise
+/// against a numeric column (Postgres does not implicitly cast text→numeric for an operator, unlike
+/// the unknown-type literal an interpolated `'5'` would have been). Everything else binds
+/// [`Bound::Text`].
+#[derive(Debug, PartialEq)]
+enum Bound {
+    Text(String),
+    /// An exact integer, for integer-column comparisons. Bound as `i64` so a value above 2^53
+    /// (e.g. a Snowflake-style ID) compares exactly, which routing it through `f64` would not.
+    Int(i64),
+    Num(f64),
+}
+
+/// A `WHERE` clause and the values its **bind placeholders** stand for, in order.
+///
+/// Filter values are never interpolated into the SQL — they are bound. That is the whole security
+/// story for this path: a value like `\' OR 1=1 #` cannot terminate a string literal it never
+/// enters, so no dialect's string-escaping quirk (MySQL's backslash, say) can turn a filter into
+/// an injected predicate. Identifiers still go through `quote_ident` because SQL cannot bind an
+/// identifier, and column names come from the grid's own schema, not free text.
+struct WhereClause {
+    sql: String,
+    params: Vec<Bound>,
+}
+
+/// How a column compares, mirroring the in-memory engine's `num_class` so the SQL and in-memory
+/// paths agree: `Integer` and `Real` columns compare *numerically* (a numeric filter value binds a
+/// number), `Other` compares as text. The Integer/Real split exists only so an integer column can
+/// bind an exact `i64` rather than a lossy `f64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColKind {
+    Integer,
+    Real,
+    Other,
+}
+
+/// Classify an Arrow [`DataType`] for comparison. Decimals fold into `Real` (bound as `f64`, matching
+/// the in-memory engine, which also casts them to `f64`) — so a very-high-precision decimal filter
+/// value is compared at `f64` precision on both paths, not exactly.
+fn col_kind(dt: &DataType) -> ColKind {
+    match dt {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => ColKind::Integer,
+        DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => ColKind::Real,
+        _ => ColKind::Other,
+    }
+}
+
+/// Build a `WHERE` clause from the grid's filters (all ANDed together), quoting identifiers per
+/// `syntax` and **binding** every value. See [`WhereClause`].
+///
+/// `numeric` reports whether a column compares as a number (mirrors the in-memory engine's
+/// `num_class`); a numeric column filtered with a numeric value compares numerically, everything
+/// else compares as text. `numeric` returning `false` for an unknown column is the safe default:
+/// text comparison never raises a type error, it just may not match a numeric row a numeric
+/// comparison would have.
+fn build_where(
+    syntax: SqlSyntax,
+    filters: &[FilterSpec],
+    kind_of: &dyn Fn(&str) -> ColKind,
+) -> WhereClause {
+    let mut params: Vec<Bound> = Vec::new();
+    // The next placeholder, advancing `params`. `$1`,`$2` on Postgres; `?` elsewhere.
+    let placeholder = |value: Bound, params: &mut Vec<Bound>| -> String {
+        params.push(value);
+        if syntax.numbered_placeholders {
+            format!("${}", params.len())
+        } else {
+            "?".to_string()
+        }
+    };
+    // An ordering/equality comparison. When the column is numeric *and* the value parses as a
+    // number, bind a numeric parameter and compare the column directly (numeric comparison, as the
+    // in-memory engine does). An integer column binds an exact `i64` so a value above 2^53 is not
+    // rounded; a fractional value on an integer column still binds `f64` so ordering matches the
+    // in-memory engine. Anything else renders the column to text and compares as text — which also
+    // cannot raise a type error on any dialect.
+    let comparison =
+        |id: &str, cast: &str, op: &str, f: &FilterSpec, params: &mut Vec<Bound>| -> String {
+            let bound = match kind_of(&f.column) {
+                ColKind::Integer => f
+                    .value
+                    .parse::<i64>()
+                    .map(Bound::Int)
+                    .ok()
+                    .or_else(|| f.value.parse::<f64>().map(Bound::Num).ok()),
+                ColKind::Real => f.value.parse::<f64>().map(Bound::Num).ok(),
+                ColKind::Other => None,
+            };
+            match bound {
+                Some(b) => {
+                    let ph = placeholder(b, params);
+                    format!("{id} {op} {ph}")
+                }
+                None => {
+                    let ph = placeholder(Bound::Text(f.value.clone()), params);
+                    format!("CAST({id} AS {cast}) {op} {ph}")
+                }
+            }
+        };
+
     if filters.is_empty() {
-        return String::new();
+        return WhereClause {
+            sql: String::new(),
+            params,
+        };
     }
     let parts: Vec<String> = filters
         .iter()
         .map(|f| {
             let id = quote_ident(syntax, &f.column);
+            let cast = syntax.text_cast;
             match f.op {
-                // Cast to text first so "contains" works on any column type: `LIKE` only applies to
-                // text, and a bare numeric/bool column would coerce oddly (or refuse to plan).
-                // `CAST(col AS TEXT|CHAR)` makes substring search work everywhere (NULLs cast to
-                // NULL → excluded, as expected).
-                FilterOp::Contains => format!(
-                    "CAST({id} AS {}) LIKE {}",
-                    syntax.text_cast,
-                    sql_str(&format!("%{}%", f.value))
-                ),
-                FilterOp::Eq => format!("{id} = {}", sql_str(&f.value)),
-                FilterOp::Ne => format!("{id} <> {}", sql_str(&f.value)),
-                FilterOp::Lt => format!("{id} < {}", sql_str(&f.value)),
-                FilterOp::Le => format!("{id} <= {}", sql_str(&f.value)),
-                FilterOp::Gt => format!("{id} > {}", sql_str(&f.value)),
-                FilterOp::Ge => format!("{id} >= {}", sql_str(&f.value)),
+                // Cast to text so "contains" works on any column type: `LIKE` only applies to text.
+                // The LIKE wildcards (`%`,`_`) in the *pattern* are escaped so a value matches
+                // literally; the value itself is then bound, not interpolated.
+                FilterOp::Contains => {
+                    let ph = placeholder(
+                        Bound::Text(format!("%{}%", like_escape(&f.value, LIKE_ESC))),
+                        &mut params,
+                    );
+                    format!("CAST({id} AS {cast}) LIKE {ph} ESCAPE '{LIKE_ESC}'")
+                }
+                FilterOp::NotContains => {
+                    let ph = placeholder(
+                        Bound::Text(format!("%{}%", like_escape(&f.value, LIKE_ESC))),
+                        &mut params,
+                    );
+                    format!("CAST({id} AS {cast}) NOT LIKE {ph} ESCAPE '{LIKE_ESC}'")
+                }
+                FilterOp::StartsWith => {
+                    let ph = placeholder(
+                        Bound::Text(format!("{}%", like_escape(&f.value, LIKE_ESC))),
+                        &mut params,
+                    );
+                    format!("CAST({id} AS {cast}) LIKE {ph} ESCAPE '{LIKE_ESC}'")
+                }
+                FilterOp::EndsWith => {
+                    let ph = placeholder(
+                        Bound::Text(format!("%{}", like_escape(&f.value, LIKE_ESC))),
+                        &mut params,
+                    );
+                    format!("CAST({id} AS {cast}) LIKE {ph} ESCAPE '{LIKE_ESC}'")
+                }
+                FilterOp::Eq => comparison(&id, cast, "=", f, &mut params),
+                FilterOp::Ne => comparison(&id, cast, "<>", f, &mut params),
+                FilterOp::Lt => comparison(&id, cast, "<", f, &mut params),
+                FilterOp::Le => comparison(&id, cast, "<=", f, &mut params),
+                FilterOp::Gt => comparison(&id, cast, ">", f, &mut params),
+                FilterOp::Ge => comparison(&id, cast, ">=", f, &mut params),
+                // Compared as text, matching the in-memory path: the grid's filter box is one
+                // string, and splitting it into typed literals per column would make the two
+                // engines disagree about `007` in an integer column.
+                FilterOp::In => {
+                    let members: Vec<&str> = f
+                        .value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .collect();
+                    if members.is_empty() {
+                        // An empty list matches nothing; `IN ()` is a syntax error in every dialect.
+                        "1 = 0".to_string()
+                    } else {
+                        let phs: Vec<String> = members
+                            .iter()
+                            .map(|m| placeholder(Bound::Text((*m).to_string()), &mut params))
+                            .collect();
+                        format!("CAST({id} AS {cast}) IN ({})", phs.join(", "))
+                    }
+                }
+                FilterOp::IsNull => format!("{id} IS NULL"),
+                FilterOp::NotNull => format!("{id} IS NOT NULL"),
             }
         })
         .collect();
-    format!(" WHERE {}", parts.join(" AND "))
+    WhereClause {
+        sql: format!(" WHERE {}", parts.join(" AND ")),
+        params,
+    }
+}
+
+/// The write verbs a read-only query must never contain — *anywhere*, not just at the head.
+///
+/// The head keyword being `SELECT`/`WITH`/`EXPLAIN` is not enough: a data-modifying CTE
+/// (`WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`) and `EXPLAIN ANALYZE DELETE …` both
+/// present an innocent head while executing a write on Postgres. So we reject the write verb as a
+/// standalone word anywhere in the statement. `OUTFILE`/`DUMPFILE` cover MySQL's `SELECT … INTO
+/// OUTFILE`, the one way a plain `SELECT` writes. Boundary-matching means `updated_at` /
+/// `is_deleted` columns don't false-positive; a column literally *named* `delete` (quoted) would,
+/// which is the acceptable tradeoff a parser-free guard makes (same as the `;`-in-a-string case).
+const FORBIDDEN_WRITE_WORDS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "TRUNCATE", "DROP", "CREATE", "ALTER",
+    "GRANT", "REVOKE", "CALL", "COPY", "VACUUM", "ATTACH", "DETACH", "LOAD", "OUTFILE", "DUMPFILE",
+];
+
+/// The subset of [`FORBIDDEN_WRITE_WORDS`] that is *also* a scalar function name in some dialect —
+/// `REPLACE(x,a,b)` is standard in SQLite/MySQL/Postgres, and the rest can appear as a function or
+/// alias. When one of these is immediately followed by `(` it is a call, not a statement verb, so
+/// it is allowed. Every *write* form of these words (`REPLACE INTO`, `MERGE INTO`, `COPY t FROM`,
+/// `LOAD DATA`, `CALL proc`) puts whitespace after the verb, never `(`, so exempting the call form
+/// closes no write vector.
+const VERBS_ALSO_FUNCTIONS: &[&str] = &["REPLACE", "MERGE", "COPY", "LOAD", "CALL"];
+
+/// Does `haystack` (already uppercased) contain `word` as a statement verb — delimited by non-word
+/// characters on both sides, and (for a word that is also a function name) not immediately followed
+/// by `(`? A "word char" is `[A-Za-z0-9_]`, so `UPDATE` matches in `... UPDATE t ...` but not inside
+/// `updated_at`, and `REPLACE(` is read as the function, not the `REPLACE INTO` write. `word` is
+/// ASCII-uppercase; the caller uppercases `haystack` once.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let call_exempt = VERBS_ALSO_FUNCTIONS.contains(&word);
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(word) {
+        let start = from + rel;
+        let end = start + word.len();
+        let before_ok = start == 0 || !is_word(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_word(bytes[end]);
+        // `REPLACE(` is the function call; `REPLACE INTO` (whitespace) is the write.
+        let is_call = call_exempt && bytes.get(end) == Some(&b'(');
+        if before_ok && after_ok && !is_call {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 /// Reject any SQL that is not a single read-only query.
 ///
 /// A lightweight guard (this build has no SQL parser — DataFusion lives behind the `sql` feature):
-/// it allows a single `SELECT` / `WITH` / `EXPLAIN` statement and rejects everything else, plus any
-/// mid-statement `;` (naive multi-statement smuggling). For SQLite this is *defence in depth* — the
-/// pool is opened `read_only`, so the engine itself rejects a write even if one slipped past. For
-/// Postgres/MySQL (no portable read-only pool) this guard *is* the read-only guarantee.
+/// it allows a single `SELECT` / `WITH` / `EXPLAIN` statement, rejects any mid-statement `;` (naive
+/// multi-statement smuggling), and — because an innocent head keyword is not proof of a read (a
+/// data-modifying CTE or `EXPLAIN ANALYZE DELETE` both start `WITH`/`EXPLAIN` yet write on
+/// Postgres) — rejects any [`FORBIDDEN_WRITE_WORDS`] verb appearing anywhere in the statement. For
+/// SQLite this is *defence in depth* — the pool is opened `read_only`. For Postgres it layers over
+/// the pool's `default_transaction_read_only`. For MySQL (no portable read-only pool) this guard
+/// *is* the read-only guarantee.
 pub fn ensure_read_only(sql: &str) -> Result<()> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     // A `;` that isn't the (already-stripped) trailing one implies multiple statements.
@@ -760,15 +1272,22 @@ pub fn ensure_read_only(sql: &str) -> Result<()> {
             "exactly one SQL statement is allowed".to_string(),
         ));
     }
-    let head = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    if !matches!(head.as_str(), "SELECT" | "WITH" | "EXPLAIN") {
+    let upper = trimmed.to_ascii_uppercase();
+    let head = upper.split_whitespace().next().unwrap_or("");
+    if !matches!(head, "SELECT" | "WITH" | "EXPLAIN") {
         return Err(EngineError::Query(
             "only read queries are allowed — SELECT / WITH, or EXPLAIN".to_string(),
         ));
+    }
+    // Close the CTE / EXPLAIN-ANALYZE write vectors: a write verb anywhere is a hard reject.
+    if let Some(verb) = FORBIDDEN_WRITE_WORDS
+        .iter()
+        .find(|w| contains_word(&upper, w))
+    {
+        return Err(EngineError::Query(format!(
+            "only read queries are allowed — this statement contains `{verb}`, which can write \
+             (e.g. a data-modifying CTE or `EXPLAIN ANALYZE {verb}`)"
+        )));
     }
     Ok(())
 }
@@ -857,6 +1376,7 @@ fn schema_via_pragma(pool: &SqlitePool, table: &str) -> Result<SchemaRef> {
             "PRAGMA table_info({})",
             quote_ident(SqlSyntax::SQLITE, table)
         ),
+        &[],
     )?;
     if rows.is_empty() {
         return Err(EngineError::Query(format!(
@@ -1502,7 +2022,7 @@ mod dialect_sql_tests {
     #[cfg(feature = "postgres")]
     #[test]
     fn postgres_quotes_with_double_quotes_and_text_cast() {
-        use super::{build_where, quote_ident, SqlSyntax};
+        use super::{build_where, quote_ident, Bound, ColKind, SqlSyntax};
         use crate::engine::{FilterOp, FilterSpec};
         assert_eq!(quote_ident(SqlSyntax::POSTGRES, "co\"l"), "\"co\"\"l\"");
         let w = build_where(
@@ -1512,14 +2032,43 @@ mod dialect_sql_tests {
                 op: FilterOp::Contains,
                 value: "2".into(),
             }],
+            &|_| ColKind::Other,
         );
-        assert_eq!(w, r#" WHERE CAST("amt" AS TEXT) LIKE '%2%'"#);
+        // The value is a bound placeholder (`$1`), never interpolated into the SQL.
+        assert_eq!(w.sql, r#" WHERE CAST("amt" AS TEXT) LIKE $1 ESCAPE '#'"#);
+        assert_eq!(w.params, vec![Bound::Text("%2%".to_string())]);
+
+        // A real column filtered with a number compares numerically (no CAST), binding an f64.
+        let n = build_where(
+            SqlSyntax::POSTGRES,
+            &[FilterSpec {
+                column: "amt".into(),
+                op: FilterOp::Gt,
+                value: "2".into(),
+            }],
+            &|_| ColKind::Real,
+        );
+        assert_eq!(n.sql, r#" WHERE "amt" > $1"#);
+        assert_eq!(n.params, vec![Bound::Num(2.0)]);
+
+        // An integer column binds an exact i64, never an f64 — so a value above 2^53 is not rounded.
+        let big = build_where(
+            SqlSyntax::POSTGRES,
+            &[FilterSpec {
+                column: "id".into(),
+                op: FilterOp::Eq,
+                value: "9007199254740993".into(),
+            }],
+            &|_| ColKind::Integer,
+        );
+        assert_eq!(big.sql, r#" WHERE "id" = $1"#);
+        assert_eq!(big.params, vec![Bound::Int(9007199254740993)]);
     }
 
     #[cfg(feature = "mysql")]
     #[test]
     fn mysql_quotes_with_backticks_and_char_cast() {
-        use super::{build_where, quote_ident, SqlSyntax};
+        use super::{build_where, quote_ident, Bound, ColKind, SqlSyntax};
         use crate::engine::{FilterOp, FilterSpec};
         assert_eq!(quote_ident(SqlSyntax::MYSQL, "co`l"), "`co``l`");
         let w = build_where(
@@ -1529,8 +2078,25 @@ mod dialect_sql_tests {
                 op: FilterOp::Contains,
                 value: "2".into(),
             }],
+            &|_| ColKind::Other,
         );
-        assert_eq!(w, " WHERE CAST(`amt` AS CHAR) LIKE '%2%'");
+        // The value is a bound placeholder (`?`), never interpolated into the SQL — this is what
+        // keeps MySQL's backslash-in-string-literal handling from ever seeing a filter value.
+        assert_eq!(w.sql, " WHERE CAST(`amt` AS CHAR) LIKE ? ESCAPE '#'");
+        assert_eq!(w.params, vec![Bound::Text("%2%".to_string())]);
+
+        // Text comparison against a non-numeric column casts to CHAR and binds text.
+        let t = build_where(
+            SqlSyntax::MYSQL,
+            &[FilterSpec {
+                column: "name".into(),
+                op: FilterOp::Eq,
+                value: "ada".into(),
+            }],
+            &|_| ColKind::Other,
+        );
+        assert_eq!(t.sql, " WHERE CAST(`name` AS CHAR) = ?");
+        assert_eq!(t.params, vec![Bound::Text("ada".to_string())]);
     }
 }
 
@@ -1645,6 +2211,106 @@ mod tests {
         assert_eq!(res.batch.num_rows(), 1);
     }
 
+    /// A numeric column filtered with a number compares **numerically**, not lexicographically.
+    /// `amt > 10` over {1.5, 2.5, 3.5} must match zero rows — a text comparison would match `2.5`
+    /// and `3.5` (since `'2.5' > '10'` as strings), so this pins the numeric-binding path.
+    #[test]
+    fn numeric_filters_compare_as_numbers() {
+        let (_dir, src) = fixture();
+        let eng = DatabaseEngine::new();
+        let scan = |op, value: &str| {
+            let spec = ScanSpec {
+                limit: 100,
+                filters: vec![FilterSpec {
+                    column: "amt".into(),
+                    op,
+                    value: value.into(),
+                }],
+                ..ScanSpec::default()
+            };
+            eng.scan(&src, &spec).expect("numeric scan").matched_rows
+        };
+        assert_eq!(
+            scan(FilterOp::Gt, "10"),
+            0,
+            "amt > 10 is numeric, matches none"
+        );
+        assert_eq!(scan(FilterOp::Gt, "2"), 2, "amt > 2 → 2.5, 3.5");
+        assert_eq!(scan(FilterOp::Ge, "2.5"), 2, "amt >= 2.5 → 2.5, 3.5");
+        assert_eq!(scan(FilterOp::Lt, "2"), 1, "amt < 2 → 1.5");
+
+        // Eq on an integer column with a numeric value matches numerically.
+        let by_id = ScanSpec {
+            limit: 100,
+            filters: vec![FilterSpec {
+                column: "id".into(),
+                op: FilterOp::Eq,
+                value: "2".into(),
+            }],
+            ..ScanSpec::default()
+        };
+        assert_eq!(eng.scan(&src, &by_id).expect("id scan").matched_rows, 1);
+
+        // A non-numeric value against a numeric column falls back to text compare — no error, no
+        // match (matching the in-memory engine, which also drops to text here).
+        let nonnum = ScanSpec {
+            limit: 100,
+            filters: vec![FilterSpec {
+                column: "id".into(),
+                op: FilterOp::Eq,
+                value: "abc".into(),
+            }],
+            ..ScanSpec::default()
+        };
+        assert_eq!(
+            eng.scan(&src, &nonnum).expect("nonnum scan").matched_rows,
+            0
+        );
+    }
+
+    /// An integer column binds an **exact** `i64`, never an `f64`. `9007199254740993` (2^53 + 1)
+    /// is not representable in `f64` — it rounds to `9007199254740992` — so an `f64` bind would
+    /// look for the wrong value and match zero rows. The exact `i64` bind finds the row.
+    #[test]
+    fn integer_filter_binds_exact_i64_above_2_pow_53() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("big.db");
+        let url = conn_url(&db);
+        runtime().block_on(async {
+            let opts = SqliteConnectOptions::from_str(&url)
+                .expect("parse url")
+                .create_if_missing(true);
+            let pool = SqlitePool::connect_with(opts).await.expect("open");
+            sqlx::query("CREATE TABLE t(id INTEGER)")
+                .execute(&pool)
+                .await
+                .expect("create");
+            // A single row whose id is exactly 2^53 + 1.
+            sqlx::query("INSERT INTO t(id) VALUES (9007199254740993)")
+                .execute(&pool)
+                .await
+                .expect("insert");
+            pool.close().await;
+        });
+        let src = Source::with_format(table_uri(&db, "t"), Format::Database);
+        let spec = ScanSpec {
+            limit: 100,
+            filters: vec![FilterSpec {
+                column: "id".into(),
+                op: FilterOp::Eq,
+                value: "9007199254740993".into(),
+            }],
+            ..ScanSpec::default()
+        };
+        let res = DatabaseEngine::new()
+            .scan(&src, &spec)
+            .expect("big-int scan");
+        assert_eq!(
+            res.matched_rows, 1,
+            "exact i64 must find 2^53+1; an f64 bind would round to 2^53 and miss it"
+        );
+    }
+
     #[test]
     fn query_counts_rows() {
         let (_dir, src) = fixture();
@@ -1664,14 +2330,96 @@ mod tests {
     fn rejects_writes() {
         assert!(ensure_read_only("SELECT 1").is_ok());
         assert!(ensure_read_only("WITH a AS (SELECT 1) SELECT * FROM a").is_ok());
+        assert!(ensure_read_only("EXPLAIN SELECT * FROM t").is_ok());
+        // Boundary-matching must not false-positive on columns whose names embed a verb.
+        assert!(
+            ensure_read_only("SELECT id, updated_at, is_deleted FROM t WHERE created_at > 0")
+                .is_ok(),
+            "column names embedding a write verb must not trip the guard"
+        );
+        // A verb that is also a scalar function (`REPLACE(...)`) called in a read is allowed; its
+        // whitespace-delimited write form (`REPLACE INTO`, `MERGE INTO`) is still rejected below.
+        assert!(
+            ensure_read_only("SELECT REPLACE(name, 'a', 'b') FROM t").is_ok(),
+            "REPLACE() as a function call must be allowed"
+        );
         for bad in [
             "INSERT INTO t VALUES (1)",
             "DROP TABLE t",
             "UPDATE t SET id = 1",
             "SELECT 1; DROP TABLE t",
+            // The two vectors an innocent head keyword hides — both execute on Postgres.
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x",
+            "WITH x AS (UPDATE t SET id = 1 RETURNING *) SELECT * FROM x",
+            "EXPLAIN (ANALYZE) INSERT INTO t VALUES (1)",
+            // MySQL's one way a SELECT writes.
+            "SELECT * FROM t INTO OUTFILE '/tmp/x'",
+            // The write forms of the function-name verbs — whitespace after the verb, so still caught.
+            "REPLACE INTO t VALUES (1)",
+            "MERGE INTO t USING s ON t.id = s.id",
         ] {
             assert!(ensure_read_only(bad).is_err(), "should reject: {bad}");
         }
+    }
+
+    /// A filter value can never break out of its literal to inject SQL, because values are **bound**,
+    /// not interpolated. A classic `' OR '1'='1` payload matches *literally* (zero rows named that)
+    /// instead of turning the predicate into a tautology (which would return every row).
+    #[test]
+    fn filter_values_are_bound_not_injected() {
+        let (_dir, src) = fixture();
+        let eng = DatabaseEngine::new();
+
+        // If this were interpolated, the WHERE would become `name = 'alice' OR '1'='1'` and match
+        // all 3 rows. Bound, it looks for a row literally named `alice' OR '1'='1` — there is none.
+        let inject = ScanSpec {
+            limit: 100,
+            filters: vec![FilterSpec {
+                column: "name".into(),
+                op: FilterOp::Eq,
+                value: "alice' OR '1'='1".into(),
+            }],
+            ..ScanSpec::default()
+        };
+        let res = eng
+            .scan(&src, &inject)
+            .expect("scan with injection payload");
+        assert_eq!(
+            res.matched_rows, 0,
+            "injection payload must match literally"
+        );
+        assert_eq!(res.batch.num_rows(), 0);
+
+        // A backslash-bearing value (the MySQL-specific escape hazard) is likewise inert and errors
+        // on neither engine — bound, it is just text.
+        let backslash = ScanSpec {
+            limit: 100,
+            filters: vec![FilterSpec {
+                column: "name".into(),
+                op: FilterOp::Eq,
+                value: "a\\' OR 1=1 -- ".into(),
+            }],
+            ..ScanSpec::default()
+        };
+        let res = eng
+            .scan(&src, &backslash)
+            .expect("scan with backslash payload");
+        assert_eq!(res.matched_rows, 0);
+
+        // Binding still matches a real value exactly — the fix does not over-escape.
+        let exact = ScanSpec {
+            limit: 100,
+            filters: vec![FilterSpec {
+                column: "name".into(),
+                op: FilterOp::Eq,
+                value: "alice".into(),
+            }],
+            ..ScanSpec::default()
+        };
+        let res = eng.scan(&src, &exact).expect("scan exact");
+        assert_eq!(res.matched_rows, 1);
+        assert_eq!(res.batch.num_rows(), 1);
     }
 
     /// When the Postgres driver is **not** compiled in, a `postgres://` URI is rejected with a

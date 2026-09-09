@@ -93,7 +93,7 @@ fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
 /// format that lets a writer skip compression entirely.
 fn zlib_stored(data: &[u8]) -> Vec<u8> {
     let mut out = vec![0x78, 0x01]; // CMF/FLG: deflate, 32K window, no dict
-    // A stored block's LEN field is 16 bits, so long inputs need several blocks.
+                                    // A stored block's LEN field is 16 bits, so long inputs need several blocks.
     const MAX: usize = 65_535;
     let mut chunks = data.chunks(MAX).peekable();
     if data.is_empty() {
@@ -117,7 +117,11 @@ fn crc32(data: &[u8]) -> u32 {
         crc ^= byte as u32;
         for _ in 0..8 {
             // 0xedb88320 is the reversed CRC-32 polynomial PNG specifies.
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -201,7 +205,11 @@ mod tests {
             let len = u32::from_le_bytes(out[entry + 8..entry + 12].try_into().unwrap()) as usize;
             let off = u32::from_le_bytes(out[entry + 12..entry + 16].try_into().unwrap()) as usize;
             assert!(off + len <= out.len(), "entry {i} runs past the end");
-            assert_eq!(&out[off..off + 4], &[0x89, b'P', b'N', b'G'], "entry {i} is not a PNG");
+            assert_eq!(
+                &out[off..off + 4],
+                &[0x89, b'P', b'N', b'G'],
+                "entry {i} is not a PNG"
+            );
         }
     }
 }

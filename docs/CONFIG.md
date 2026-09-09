@@ -19,7 +19,7 @@ Available on every subcommand (clap `global = true`).
 |---|---|---|---|
 | `-o`, `--output <fmt>` | — | `table` | Output format: `table` \| `json` \| `ndjson` \| `csv`. |
 | `--engine <choice>` | — | `auto` | Which engine reads: `auto` \| `local` \| `sql` \| `remote`. `auto` = local, unless `--remote-url` is set (then remote). |
-| `--remote-url <url>` | `LAKELETO_REMOTE_URL` | unset | Lakeleto Cloud endpoint. Setting it implies `--engine remote`. Needs `--features remote`. |
+| `--remote-url <url>` | `LAKELETO_REMOTE_URL` | unset | A Lakeleto server speaking the `/v1/*` contract — in practice a `lakeleto serve` you run. Setting it implies `--engine remote`. Needs `--features remote`. |
 | `--remote-token <tok>` | `LAKELETO_REMOTE_TOKEN` | unset | Bearer token for the Lakeleto Cloud endpoint. |
 
 ## Subcommands
@@ -88,7 +88,7 @@ filesystem error. Object-store credentials come only from the environment (see
 | `iceberg` | self-contained Iceberg reader (apache-avro) | Read Iceberg tables: current-snapshot Parquet via metadata + Avro manifests, merge-on-read positional + equality deletes, schema evolution, statistics/partition pruning. Reads compressed manifests. |
 | `object-store` | BYO-credential `s3://`/`gs://`/`az://` reads (object_store + url + futures + tokio) | Every read op over a remote URI with *your own* env credentials, zero hosted compute. Ranged Parquet reads (footer + touched row groups); CSV fetched whole. |
 | `serve` | `lakeleto serve` / `lakeleto open` (axum + rust-embed + tokio) | The HTTP/JSON `/v1/*` API and the embedded SPA (bundled via rust-embed — air-gapped). Add `sql` too for a working `POST /v1/query`. |
-| `remote` | `RemoteEngine` → Lakeleto Cloud seam (reqwest) | `--engine remote` / `--remote-url`; the hosted-plane client (optional). Also enables `--workspace-remote` sync in `serve`. |
+| `remote` | `RemoteEngine` → the over-HTTP seam (reqwest) | `--engine remote` / `--remote-url`; a client for another `lakeleto serve` (optional). Also enables `--workspace-remote` sync in `serve`. |
 | `duckdb` | *(stub — no code yet)* | Reserved Phase-2 DuckDB backend (C++ toolchain). Currently a no-op feature. |
 
 The container image ([`Dockerfile`](../Dockerfile)) is built with
@@ -110,18 +110,82 @@ IO. Non-API paths fall back to the SPA's `index.html`.
 | `GET` | `/v1/engines` | Serving engine capabilities, `sql_available`, and the endpoint list. |
 | `GET` | `/v1/schema?path=&format=` | Columns, types, nullability, row count. |
 | `GET` | `/v1/info?path=&format=` | Format, engine, size, rows, columns. |
-| `GET` | `/v1/preview?path=&limit=&format=` | First N rows (default 50) as `{ columns, rows }`. |
+| `GET` | `/v1/preview?path=&limit=&format=` | First N rows (default 50) as `{ columns, rows }`, or Arrow IPC (see below). |
 | `GET` | `/v1/profile?path=&scan=&format=` | Per-column null %, distinct, min/max (`scan=0` = Parquet footer fast path). |
-| `GET` | `/v1/rows?path=&offset=&limit=&sort=&desc=&filter=col:op:value&cols=a,b` | Grid window: filter → sort → page → project. `limit` clamped to 10000. |
+| `GET` | `/v1/rows?path=&offset=&limit=&sort=&desc=&filter=col:op:value&cols=a,b` | Grid window: filter → sort → page → project. `limit` clamped to 10000. Arrow IPC on request (see below). |
 | `GET` | `/v1/stats?path=&filter=col:op:value` | Column profile over the **filtered** view. |
-| `GET` | `/v1/export?path=&fmt=csv\|json\|parquet&sort=&filter=&cols=` | Current view as a download (row cap 1,000,000; byte cap 512 MiB → 413). |
+| `GET` | `/v1/export?path=&fmt=csv\|tsv\|json\|ndjson\|parquet&sort=&filter=&cols=` | Current view as a download (row cap 1,000,000; byte cap 512 MiB → 413). |
 | `GET` | `/v1/list?dir=` | File browser: subdirs + readable data files (defaults to `--root`, else cwd). |
-| `POST` | `/v1/query` | `{ sql, file?, tables[] }` → `{ columns, rows }`. Needs `sql`. |
+| `POST` | `/v1/query` | `{ sql, file?, tables[] }` → `{ columns, rows }`, or Arrow IPC (see below). Needs `sql`. |
 
 Filter ops: `eq ne lt le gt ge contains` (aliases `= != < <= > >= ~`). With `sql`,
 sort/filter/count are pushed into DataFusion (exact, unbounded); without it the local
 reader works over a bounded set (`scan_cap`, default 200k) and the response's `bounded`
 flag marks a partial view.
+
+#### Result encoding — `Accept: application/vnd.apache.arrow.stream`
+
+`/v1/preview`, `/v1/rows` and `POST /v1/query` answer **JSON by default**. A request whose
+`Accept` contains the exact token `application/vnd.apache.arrow.stream` gets the same rows as
+an uncompressed **Arrow IPC stream** instead (`Content-Type` echoes that media type).
+
+| `Accept` | Answer |
+|---|---|
+| *(absent)* | JSON |
+| `*/*` | JSON — this is what browsers and `fetch()` send |
+| `application/json` | JSON |
+| anything unrecognised | JSON (never a `406`; negotiation cannot fail) |
+| `application/vnd.apache.arrow.stream` | Arrow IPC stream |
+
+The Arrow body carries rows only, so the counts the JSON body states inline come back as
+response headers — `X-Lakeleto-Offset`, `X-Lakeleto-Num-Rows`, `X-Lakeleto-Matched-Rows`,
+`X-Lakeleto-Total-Known`, `X-Lakeleto-Scanned-Rows`, `X-Lakeleto-Bounded` on `/v1/rows`, and
+`X-Lakeleto-Capped` on `/v1/preview` and `POST /v1/query`. Booleans are spelled `true`/`false`.
+(They are headers, not Arrow schema metadata, so the schema a client decodes is exactly the
+schema the server read.)
+
+This is the codec the `remote` engine speaks, and the reason it can return rows at all: unlike
+a JSON rendering it preserves a result's real Arrow types — an `Int64` beyond 2⁵³, a decimal, a
+timestamp — and the columns of a zero-row window. The stream is uncompressed on purpose, so any
+Arrow implementation can read it without a matching codec; the client refuses a *compressed*
+stream for its own reasons (a compressed body declares the size it decompresses to, and that
+declaration would size the client's allocation).
+
+#### What `--remote-url` calls, and what it does not
+
+The table above is the **server's** surface. The `remote` engine is a **client** for a subset of
+it, pointed at any server that speaks the contract:
+
+| trait method | request it makes | encoding |
+|---|---|---|
+| `schema` | `GET /v1/schema?path=&format=` | JSON |
+| `profile` | `GET /v1/profile?path=&format=&scan=` | JSON |
+| `preview` | `GET /v1/preview?path=&format=&limit=` | Arrow IPC |
+| `query` / `query_capped` | `POST /v1/query` | Arrow IPC |
+| `scan` | *(nothing — not implemented)* | — |
+
+So `GET /v1/rows` is offered by the server and **not used by this client**: grid windowing
+(filter → sort → page → project) over a remote engine answers `501`, and the grid is served by
+the local and `sql` engines.
+
+`--remote-url` points at **whatever speaks this contract** — a `lakeleto serve` you host, or a
+hosted plane that serves part of it. Three things follow, and each is discovered the ordinary
+way rather than configured:
+
+- **A server may answer only some of these routes.** An unserved one replies `404` or `501`
+  carrying the server's own message, and `schema`/`profile` are separate endpoints from the row
+  methods, so a server can answer one and not the other.
+- **The server resolves its own refs.** With `--remote-url` set the CLI does **not** resolve the
+  path locally: it forwards the string opaquely and lets the peer decide what it names — a file
+  path there, a catalog name, a table id. `?format=` is sent only when you passed `--format`;
+  otherwise the server infers it.
+- **A server may impose limits this contract does not name** (how many tables one query may
+  register, which paths it will accept at all). Those arrive as an ordinary `4xx` with the
+  server's own message.
+
+A response body over **256 MiB** is refused by the client (`Content-Length` where the server
+declares one, and the read itself where it does not), and every call — metadata and rows alike —
+reports the server's own `{"error": …}` message rather than a bare status line.
 
 ### Workspace data-plane endpoints ("Postman" workbench)
 

@@ -17,17 +17,17 @@
 //! | GET  | `/v1/engines` | capabilities of the serving engine + endpoint list |
 //! | GET  | `/v1/schema?path=&format=` | [`TableSchema`] |
 //! | GET  | `/v1/info?path=&format=` | source info (format, size, rows, columns) |
-//! | GET  | `/v1/preview?path=&limit=&format=` | first N rows as `{columns, rows}` |
+//! | GET  | `/v1/preview?path=&limit=&format=` | first N rows as `{columns, rows}` (or Arrow, see below) |
 //! | GET  | `/v1/profile?path=&scan=&format=` | [`TableProfile`] |
-//! | GET  | `/v1/rows?path=&offset=&limit=&sort=&desc=&filter=&cols=` | grid window (filter→sort→page→project) |
+//! | GET  | `/v1/rows?path=&offset=&limit=&sort=&desc=&filter=&cols=` | grid window (filter→sort→page→project; or Arrow, see below) |
 //! | GET  | `/v1/stats?path=&filter=` | column profile over the *filtered* view |
-//! | GET  | `/v1/export?path=&fmt=&sort=&filter=&cols=` | current view as a CSV/JSON/Parquet download |
+//! | GET  | `/v1/export?path=&fmt=&sort=&filter=&cols=` | current view as a CSV/TSV/JSON/NDJSON/Parquet download |
 //! | GET  | `/v1/list?dir=` | file browser: subdirs + readable data files |
-//! | POST | `/v1/query` | `{sql, file?, tables[]}` → `{columns, rows}` (needs `sql`) |
+//! | POST | `/v1/query` | `{sql, file?, tables[], limit?}` → `{columns, rows, capped}` (or Arrow, see below; needs `sql`) |
 //! | GET/POST | `/v1/workspaces` | list / create a workspace (the "Postman" data plane) |
 //! | GET/PUT/DELETE | `/v1/workspaces/{id}` | fetch / save / delete a workspace |
 //! | GET/POST | `/v1/workspaces/{id}/history` | run history (newest first) / sync-append a record |
-//! | POST | `/v1/workspaces/{id}/runs` | run SQL/scan (root-confined), record + cache the result |
+//! | POST | `/v1/workspaces/{id}/runs` | run SQL/scan (root-confined), record it, cache on `cache:true` |
 //! | GET  | `/v1/workspaces/{id}/runs/{run_id}` | a window over a cached run result |
 //! | PUT/GET | `/v1/workspaces/{id}/runs/{run_id}/result` | raw Parquet result bytes (sync up/down) |
 //! | GET  | `/v1/workspaces/{id}/export` | download a portable [`WorkspaceBundle`] |
@@ -36,13 +36,33 @@
 //!
 //! Workspace endpoints persist through a [`WorkspaceStore`] (the data-plane seam mirroring
 //! [`Engine`]): a local JSON+Parquet store today, a cloud store behind the same contract later.
+//!
+//! ## Result encoding: JSON by default, Arrow IPC on request
+//!
+//! The three row-returning endpoints (`/v1/preview`, `/v1/rows`, `POST /v1/query`) answer with
+//! their usual JSON body unless the request's `Accept` names the exact token
+//! `application/vnd.apache.arrow.stream`, in which case the body is an uncompressed Arrow IPC
+//! **stream** of the same rows and the counts the JSON body carries inline travel as
+//! `X-Lakeleto-*` response headers (see [`wants_arrow`] and [`RowPayload`]).
+//!
+//! JSON is the default *and* the fallback for every ambiguous `Accept` — including the `*/*`
+//! that browsers and `fetch()` send — so the SPA needs no change and no request can be answered
+//! with bytes it did not ask for. There is no `406`: the IPC codec is compiled unconditionally,
+//! so negotiation cannot fail and JSON always answers.
+//!
+//! That makes Arrow the engine-to-engine codec: `RemoteEngine` (`--features remote`) reads rows
+//! back over HTTP with their Arrow types intact, which a JSON rendering cannot do. Its peer is
+//! whatever speaks this contract — another `lakeleto serve`, or a hosted plane serving part of
+//! it. Partial service is normal and needs no negotiation: an unserved route answers `404`/`501`
+//! carrying the server's own message, and `path` is the *server's* string to interpret, so a
+//! peer whose refs name something other than its filesystem is equally within the contract.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
     extract::{DefaultBodyLimit, Path as UrlPath, Query, RawQuery, Request, State},
-    http::{header, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri},
     middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -56,7 +76,7 @@ use crate::engine::{
     ScanSpec, SortSpec, TableProfile, TableSchema,
 };
 use crate::error::EngineError;
-use crate::source::{list_dir, DirEntry, DirListing, Format, Source};
+use crate::source::{list_dir, DirListing, Format, Source};
 use crate::workspace::{RunRecord, RunStatus, Workspace, WorkspaceBundle, WorkspaceStore};
 
 /// Export view cap — the most rows `GET /v1/export` will materialize.
@@ -67,6 +87,22 @@ const EXPORT_CAP: usize = 1_000_000;
 /// before a million rows, so the response is bounded in bytes too and rejected (413) past this.
 /// (End-to-end streaming would need a streaming-scan across the `Engine` trait — a later step.)
 const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
+
+/// Ad-hoc query cap — the most rows `POST /v1/query` will materialize into a JSON response.
+///
+/// The endpoint used to call [`Engine::query`], which is unbounded: a `SELECT *` over a large
+/// table built the whole result in memory and then serialized every row into one JSON body, so a
+/// single request could take the server down. [`Engine::query_capped`] pushes the bound *into the
+/// plan* on the SQL engine (a plan-level `LIMIT`), so the rows are never materialized in the first
+/// place. Callers that want less can ask for less via the body's `limit`; nobody can ask for more,
+/// which is the point. `GET /v1/export` remains the way to pull a large result, bounded by
+/// [`EXPORT_CAP`] and [`MAX_EXPORT_BYTES`] and rendered as a stream-shaped format rather than JSON.
+const QUERY_CAP: usize = 100_000;
+
+/// Default rows for `POST /v1/query` when the body names no `limit`. Deliberately well under
+/// [`QUERY_CAP`]: the interactive caller is a grid or a REPL that shows a screenful, and one that
+/// genuinely wants 100k rows can say so.
+const QUERY_DEFAULT_LIMIT: usize = 10_000;
 
 /// The embedded SPA shell (`frontend/dist/`). Served at `/` with SPA fallback so the UI is
 /// bundled into the single `lakeleto` binary — no separate web server, works air-gapped.
@@ -84,7 +120,7 @@ const ENDPOINTS: &[&str] = &[
     "GET /v1/profile?path=&scan=&format=",
     "GET /v1/rows?path=&offset=&limit=&sort=&desc=&filter=col:op:value&cols=a,b",
     "GET /v1/stats?path=&filter=col:op:value",
-    "GET /v1/export?path=&fmt=csv|json|parquet&sort=&filter=&cols=",
+    "GET /v1/export?path=&fmt=csv|tsv|json|ndjson|parquet&sort=&filter=&cols=",
     "GET /v1/list?dir=",
     "POST /v1/query",
     "GET|POST /v1/workspaces",
@@ -418,9 +454,15 @@ fn confine_entry(root: &Option<Arc<PathBuf>>, path: &str) -> Result<(), ApiError
 
 /// Confine every file the engine will actually **read** for `source` to `--root`. The entry path
 /// is already gated by [`confine_entry`], but a directory dataset reads every member `.parquet`
-/// (a symlink escaping the root is caught here by canonicalizing each), and an Iceberg table
-/// reads whatever paths its manifests name — manifest list, manifests, delete files, and absolute
-/// data-file paths — which can point outside the table dir. No-op without a root.
+/// (a symlink escaping the root is caught here by canonicalizing each), and a table format reads
+/// whatever paths its own metadata names — Iceberg's manifest list, manifests, delete files and
+/// absolute data-file paths, or Delta's `add.path` entries — any of which can point outside the
+/// table dir. No-op without a root.
+///
+/// Note the shape of this guard: it is a per-format traversal whitelist, not a generic filesystem
+/// sandbox. Each arm has to know, format by format, every file its reader will subsequently open —
+/// so a new readable format needs an arm here, and its absence is a confinement hole rather than a
+/// missing feature.
 fn confine_members(root: &Option<Arc<PathBuf>>, source: &Source) -> Result<(), ApiError> {
     let Some(root) = root else { return Ok(()) };
     match source.format {
@@ -434,6 +476,14 @@ fn confine_members(root: &Option<Arc<PathBuf>>, source: &Source) -> Result<(), A
             // Re-plan with the root so every path the reader will open (manifests + delete files
             // + data files) is validated *before* it is read — gating metadata too, not just data.
             crate::iceberg::plan_with_root(&source.path, Some(root.as_path())).map_err(ApiError)?;
+        }
+        #[cfg(feature = "delta")]
+        Format::Delta => {
+            // Same reasoning as Iceberg, and just as necessary: a Delta `add.path` may be absolute
+            // or relative-with-`..`, so the log can name data files anywhere on the filesystem.
+            // The planner memoizes, so this replay and the engine's own share one pass over the log.
+            crate::engine::delta::plan_with_root(&source.path, Some(root.as_path()))
+                .map_err(ApiError)?;
         }
         _ => {}
     }
@@ -540,6 +590,9 @@ struct QueryBody {
     file: Option<String>,
     #[serde(default)]
     tables: Vec<TableSpec>,
+    /// Max rows to return, clamped to [`QUERY_CAP`]; [`QUERY_DEFAULT_LIMIT`] when absent.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -555,6 +608,13 @@ struct RowsResponse {
     columns: Vec<ColumnSchema>,
     num_rows: usize,
     rows: Vec<serde_json::Value>,
+    /// True when the result filled the requested cap, so there may be more rows the caller is not
+    /// seeing. Conservative by construction: a result that happens to be exactly `cap` rows long
+    /// reports `true` even though nothing was dropped. Saying "there may be more" when there is
+    /// not is a smaller error than the reverse, which is the silent truncation this replaces.
+    /// Always `false` on the paths that window explicitly (`/v1/preview`, `/v1/rows`).
+    #[serde(default)]
+    capped: bool,
 }
 
 /// `GET /v1/rows` response: the row window plus counts to drive the virtual scrollbar.
@@ -583,6 +643,36 @@ struct InfoResponse {
     columns: usize,
 }
 
+/// The bounds this server will enforce, stated up front so a client can show them before it hits
+/// one instead of explaining a rejection afterwards.
+///
+/// These live on the response rather than on [`Capabilities`], despite `Capabilities` being the
+/// other thing `/v1/engines` returns: they are properties of *this server* (its caps, its
+/// edition), not of the engine that reads the files, and an `Engine` implementation has no
+/// business knowing what the HTTP layer's export cap is. `sql_available` and `ee` are here for
+/// the same reason.
+#[derive(Serialize)]
+struct Limits {
+    /// Max rows `GET /v1/export` will render ([`EXPORT_CAP`]).
+    max_export_rows: usize,
+    /// Max bytes that rendered export may occupy before it is refused ([`MAX_EXPORT_BYTES`]).
+    max_export_bytes: usize,
+    /// Max rows `POST /v1/query` will return ([`QUERY_CAP`]).
+    max_query_rows: usize,
+    /// Rows `POST /v1/query` returns when the request names no `limit` ([`QUERY_DEFAULT_LIMIT`]).
+    default_query_rows: usize,
+    /// Max rows a workspace run will execute and cache ([`WORKSPACE_RUN_CAP`]).
+    max_run_rows: usize,
+    /// Simultaneous database connections a workspace may hold; `null` means unlimited. The
+    /// open-source edition caps this and the EE build lifts it — the number lived in the SPA as a
+    /// literal, which meant changing an edition's terms meant rebuilding the frontend.
+    max_db_connections: Option<usize>,
+}
+
+/// Databases a single workspace may connect to at once in the open-source edition. Any mix of
+/// SQLite/Postgres/MySQL; file and object-store connections are uncapped.
+const OSS_MAX_DB_CONNECTIONS: usize = 2;
+
 #[derive(Serialize)]
 struct EnginesResponse {
     /// The running binary's version (from `CARGO_PKG_VERSION`) — the SPA shows it in the header
@@ -594,7 +684,100 @@ struct EnginesResponse {
     /// build flips it, which lifts the OSS connection cap in the UI. The real EE capabilities live
     /// behind the hosted plane — this flag just tells the SPA which limits to apply.
     ee: bool,
+    limits: Limits,
     endpoints: Vec<&'static str>,
+}
+
+// ---- result encoding (JSON | Arrow IPC) -----------------------------------------------
+
+/// The media type that selects the Arrow IPC stream arm.
+const ARROW_STREAM_MIME: &str = "application/vnd.apache.arrow.stream";
+
+// Sidecar counts for the Arrow arm. The JSON bodies carry these inline; the Arrow body is *only*
+// the rows, so the same numbers travel as response headers (canonically spelled
+// `X-Lakeleto-Offset` etc. — declared lowercase because that is what `HeaderName::from_static`
+// accepts, and HTTP field names are case-insensitive either way).
+//
+// Headers rather than Arrow schema `custom_metadata` on purpose: schema metadata round-trips
+// into the decoded batch, so the schema a client reads back would no longer equal the schema the
+// server read, and every later `RecordBatch::try_new` against the original schema would fail.
+// Counts are transport facts about one response; they do not belong in the data's type.
+const H_OFFSET: &str = "x-lakeleto-offset";
+const H_NUM_ROWS: &str = "x-lakeleto-num-rows";
+const H_MATCHED_ROWS: &str = "x-lakeleto-matched-rows";
+const H_TOTAL_KNOWN: &str = "x-lakeleto-total-known";
+const H_SCANNED_ROWS: &str = "x-lakeleto-scanned-rows";
+const H_BOUNDED: &str = "x-lakeleto-bounded";
+const H_CAPPED: &str = "x-lakeleto-capped";
+
+/// Does this request want Arrow IPC instead of JSON?
+///
+/// True only when `Accept` lists the exact [`ARROW_STREAM_MIME`] token. Everything else — an
+/// absent header, `*/*`, `application/json`, anything unrecognised — is JSON, because `*/*` is
+/// what browsers and `fetch()` send and answering those with a binary body would break every
+/// web client. Each comma-separated entry is compared on its media-type portion only, with any
+/// `;q=`/parameter suffix stripped, ASCII-case-insensitively.
+///
+/// Deliberately returns a `bool` and never a "not acceptable" error: `arrow-ipc` is compiled
+/// unconditionally (see Cargo.toml), so negotiation cannot fail, and JSON is a valid answer to
+/// any `Accept`. No handler here returns `406`.
+fn wants_arrow(headers: &HeaderMap) -> bool {
+    let Some(accept) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    accept.split(',').any(|entry| {
+        entry
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case(ARROW_STREAM_MIME)
+    })
+}
+
+/// `"true"`/`"false"` — the wire spelling of a sidecar boolean.
+fn hv_bool(b: bool) -> HeaderValue {
+    HeaderValue::from_static(if b { "true" } else { "false" })
+}
+
+/// One row-returning response body, already encoded.
+///
+/// Both arms are serialized on the blocking worker, right beside the engine call that produced
+/// the batch: rendering a window (JSON *or* IPC) is real CPU work and does not belong on an
+/// async request thread. The handler only picks which encoder runs and turns the bytes into a
+/// response.
+///
+/// The Arrow body deliberately gets **no separate byte cap**, unlike `GET /v1/export`
+/// ([`MAX_EXPORT_BYTES`]). Export is row-capped at a million and can therefore blow past any
+/// sane byte budget while still being "in bounds"; these three endpoints are already bounded far
+/// tighter at the row level before an engine runs (`/v1/preview` and `POST /v1/query` clamp to
+/// [`QUERY_CAP`], `/v1/rows` clamps its `limit`), and the same rows are served over the JSON arm
+/// with no byte cap either. A cap only on the binary arm would reject requests the JSON arm
+/// answers, which is the wrong asymmetry.
+enum RowPayload<T> {
+    /// The default: the same JSON body the endpoint has always returned, byte for byte.
+    Json(T),
+    /// Arrow IPC stream bytes, plus the counts the JSON body would have carried inline.
+    Arrow(Vec<u8>, Vec<(&'static str, HeaderValue)>),
+}
+
+impl<T: Serialize> IntoResponse for RowPayload<T> {
+    fn into_response(self) -> Response {
+        match self {
+            RowPayload::Json(body) => Json(body).into_response(),
+            RowPayload::Arrow(bytes, counts) => {
+                let mut headers = HeaderMap::with_capacity(counts.len() + 1);
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static(ARROW_STREAM_MIME),
+                );
+                for (name, value) in counts {
+                    headers.insert(HeaderName::from_static(name), value);
+                }
+                (headers, bytes).into_response()
+            }
+        }
+    }
 }
 
 // ---- handlers -------------------------------------------------------------------------
@@ -609,6 +792,18 @@ async fn engines(State(st): State<AppState>) -> Json<EnginesResponse> {
         engine: st.read.capabilities(),
         sql_available: st.sql.is_some(),
         ee: cfg!(feature = "ee"),
+        limits: Limits {
+            max_export_rows: EXPORT_CAP,
+            max_export_bytes: MAX_EXPORT_BYTES,
+            max_query_rows: QUERY_CAP,
+            default_query_rows: QUERY_DEFAULT_LIMIT,
+            max_run_rows: WORKSPACE_RUN_CAP,
+            max_db_connections: if cfg!(feature = "ee") {
+                None
+            } else {
+                Some(OSS_MAX_DB_CONNECTIONS)
+            },
+        },
         endpoints: ENDPOINTS.to_vec(),
     })
 }
@@ -631,7 +826,21 @@ async fn info(
     confine_entry(&st.root, &q.path)?;
     let source = Source::resolve(&q.path, q.format.as_deref())?;
     confine_members(&st.root, &source)?;
-    let size_bytes = std::fs::metadata(&source.path).map(|m| m.len()).ok();
+    // Local files answer from the filesystem; a remote object answers from a `HEAD`. Both are
+    // cheap and neither reads data — an unknown size here used to mean "this URI is remote".
+    let size_bytes = if source.is_remote() {
+        #[cfg(feature = "object-store")]
+        {
+            let uri = source.path.to_string_lossy().to_string();
+            blocking(move || Ok(crate::objstore::object_size(&uri))).await?
+        }
+        #[cfg(not(feature = "object-store"))]
+        {
+            None
+        }
+    } else {
+        std::fs::metadata(&source.path).map(|m| m.len()).ok()
+    };
     let format = source.format.to_string();
     let path = source.display();
     let engine = read_engine(&st, &source)?;
@@ -649,15 +858,32 @@ async fn info(
 
 async fn preview(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<PreviewQuery>,
-) -> Result<Json<RowsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     confine_entry(&st.root, &q.path)?;
     let source = Source::resolve(&q.path, q.format.as_deref())?;
     confine_members(&st.root, &source)?;
-    let limit = q.limit.unwrap_or(50);
+    // Bound a caller-supplied limit above by the same ceiling `POST /v1/query` enforces — otherwise
+    // `?limit=999999999` materialises the whole table. Only the upper bound is clamped, so
+    // `limit=0` (an explicit "no rows" probe) keeps returning zero rows; the absent-value default
+    // (a screenful) is already small and left untouched.
+    let limit = q.limit.map(|n| n.min(QUERY_CAP)).unwrap_or(50);
     let engine = read_engine(&st, &source)?;
-    let resp = blocking(move || rows_response(engine.preview(&source, limit)?)).await?;
-    Ok(Json(resp))
+    let arrow = wants_arrow(&headers);
+    let payload = blocking(move || {
+        let rb = engine.preview(&source, limit)?;
+        if arrow {
+            // The window here is explicit, so `capped` is always false — but it is still emitted,
+            // so an Arrow client reads the same fields off the response as a JSON one.
+            let counts = vec![(H_CAPPED, hv_bool(false))];
+            Ok(RowPayload::Arrow(crate::render::to_arrow_ipc(&rb)?, counts))
+        } else {
+            Ok(RowPayload::Json(rows_response(rb)?))
+        }
+    })
+    .await?;
+    Ok(payload.into_response())
 }
 
 async fn profile(
@@ -667,15 +893,22 @@ async fn profile(
     confine_entry(&st.root, &q.path)?;
     let source = Source::resolve(&q.path, q.format.as_deref())?;
     confine_members(&st.root, &source)?;
-    let scan = q.scan.unwrap_or(st.default_scan);
+    // A caller-supplied `?scan=` is bounded above by the query ceiling so it can't ask the profiler
+    // to walk an unbounded number of rows; the operator-configured default (trusted) is left as-is.
+    // Only the upper bound is clamped — `scan=0` is the footer-statistics fast path (see
+    // `LocalReaderEngine::profile`), so a lower clamp would silently disable it.
+    let scan = q.scan.map(|n| n.min(QUERY_CAP)).unwrap_or(st.default_scan);
     let engine = read_engine(&st, &source)?;
     Ok(Json(blocking(move || engine.profile(&source, scan)).await?))
 }
 
 async fn query(
     State(st): State<AppState>,
+    // The `HeaderMap` extractor MUST come before the body-consuming `Json` one: axum lets only
+    // the last argument consume the request body, so the two swapped will not compile.
+    headers: HeaderMap,
     Json(body): Json<QueryBody>,
-) -> Result<Json<RowsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     // Confine every table a query would register to the server root (when set) — gated before the
     // source resolves *and* before requiring the SQL engine, so an out-of-root path is refused
     // regardless of the build.
@@ -715,23 +948,64 @@ async fn query(
             .ok_or_else(|| ApiError(EngineError::missing_feature("run SQL", "sql")))?
     };
     let sql = body.sql.clone();
-    let resp = blocking(move || rows_response(engine.query(&sql, &named)?)).await?;
-    Ok(Json(resp))
+    let cap = body
+        .limit
+        .unwrap_or(QUERY_DEFAULT_LIMIT)
+        .clamp(1, QUERY_CAP);
+    let arrow = wants_arrow(&headers);
+    let payload = blocking(move || {
+        let rb = engine.query_capped(&sql, &named, cap)?;
+        if arrow {
+            // Same conservative rule the JSON body uses: a result that exactly fills the cap
+            // reports `capped` even when nothing was actually dropped.
+            let counts = vec![(H_CAPPED, hv_bool(rb.num_rows() >= cap))];
+            Ok(RowPayload::Arrow(crate::render::to_arrow_ipc(&rb)?, counts))
+        } else {
+            let mut resp = rows_response(rb)?;
+            resp.capped = resp.num_rows >= cap;
+            Ok(RowPayload::Json(resp))
+        }
+    })
+    .await?;
+    Ok(payload.into_response())
 }
 
 /// `GET /v1/rows` — the grid's windowed scan: filter → sort → `offset`/`limit`.
 async fn rows(
     State(st): State<AppState>,
+    headers: HeaderMap,
     RawQuery(q): RawQuery,
-) -> Result<Json<RowsWindow>, ApiError> {
+) -> Result<Response, ApiError> {
     let params = parse_scan_params(&q.unwrap_or_default())?;
     confine_entry(&st.root, &params.path)?;
     let source = Source::resolve(&params.path, params.format.as_deref())?;
     confine_members(&st.root, &source)?;
     let spec = params.spec;
     let engine = scan_engine_for(&st, &source, &spec)?;
-    let res = blocking(move || engine.scan(&source, &spec)).await?;
-    rows_window(res)
+    let arrow = wants_arrow(&headers);
+    let payload = blocking(move || {
+        let res = engine.scan(&source, &spec)?;
+        if arrow {
+            // Every count [`RowsWindow`] carries inline — the virtual scrollbar needs all of
+            // them, and the IPC body carries rows only.
+            let counts = vec![
+                (H_OFFSET, HeaderValue::from(res.offset)),
+                (H_NUM_ROWS, HeaderValue::from(res.batch.num_rows())),
+                (H_MATCHED_ROWS, HeaderValue::from(res.matched_rows)),
+                (H_TOTAL_KNOWN, hv_bool(res.total_known)),
+                (H_SCANNED_ROWS, HeaderValue::from(res.scanned_rows)),
+                (H_BOUNDED, hv_bool(res.bounded)),
+            ];
+            Ok(RowPayload::Arrow(
+                crate::render::to_arrow_ipc(&res.batch)?,
+                counts,
+            ))
+        } else {
+            Ok(RowPayload::Json(rows_window(res)?))
+        }
+    })
+    .await?;
+    Ok(payload.into_response())
 }
 
 /// `GET /v1/stats` — column profile over the current *filtered* view (grid filters applied).
@@ -776,6 +1050,18 @@ async fn export(State(st): State<AppState>, RawQuery(q): RawQuery) -> Result<Res
                 crate::render::rows(&rb, crate::render::Output::Json)?.into_bytes(),
                 "application/json",
                 "json",
+            ),
+            // Newline-delimited JSON: the shape every log/ETL pipeline already consumes, and the
+            // one JSON form that stays streamable when this handler eventually stops buffering.
+            "ndjson" | "jsonl" => (
+                crate::render::rows(&rb, crate::render::Output::Ndjson)?.into_bytes(),
+                "application/x-ndjson",
+                "ndjson",
+            ),
+            "tsv" => (
+                crate::render::rows(&rb, crate::render::Output::Tsv)?.into_bytes(),
+                "text/tab-separated-values",
+                "tsv",
             ),
             _ => (
                 crate::render::rows(&rb, crate::render::Output::Csv)?.into_bytes(),
@@ -846,7 +1132,7 @@ fn db_listing(dir: &str) -> Result<DirListing, EngineError> {
         .into_iter()
         .map(|name| {
             let path = format!("{base}?table={name}");
-            DirEntry {
+            crate::source::DirEntry {
                 name,
                 path,
                 kind: "file",
@@ -891,6 +1177,15 @@ struct RunRequest {
     /// Rows to return inline in the response (the full result stays in the cache).
     #[serde(default)]
     preview: Option<usize>,
+    /// Write the full result to the workspace store so the run can be re-opened later.
+    ///
+    /// **Opt-in, and deliberately so.** A query result is dataset content, and the store behind
+    /// this handler is a trait: with a `RemoteStore` configured, caching a run uploads those rows
+    /// off the machine. A tool whose promise is that the data never leaves cannot do that as an
+    /// unasked-for default — so the caller states it, and the record's `cached` flag then reports
+    /// what actually happened rather than what was intended.
+    #[serde(default)]
+    cache: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -990,6 +1285,7 @@ async fn ws_run(
     confine_members(&st.root, &source)?;
 
     let sql = req.sql.filter(|s| !s.trim().is_empty());
+    let cache = req.cache.unwrap_or(false);
     let cap = req.limit.unwrap_or(10_000).clamp(1, WORKSPACE_RUN_CAP);
     let preview_n = req.preview.unwrap_or(200).clamp(1, cap);
     let engine = if source.format == Format::Database {
@@ -1041,12 +1337,15 @@ async fn ws_run(
         match result {
             Ok(rb) => {
                 rec.row_count = Some(rb.num_rows() as u64);
-                rec.cached = true;
-                store.append_run(&id, &rec, Some(&rb))?;
+                // `cached` is set from what is about to be written, not from what was asked for,
+                // so a history record never claims a result the store was never given.
+                rec.cached = cache;
+                store.append_run(&id, &rec, if cache { Some(&rb) } else { None })?;
                 let RowsResponse {
                     columns,
                     num_rows,
                     rows,
+                    ..
                 } = rows_response(window_rowbatch(&rb, preview_n))?;
                 Ok(RunResponse {
                     run: rec,
@@ -1210,13 +1509,18 @@ fn parse_scan_params(qs: &str) -> Result<ScanParams, ApiError> {
             }
             "filter" => {
                 let mut it = v.splitn(3, ':');
-                if let (Some(c), Some(o), Some(val)) = (it.next(), it.next(), it.next()) {
+                if let (Some(c), Some(o)) = (it.next(), it.next()) {
                     if let Some(op) = FilterOp::parse(o) {
-                        if !c.is_empty() {
+                        // `is_null` / `not_null` take no operand, so `col:isnull` is accepted
+                        // without the trailing colon that would otherwise be required to make the
+                        // filter parse at all — this parser drops what it cannot read, and a
+                        // silently missing filter shows wrong rows rather than an error.
+                        let val = it.next();
+                        if !c.is_empty() && (val.is_some() || op.is_unary()) {
                             filters.push(FilterSpec {
                                 column: c.to_string(),
                                 op,
-                                value: val.to_string(),
+                                value: val.unwrap_or_default().to_string(),
                             });
                         }
                     }
@@ -1282,7 +1586,10 @@ fn scan_engine_for(
     }
 }
 
-fn rows_window(res: ScanResult) -> Result<Json<RowsWindow>, ApiError> {
+/// Shape a [`ScanResult`] into the `GET /v1/rows` JSON body. Runs on the blocking worker (it
+/// renders every cell through `arrow_json`), so it yields the plain struct and leaves the
+/// response wrapping to the handler.
+fn rows_window(res: ScanResult) -> Result<RowsWindow, EngineError> {
     let ScanResult {
         batch,
         matched_rows,
@@ -1295,8 +1602,9 @@ fn rows_window(res: ScanResult) -> Result<Json<RowsWindow>, ApiError> {
         columns,
         num_rows,
         rows,
-    } = rows_response(batch).map_err(ApiError)?;
-    Ok(Json(RowsWindow {
+        ..
+    } = rows_response(batch)?;
+    Ok(RowsWindow {
         columns,
         offset,
         num_rows,
@@ -1305,7 +1613,7 @@ fn rows_window(res: ScanResult) -> Result<Json<RowsWindow>, ApiError> {
         scanned_rows,
         bounded,
         rows,
-    }))
+    })
 }
 
 /// Run a synchronous engine call off the async request threads.
@@ -1337,6 +1645,9 @@ fn rows_response(rb: RowBatch) -> Result<RowsResponse, EngineError> {
         columns,
         num_rows,
         rows,
+        // The windowing callers set this themselves; `rows_response` only renders a batch and
+        // cannot know whether the batch it was handed was clipped.
+        capped: false,
     })
 }
 
@@ -1376,6 +1687,60 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request's `Accept`, or none at all.
+    fn accept(value: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = value {
+            h.insert(header::ACCEPT, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn accept_defaults_to_json() {
+        // The three ways a normal web client asks. `*/*` is what a browser `fetch()` sends and
+        // is the load-bearing one: answering it with Arrow would break the whole SPA.
+        assert!(!wants_arrow(&accept(None)));
+        assert!(!wants_arrow(&accept(Some("*/*"))));
+        assert!(!wants_arrow(&accept(Some("application/json"))));
+        assert!(!wants_arrow(&accept(Some(
+            "text/html,application/xhtml+xml,*/*;q=0.8"
+        ))));
+    }
+
+    #[test]
+    fn accept_selects_arrow_on_the_exact_token() {
+        assert!(wants_arrow(&accept(Some(
+            "application/vnd.apache.arrow.stream"
+        ))));
+        // Case-insensitive, whitespace- and q-tolerant, and found anywhere in the list.
+        assert!(wants_arrow(&accept(Some(
+            "application/vnd.apache.arrow.stream;q=1.0"
+        ))));
+        assert!(wants_arrow(&accept(Some(
+            "application/json, application/vnd.apache.arrow.stream;q=0.9, */*;q=0.1"
+        ))));
+        assert!(wants_arrow(&accept(Some(
+            "APPLICATION/VND.APACHE.ARROW.STREAM"
+        ))));
+    }
+
+    #[test]
+    fn accept_ignores_near_misses() {
+        // A neighbouring Arrow media type is not this one: the *file* format is a different
+        // codec, and a prefix match would hand it an IPC stream it cannot read.
+        assert!(!wants_arrow(&accept(Some("application/vnd.apache.arrow"))));
+        assert!(!wants_arrow(&accept(Some(
+            "application/vnd.apache.arrow.file"
+        ))));
+        assert!(!wants_arrow(&accept(Some(
+            "application/vnd.apache.arrow.stream.v2"
+        ))));
+        assert!(!wants_arrow(&accept(Some(
+            "application/vnd.apache.parquet"
+        ))));
+    }
 
     #[test]
     fn export_cap_rejects_over_limit() {

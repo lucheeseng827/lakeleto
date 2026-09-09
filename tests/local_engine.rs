@@ -135,6 +135,56 @@ fn csv_detect_and_read() {
 }
 
 #[test]
+fn ndjson_detect_and_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.ndjson");
+    std::fs::write(
+        &path,
+        "{\"id\":1,\"name\":\"Ada\",\"score\":91.5}\n\
+         {\"id\":2,\"name\":\"Grace\",\"score\":null}\n\
+         {\"id\":3,\"name\":\"Linus\",\"score\":88.0}\n",
+    )
+    .unwrap();
+
+    let source = Source::detect(&path).unwrap();
+    assert_eq!(source.format, Format::Json, ".ndjson → Json");
+
+    let engine = LocalReaderEngine::default();
+    let schema = engine.schema(&source).unwrap();
+    assert_eq!(schema.columns.len(), 3);
+
+    let preview = engine.preview(&source, 10).unwrap();
+    assert_eq!(preview.num_rows(), 3);
+
+    // The row limit is honoured, not ignored.
+    assert_eq!(engine.preview(&source, 2).unwrap().num_rows(), 2);
+
+    // `null` is a null cell, not the string "null".
+    let profile = engine.profile(&source, 10_000).unwrap();
+    let score = profile.columns.iter().find(|c| c.name == "score").unwrap();
+    assert_eq!(score.null_count, 1);
+}
+
+#[test]
+fn json_array_detect_and_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.json");
+    // A top-level array — leading whitespace before `[` — must read the same as newline-delimited.
+    std::fs::write(
+        &path,
+        "\n  [\n    {\"id\": 1, \"name\": \"Ada\"},\n    {\"id\": 2, \"name\": \"Grace\"}\n  ]\n",
+    )
+    .unwrap();
+
+    let source = Source::detect(&path).unwrap();
+    assert_eq!(source.format, Format::Json, ".json → Json");
+
+    let engine = LocalReaderEngine::default();
+    assert_eq!(engine.schema(&source).unwrap().columns.len(), 2);
+    assert_eq!(engine.preview(&source, 10).unwrap().num_rows(), 2);
+}
+
+#[test]
 fn tsv_detect_and_read() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.tsv");

@@ -55,13 +55,82 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 /// DataFusion-backed engine. Reads run on the shared static [`runtime`] via `block_on`, so callers
 /// use the same synchronous [`Engine`] API as the local engine (no `async` leaks across the seam).
-pub struct DataFusionEngine;
+pub struct DataFusionEngine {
+    /// How remote (`s3://`, `gs://`, `az://`) stores are configured for this engine's sessions.
+    ///
+    /// A field rather than a per-call argument because [`Engine`] is a stable object-safe trait
+    /// shared by every backend and must not grow a cloud-specific parameter; an engine value is
+    /// cheap, so a caller that reads for a particular identity constructs an engine for it with
+    /// [`DataFusionEngine::with_store_options`]. Defaults to the process environment, which is
+    /// what every existing caller gets.
+    #[cfg(feature = "object-store")]
+    store_options: crate::objstore::StoreOptions,
+}
 
 impl DataFusionEngine {
     pub fn new() -> Self {
         // Touch the runtime so it is built eagerly (a bad build surfaces here, not mid-request).
         let _ = runtime();
-        Self
+        Self {
+            #[cfg(feature = "object-store")]
+            store_options: crate::objstore::StoreOptions::from_env(),
+        }
+    }
+
+    /// An engine whose remote reads are configured by `options` rather than by the environment.
+    #[cfg(feature = "object-store")]
+    pub fn with_store_options(options: crate::objstore::StoreOptions) -> Self {
+        let _ = runtime();
+        Self {
+            store_options: options,
+        }
+    }
+
+    /// The store configuration this engine hands to DataFusion for remote URLs.
+    #[cfg(feature = "object-store")]
+    pub fn store_options(&self) -> &crate::objstore::StoreOptions {
+        &self.store_options
+    }
+
+    /// Teach `ctx` how to reach the object store behind `path`, if `path` is a remote URI.
+    ///
+    /// A bare `SessionContext` knows only the local filesystem: `register_parquet("s3://…")`
+    /// against one fails with "No suitable object store found for s3://…" before a single byte is
+    /// fetched, which is why SQL over a bucket did not work at all. DataFusion resolves stores
+    /// through a registry keyed by scheme+authority, so the fix is to put the store there first.
+    ///
+    /// The store comes from [`crate::objstore::store_for_url`] — the *same* builder, and the same
+    /// [`crate::objstore::StoreOptions`], that every non-SQL read goes through. That is the point:
+    /// a per-caller credential configured once reaches the SQL planner and the local reader
+    /// identically, instead of SQL quietly keeping a second, ambient credential path.
+    #[cfg(feature = "object-store")]
+    fn register_remote_store(&self, ctx: &SessionContext, path: &str) -> Result<()> {
+        if !crate::source::is_object_uri(path) {
+            return Ok(());
+        }
+        let url = url::Url::parse(path).map_err(|e| {
+            EngineError::Query(format!("not a valid object-store URL `{path}`: {e}"))
+        })?;
+        let store = crate::objstore::store_for_url(path, &self.store_options)?;
+        // Keyed on scheme + authority by DataFusion, so one registration serves every object in
+        // the bucket; re-registering the same bucket replaces the entry, which is what a
+        // re-registration with different options should do.
+        ctx.register_object_store(&url, store);
+        Ok(())
+    }
+
+    /// Without the `object-store` feature there is no store to register, so a remote URI gets the
+    /// same targeted "rebuild with the feature" answer the local engine gives instead of
+    /// DataFusion's opaque "No suitable object store found".
+    #[cfg(not(feature = "object-store"))]
+    fn register_remote_store(&self, _ctx: &SessionContext, path: &str) -> Result<()> {
+        if crate::source::is_object_uri(path) {
+            return Err(EngineError::missing_feature(
+                "read an object-store URI",
+                "object-store",
+            ));
+        }
+        Ok(())
     }
 
     fn register(&self, ctx: &SessionContext, table: &NamedSource) -> Result<()> {
@@ -84,6 +153,9 @@ impl DataFusionEngine {
         if via_local {
             return self.register_via_local(ctx, table);
         }
+        // Must precede the register_* call below: DataFusion resolves the store while *listing*
+        // the URL, so a registry that does not yet know the bucket fails the registration itself.
+        self.register_remote_store(ctx, &path)?;
         let ext = std::path::Path::new(&path)
             .extension()
             .and_then(|e| e.to_str())
@@ -115,6 +187,14 @@ impl DataFusionEngine {
     /// resolves Iceberg snapshots and Hive partition columns, so SQL gets the correct schema.
     fn register_via_local(&self, ctx: &SessionContext, table: &NamedSource) -> Result<()> {
         use datafusion::datasource::MemTable;
+        // Hand this engine's identity down. Without it the local reader mirrors a remote Iceberg
+        // prefix as whatever principal the process environment names, so a SQL query that joins a
+        // Parquet table (registered above under `store_options`) to an Iceberg one would read the
+        // two as DIFFERENT principals — and the Iceberg half would ignore the caller entirely.
+        #[cfg(feature = "object-store")]
+        let local = crate::engine::local::LocalReaderEngine::default()
+            .with_store_options(self.store_options.clone());
+        #[cfg(not(feature = "object-store"))]
         let local = crate::engine::local::LocalReaderEngine::default();
         let rb = local.preview(&table.source, usize::MAX)?; // full read (no row cap)
         let mem = MemTable::try_new(rb.schema.clone(), vec![rb.batches])
@@ -167,7 +247,7 @@ impl Engine for DataFusionEngine {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             engine: "sql (DataFusion)".to_string(),
-            formats: vec!["parquet".to_string(), "csv".to_string()],
+            formats: crate::engine::readable_formats(),
             sql: true,
             profile: true,
             remote: false,
@@ -304,6 +384,34 @@ fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Escape the `LIKE` metacharacters in a filter value so it is matched **literally**, using
+/// `esc` as the escape character.
+///
+/// The grid's filter box takes free text, and `%` and `_` are ordinary characters in it — a user
+/// filtering a `discount` column for `50%` means those two characters, not "anything". Interpolated
+/// raw, `%` becomes "match anything" and `_` becomes "match one character", so the SQL engines
+/// answer a different question from the Arrow kernel path, which compares literally. Which answer a
+/// user got would depend on how their binary was built.
+///
+/// The escape character itself is escaped first, or a value containing it would shift the meaning
+/// of whatever follows.
+fn like_escape(v: &str, esc: char) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        if c == esc || c == '%' || c == '_' {
+            out.push(esc);
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// DataFusion accepts **only** `\` as the `ESCAPE` character and errors on any other, so the
+/// choice is made for us here. (The database builder uses `#` instead, for a reason spelled out
+/// there: a backslash is itself special inside a MySQL string literal.) DataFusion does not treat
+/// `\` as an escape inside a plain string literal, so a single backslash reaches `LIKE` intact.
+const LIKE_ESC: char = '\\';
+
 /// `'value'` with embedded quotes doubled — a SQL string literal. DataFusion coerces it to the
 /// column's type for comparisons (so `"score" > '90'` works on a numeric column).
 fn sql_str(v: &str) -> String {
@@ -325,8 +433,8 @@ fn build_where(filters: &[FilterSpec]) -> String {
                 // CAST(col AS VARCHAR) makes substring search work on numeric/bool/temporal columns
                 // too (NULLs cast to NULL → excluded, as expected).
                 FilterOp::Contains => format!(
-                    "CAST({id} AS VARCHAR) LIKE {}",
-                    sql_str(&format!("%{}%", f.value))
+                    "CAST({id} AS VARCHAR) LIKE {} ESCAPE '{LIKE_ESC}'",
+                    sql_str(&format!("%{}%", like_escape(&f.value, LIKE_ESC)))
                 ),
                 FilterOp::Eq => format!("{id} = {}", sql_str(&f.value)),
                 FilterOp::Ne => format!("{id} <> {}", sql_str(&f.value)),
@@ -334,6 +442,38 @@ fn build_where(filters: &[FilterSpec]) -> String {
                 FilterOp::Le => format!("{id} <= {}", sql_str(&f.value)),
                 FilterOp::Gt => format!("{id} > {}", sql_str(&f.value)),
                 FilterOp::Ge => format!("{id} >= {}", sql_str(&f.value)),
+                FilterOp::NotContains => format!(
+                    "CAST({id} AS VARCHAR) NOT LIKE {} ESCAPE '{LIKE_ESC}'",
+                    sql_str(&format!("%{}%", like_escape(&f.value, LIKE_ESC)))
+                ),
+                FilterOp::StartsWith => format!(
+                    "CAST({id} AS VARCHAR) LIKE {} ESCAPE '{LIKE_ESC}'",
+                    sql_str(&format!("{}%", like_escape(&f.value, LIKE_ESC)))
+                ),
+                FilterOp::EndsWith => format!(
+                    "CAST({id} AS VARCHAR) LIKE {} ESCAPE '{LIKE_ESC}'",
+                    sql_str(&format!("%{}", like_escape(&f.value, LIKE_ESC)))
+                ),
+                // Compared as text, matching the in-memory path: the grid's filter box is one
+                // string, and splitting it into typed literals per column would make the two
+                // engines disagree about `007` in an integer column.
+                FilterOp::In => {
+                    let members: Vec<String> = f
+                        .value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .map(sql_str)
+                        .collect();
+                    if members.is_empty() {
+                        // An empty list matches nothing; `IN ()` is a syntax error in every dialect.
+                        "1 = 0".to_string()
+                    } else {
+                        format!("CAST({id} AS VARCHAR) IN ({})", members.join(", "))
+                    }
+                }
+                FilterOp::IsNull => format!("{id} IS NULL"),
+                FilterOp::NotNull => format!("{id} IS NOT NULL"),
             }
         })
         .collect();
@@ -393,6 +533,82 @@ mod tests {
     use crate::error::EngineError;
     use crate::source::{Format, Source};
 
+    /// P3: a bare `SessionContext` cannot reach a bucket at all — `register_parquet("s3://…")`
+    /// fails with "No suitable object store found" before any byte moves — so these assert on the
+    /// *registry*, which needs no credentials and no network.
+    #[cfg(feature = "object-store")]
+    mod remote_store {
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use datafusion::prelude::SessionContext;
+
+        use super::DataFusionEngine;
+        use crate::objstore::{StoreCredentials, StoreOptions};
+
+        fn bucket() -> ObjectStoreUrl {
+            ObjectStoreUrl::parse("s3://bucket").unwrap()
+        }
+
+        #[test]
+        fn a_remote_url_gets_an_object_store_registered_on_the_session() {
+            let ctx = SessionContext::new();
+            // The bug, reproduced: nothing knows how to reach s3:// yet.
+            assert!(ctx.runtime_env().object_store(bucket()).is_err());
+
+            DataFusionEngine::new()
+                .register_remote_store(&ctx, "s3://bucket/t.parquet")
+                .unwrap();
+            assert!(ctx.runtime_env().object_store(bucket()).is_ok());
+        }
+
+        #[test]
+        fn a_local_path_registers_nothing() {
+            let ctx = SessionContext::new();
+            DataFusionEngine::new()
+                .register_remote_store(&ctx, "/data/t.parquet")
+                .unwrap();
+            assert!(ctx.runtime_env().object_store(bucket()).is_err());
+        }
+
+        #[test]
+        fn registration_goes_through_the_engines_own_store_options() {
+            // A provider for the wrong family is rejected by `objstore`, so seeing that error come
+            // back out of the SQL path proves the SQL engine resolves its store through the same
+            // seam — and therefore that a per-caller credential will reach the planner — rather
+            // than keeping a second, ambient credential path of its own.
+            let provider: object_store::aws::AwsCredentialProvider = std::sync::Arc::new(
+                object_store::StaticCredentialProvider::new(object_store::aws::AwsCredential {
+                    key_id: "AKIAEXAMPLE".to_string(),
+                    secret_key: "TOP-SECRET-VALUE".to_string(),
+                    token: None,
+                }),
+            );
+            let engine = DataFusionEngine::with_store_options(
+                StoreOptions::empty()
+                    .with_scope("tenant-a")
+                    .with_credentials(StoreCredentials::S3(provider)),
+            );
+            assert_eq!(engine.store_options().scope_id(), "tenant-a");
+
+            let ctx = SessionContext::new();
+            let err = engine
+                .register_remote_store(&ctx, "gs://bucket/t.parquet")
+                .unwrap_err();
+            assert!(err.to_string().contains("S3"), "{err}");
+        }
+    }
+
+    /// Without the feature there is no store to register, so the SQL path must say so rather than
+    /// letting DataFusion fail with "No suitable object store found".
+    #[cfg(not(feature = "object-store"))]
+    #[test]
+    fn a_remote_url_without_the_feature_names_the_missing_feature() {
+        use datafusion::prelude::SessionContext;
+        let err = DataFusionEngine::new()
+            .register_remote_store(&SessionContext::new(), "s3://bucket/t.parquet")
+            .unwrap_err();
+        assert!(err.to_string().contains("object-store"), "{err}");
+    }
+
     #[test]
     fn strips_windows_verbatim_prefix() {
         // A canonicalized Windows path (from `--root` or fs::canonicalize) reaching the SQL engine
@@ -434,7 +650,27 @@ mod tests {
             op: FilterOp::Contains,
             value: "12".into(),
         }]);
-        assert_eq!(w, r#" WHERE CAST("amount_usd" AS VARCHAR) LIKE '%12%'"#);
+        assert_eq!(
+            w,
+            r#" WHERE CAST("amount_usd" AS VARCHAR) LIKE '%12%' ESCAPE '\'"#
+        );
+    }
+
+    #[test]
+    fn like_metacharacters_in_a_filter_value_are_matched_literally() {
+        use super::build_where;
+        use crate::engine::{FilterOp, FilterSpec};
+        // A user filtering for `50%` means those two characters. Unescaped, `%` becomes "match
+        // anything" and the SQL path answers a different question from the Arrow path.
+        let w = build_where(&[FilterSpec {
+            column: "discount".into(),
+            op: FilterOp::Contains,
+            value: "50%_".into(),
+        }]);
+        assert_eq!(
+            w,
+            r#" WHERE CAST("discount" AS VARCHAR) LIKE '%50\%\_%' ESCAPE '\'"#
+        );
     }
 
     #[test]

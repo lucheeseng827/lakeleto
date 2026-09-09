@@ -4,7 +4,7 @@
 //! whole point: the same commands work against the local reader, the DataFusion engine, or
 //! a remote Lakeleto Cloud endpoint — and the future UI reuses this exact selection logic.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -35,11 +35,13 @@ pub struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = EngineChoice::Auto)]
     pub engine: EngineChoice,
 
-    /// Lakeleto Cloud endpoint (implies `--engine remote` when set). Env: LAKELETO_REMOTE_URL.
+    /// Lakeleto server endpoint — any server speaking the `/v1/*` contract (implies
+    /// `--engine remote` when set). The path is then the SERVER's to resolve, not this
+    /// machine's. Env: LAKELETO_REMOTE_URL.
     #[arg(long, global = true, env = "LAKELETO_REMOTE_URL")]
     pub remote_url: Option<String>,
 
-    /// Bearer token for Lakeleto Cloud. Env: LAKELETO_REMOTE_TOKEN.
+    /// Bearer token for the remote Lakeleto server. Env: LAKELETO_REMOTE_TOKEN.
     #[arg(
         long,
         global = true,
@@ -47,6 +49,15 @@ pub struct Cli {
         hide_env_values = true
     )]
     pub remote_token: Option<String>,
+
+    /// Read the source as this format instead of inferring it
+    /// (parquet/csv/tsv/json/iceberg/delta/database).
+    ///
+    /// Locally this is the same override `?format=` is on the API. Against `--remote-url` it is
+    /// the only way to name a format at all: the ref is not resolved on this machine, so with
+    /// no `--format` the server infers it (see `Source::unresolved`).
+    #[arg(long, global = true, value_name = "FORMAT")]
+    pub format: Option<String>,
 
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -126,6 +137,11 @@ pub enum Cmd {
         /// Bearer token for `--workspace-remote`.
         #[arg(long, env = "LAKELETO_WORKSPACE_REMOTE_TOKEN", hide_env_values = true)]
         workspace_remote_token: Option<String>,
+        /// Keep workspaces, history and cached results under this directory instead of
+        /// `$LAKELETO_HOME`. Lets two servers run side by side without sharing a store — and
+        /// gives the tray launcher and `serve` a way not to collide over one home.
+        #[arg(long, env = "LAKELETO_WORKSPACE_HOME")]
+        workspace_home: Option<PathBuf>,
     },
 
     /// Open a file in the embedded SPA: start the server and launch a browser tab. Needs `--features serve`.
@@ -150,19 +166,19 @@ pub enum Cmd {
 pub fn run(cli: Cli) -> Result<i32> {
     match &cli.cmd {
         Cmd::Schema { path } => {
-            let source = Source::detect(path)?;
+            let source = source_for(&cli, path)?;
             let engine = engine_for(&cli)?;
             let schema = engine.schema(&source)?;
             print!("{}", render::schema(&schema, cli.output)?);
         }
         Cmd::Head { path, rows } => {
-            let source = Source::detect(path)?;
+            let source = source_for(&cli, path)?;
             let engine = engine_for(&cli)?;
             let batch = engine.preview(&source, *rows)?;
             print!("{}", render::rows(&batch, cli.output)?);
         }
         Cmd::Profile { path, scan, fast } => {
-            let source = Source::detect(path)?;
+            let source = source_for(&cli, path)?;
             let engine = engine_for(&cli)?;
             // `--fast` selects the footer-statistics path (scan_limit 0).
             let scan_limit = if *fast { 0 } else { *scan };
@@ -170,12 +186,19 @@ pub fn run(cli: Cli) -> Result<i32> {
             print!("{}", render::profile(&prof, cli.output)?);
         }
         Cmd::Info { path } => {
-            let source = Source::detect(path)?;
+            let source = source_for(&cli, path)?;
             let engine = engine_for(&cli)?;
             let schema = engine.schema(&source)?;
             let size = std::fs::metadata(&source.path).map(|m| m.len()).ok();
             println!("path   : {}", source.display());
-            println!("format : {}", source.format);
+            // An unresolved source has no format *here* — the server resolved the ref and read
+            // the bytes. Printing the placeholder's name ("unknown") would read like a failed
+            // detection rather than a deliberate absence.
+            if source.is_unresolved() {
+                println!("format : (resolved by the server)");
+            } else {
+                println!("format : {}", source.format);
+            }
             println!("engine : {}", engine.name());
             println!(
                 "size   : {}",
@@ -195,7 +218,7 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Query { sql, tables, file } => {
             let engine = query_engine(&cli)?;
-            let named = build_named_sources(tables, file)?;
+            let named = build_named_sources(&cli, tables, file)?;
             let batch = engine.query(sql, &named)?;
             print!("{}", render::rows(&batch, cli.output)?);
         }
@@ -207,10 +230,11 @@ pub fn run(cli: Cli) -> Result<i32> {
             root,
             workspace_remote,
             workspace_remote_token,
+            workspace_home,
         } => {
             let read: std::sync::Arc<dyn Engine> =
                 std::sync::Arc::new(LocalReaderEngine::default());
-            let store = remote_store(workspace_remote, workspace_remote_token)?;
+            let store = workspace_store(workspace_remote, workspace_remote_token, workspace_home)?;
             crate::api::serve(
                 addr,
                 read,
@@ -269,6 +293,33 @@ fn canon_root(root: &Option<PathBuf>) -> Result<Option<PathBuf>> {
         )));
     }
     Ok(Some(canon))
+}
+
+/// Pick the workspace store from the flags: a remote sync target, an explicit local directory, or
+/// (the default) the on-disk store under `$LAKELETO_HOME` that `api::serve` builds for itself.
+///
+/// `--workspace-remote` and `--workspace-home` are mutually exclusive rather than layered: one
+/// says "the store is over there", the other says "the store is in this directory", and silently
+/// letting one win would put a user's workspaces somewhere they did not ask for.
+#[cfg(feature = "serve")]
+fn workspace_store(
+    remote_url: &Option<String>,
+    remote_token: &Option<String>,
+    home: &Option<PathBuf>,
+) -> Result<Option<std::sync::Arc<dyn crate::workspace::WorkspaceStore>>> {
+    if remote_url.is_some() && home.is_some() {
+        return Err(EngineError::Other(
+            "--workspace-remote and --workspace-home both set: the store is either remote or in \
+             a local directory, not both"
+                .to_string(),
+        ));
+    }
+    if let Some(dir) = home {
+        return Ok(Some(std::sync::Arc::new(crate::workspace::LocalStore::at(
+            dir,
+        )?)));
+    }
+    remote_store(remote_url, remote_token)
 }
 
 /// Build the `--workspace-remote` store override: a [`RemoteStore`](crate::workspace_remote)
@@ -331,6 +382,41 @@ pub(crate) fn db_engine_arc() -> Option<std::sync::Arc<dyn Engine>> {
 }
 
 // ---- engine selection -----------------------------------------------------------------
+
+/// Will this invocation read through the `remote` engine?
+///
+/// Mirrors the `Auto` rule in [`engine_for`] and [`query_engine`] — which agree with each other
+/// — so the source-resolution decision below cannot drift from the engine actually selected.
+/// It is deliberately *not* `cli.remote_url.is_some()`: `--engine local --remote-url …` reads
+/// locally, and handing that a source nothing resolved would be a confusing failure.
+fn uses_remote(cli: &Cli) -> bool {
+    match cli.engine {
+        EngineChoice::Remote => true,
+        EngineChoice::Auto => cli.remote_url.is_some(),
+        EngineChoice::Local | EngineChoice::Sql => false,
+    }
+}
+
+/// Turn a command-line path into the [`Source`] the selected engine should be handed.
+///
+/// This is the whole of the local-vs-remote resolution rule, in one place because every command
+/// needs the same answer. **A remote engine resolves its own sources.** [`Source::detect`] is
+/// local — it stats the path, walks directories, sniffs magic bytes — so running it for a ref
+/// that only the *server* can interpret resolves it against the wrong machine: the command fails
+/// on the laptop and never reaches the network. When the read is going out over HTTP the string
+/// is therefore passed through opaquely (honouring an explicit `--format`, and otherwise leaving
+/// the format for the server to infer) and the peer decides what it names.
+///
+/// Nothing here knows about any particular scheme or product: *any* opaque string a server
+/// understands travels this way, and a plain path that happens to exist on both machines is
+/// simply one of them.
+fn source_for(cli: &Cli, path: &Path) -> Result<Source> {
+    if uses_remote(cli) {
+        Source::unresolved(path, cli.format.as_deref())
+    } else {
+        Source::resolve(path, cli.format.as_deref())
+    }
+}
 
 /// Engine for read commands (schema/head/profile/info).
 fn engine_for(cli: &Cli) -> Result<Box<dyn Engine>> {
@@ -403,12 +489,16 @@ fn make_remote(_cli: &Cli) -> Result<Box<dyn Engine>> {
 
 // ---- helpers --------------------------------------------------------------------------
 
-fn build_named_sources(tables: &[String], file: &Option<PathBuf>) -> Result<Vec<NamedSource>> {
+fn build_named_sources(
+    cli: &Cli,
+    tables: &[String],
+    file: &Option<PathBuf>,
+) -> Result<Vec<NamedSource>> {
     let mut out = Vec::new();
     if let Some(path) = file {
         out.push(NamedSource {
             name: "t".to_string(),
-            source: Source::detect(path)?,
+            source: source_for(cli, path)?,
         });
     }
     for spec in tables {
@@ -417,7 +507,7 @@ fn build_named_sources(tables: &[String], file: &Option<PathBuf>) -> Result<Vec<
         })?;
         out.push(NamedSource {
             name: name.to_string(),
-            source: Source::detect(path)?,
+            source: source_for(cli, Path::new(path))?,
         });
     }
     if out.is_empty() {
@@ -434,63 +524,99 @@ enum CapState {
     On,
     /// A real engine, gated behind a cargo feature that isn't enabled in this binary.
     Off,
+    /// A feature flag that exists but wires nothing — the door is held open, not walked through.
+    /// Distinguished from [`CapState::Off`] because "rebuild with --features x" is bad advice for
+    /// a flag that would still do nothing afterwards.
+    Planned,
 }
 
 fn render_engines() -> String {
     let mut out = String::from("Lakeleto engine backends:\n\n");
 
+    // The format lists come from the same helper the `Engine::capabilities` surface uses, so
+    // this command and `GET /v1/engines` cannot disagree about what the build can read.
+    let formats = crate::engine::readable_formats().join(", ");
     out.push_str(&cap_line(
         "local (arrow/parquet/csv)",
-        "parquet, csv",
+        &formats,
         CapState::On,
     ));
     out.push_str(&cap_line(
         "sql (DataFusion)",
-        "parquet, csv + read-only SQL",
-        if cfg!(feature = "sql") {
-            CapState::On
-        } else {
-            CapState::Off
-        },
+        &format!("{formats} + read-only SQL"),
+        feature_state(cfg!(feature = "sql")),
     ));
+    // Named by the CONTRACT rather than by any one server, because that is what the engine
+    // binds to: a `lakeleto serve` speaks all of it, and a hosted plane may speak part of it —
+    // an unserved route just answers 404/501 with the server's own message. `scan` (the grid's
+    // filter → sort → window) is unimplemented on this engine, hence the exclusion.
     out.push_str(&cap_line(
-        "remote (Lakeleto Cloud) [optional]",
-        "schema/profile today; row streaming = Phase 4",
-        if cfg!(feature = "remote") {
-            CapState::On
-        } else {
-            CapState::Off
-        },
+        "remote (any `/v1/*` server)",
+        "schema/profile/preview/SQL over HTTP (rows as Arrow IPC); no grid windowing",
+        feature_state(cfg!(feature = "remote")),
     ));
     out.push_str(&cap_line(
         "iceberg (reader)",
         "iceberg tables (current-snapshot Parquet)",
-        if cfg!(feature = "iceberg") {
-            CapState::On
-        } else {
-            CapState::Off
-        },
+        feature_state(cfg!(feature = "iceberg")),
+    ));
+    out.push_str(&cap_line(
+        "delta (reader)",
+        "delta lake tables (JSON transaction log)",
+        feature_state(cfg!(feature = "delta")),
     ));
     out.push_str(&cap_line(
         "object-store (s3/gs/az)",
         "remote parquet/csv via your own creds",
-        if cfg!(feature = "object-store") {
-            CapState::On
-        } else {
-            CapState::Off
-        },
+        feature_state(cfg!(feature = "object-store")),
+    ));
+    // The BYO-database connectors. Listed per backend rather than as one "database" row because
+    // each is its own cargo feature and a lean build can carry any subset of them.
+    out.push_str(&cap_line(
+        "sqlite (read-only)",
+        "sqlite files + connection URIs",
+        feature_state(cfg!(feature = "sqlite")),
+    ));
+    out.push_str(&cap_line(
+        "postgres (read-only)",
+        "postgres:// connections",
+        feature_state(cfg!(feature = "postgres")),
+    ));
+    out.push_str(&cap_line(
+        "mysql (read-only)",
+        "mysql:// connections",
+        feature_state(cfg!(feature = "mysql")),
+    ));
+    // ROADMAP Phase 5 records this as deliberately not built, and states that `lakeleto engines`
+    // shows it as "planned" — it did not, so `--features duckdb` compiled and silently wired
+    // nothing. Saying so here is what the recorded decision already promised.
+    out.push_str(&cap_line(
+        "duckdb",
+        "not built — the `sql` (DataFusion) engine covers this",
+        CapState::Planned,
     ));
     out.push_str(
-        "\nLegend: ✓ available · · not compiled (rebuild with the named --features).\n\
+        "\nLegend: ✓ available · · not compiled (rebuild with the named --features) · ○ planned \
+         (the feature flag exists but wires nothing).\n\
          The UI binds to the `Engine` trait, so every backend is interchangeable.\n",
     );
     out
+}
+
+/// `cfg!(feature = ...)` -> the state its row should render in.
+fn feature_state(compiled: bool) -> CapState {
+    if compiled {
+        CapState::On
+    } else {
+        CapState::Off
+    }
 }
 
 fn cap_line(name: &str, formats: &str, state: CapState) -> String {
     let (mark, note) = match state {
         CapState::On => ("✓", ""),
         CapState::Off => ("·", " (not compiled)"),
+        CapState::Planned => ("○", " (planned — the feature flag is inert)"),
     };
     format!("  {mark} {name:<32} reads: {formats}{note}\n")
 }

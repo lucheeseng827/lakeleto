@@ -120,15 +120,94 @@ export function CommandPalette({ open, items, onClose }: { open: boolean; items:
 // ======================================================================
 // Row detail drawer — the full row as pretty JSON (great for wide tables)
 // ======================================================================
-export function RowDetail({ row, onClose }: { row: Row | null; onClose: () => void }) {
+/** A cell as a SQL literal. Quotes are doubled everywhere; `escapeBackslashes` is the MySQL
+ *  case, where `\` is itself an escape inside a string literal under the default SQL mode — so a
+ *  value ending in `\` would otherwise swallow the closing quote and let whatever follows the
+ *  pasted literal execute as SQL. Doubling the backslash closes that; under `NO_BACKSLASH_ESCAPES`
+ *  it merely doubles a character in the data, which is wrong-but-inert — the safe direction. The
+ *  ANSI dialects (SQLite, Postgres with standard strings, DataFusion) treat `\` literally, so
+ *  they must NOT get the doubling. */
+function sqlLiteral(v: unknown, escapeBackslashes = false): string {
+  if (v === null || v === undefined) return "NULL";
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
+  let s = String(v);
+  if (escapeBackslashes) s = s.replace(/\\/g, "\\\\");
+  return "'" + s.replace(/'/g, "''") + "'";
+}
+
+/** How to quote an identifier, chosen from where the row came from.
+ *
+ *  These snippets exist to be PASTED somewhere else, so the dialect matters: MySQL treats a
+ *  double-quoted token as a string literal unless `ANSI_QUOTES` is on, which means an
+ *  ANSI-quoted `WHERE "name" = 'Ada'` compares a column to... the string `name`. Backticks are
+ *  MySQL's native form. Everything else this product connects to — SQLite, Postgres, DataFusion —
+ *  takes the standard double quotes, so the scheme of the source URI decides and a plain file
+ *  path gets the ANSI default. */
+export interface SqlDialect {
+  ident: (name: string) => string;
+  literal: (v: unknown) => string;
+}
+
+/** The quoting rules for both halves of a snippet — identifiers AND string literals — chosen from
+ *  where the row came from. They travel together because splitting them is how a snippet ends up
+ *  half-MySQL: backticked identifiers around a literal whose trailing backslash still breaks out. */
+export function dialectFor(sourcePath?: string): SqlDialect {
+  if (/^mysql:\/\//i.test((sourcePath || "").trim())) {
+    return {
+      ident: (name) => "`" + name.replace(/`/g, "``") + "`",
+      literal: (v) => sqlLiteral(v, true),
+    };
+  }
+  return {
+    ident: (name) => '"' + name.replace(/"/g, '""') + '"',
+    literal: (v) => sqlLiteral(v),
+  };
+}
+
+/** Back-compat shim over [`dialectFor`] for callers that only need identifiers. */
+export function identQuoterFor(sourcePath?: string): (name: string) => string {
+  return dialectFor(sourcePath).ident;
+}
+
+/** `WHERE a = 1 AND b IS NULL` for this row — the clause you paste to find it again elsewhere. */
+export function rowAsWhere(row: Row, dialect = dialectFor()): string {
+  const parts = Object.entries(row).map(([k, v]) =>
+    v === null || v === undefined ? `${dialect.ident(k)} IS NULL` : `${dialect.ident(k)} = ${dialect.literal(v)}`);
+  return "WHERE " + (parts.length ? parts.join("\n  AND ") : "TRUE");
+}
+
+/** `INSERT INTO t (...) VALUES (...)` for this row — for seeding a fixture from a real one. */
+export function rowAsInsert(row: Row, table: string, dialect = dialectFor()): string {
+  const keys = Object.keys(row);
+  return (
+    `INSERT INTO ${dialect.ident(table)} (${keys.map(dialect.ident).join(", ")})\n` +
+    `VALUES (${keys.map((k) => dialect.literal(row[k])).join(", ")});`
+  );
+}
+
+export function RowDetail({ row, table, sourcePath, onClose }: { row: Row | null; table?: string; sourcePath?: string; onClose: () => void }) {
+  const [copied, setCopied] = useState<string | null>(null);
   if (!row) return null;
+  // Copying is the whole point of this drawer — a row you are looking at is usually a row you are
+  // about to mention somewhere else — so it says which form went to the clipboard, since three
+  // buttons that all silently "work" are indistinguishable from three that silently do not.
+  const copy = (label: string, text: string) => {
+    navigator.clipboard?.writeText(text).then(() => {
+      setCopied(label);
+      setTimeout(() => setCopied((c) => (c === label ? null : c)), 1200);
+    }).catch(() => setCopied("copy failed"));
+  };
   const json = JSON.stringify(row, null, 2);
   return (
     <aside style={{ flex: "0 0 340px", borderLeft: "var(--border-hairline)", background: "var(--panel)", display: "flex", flexDirection: "column", minHeight: 0 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "var(--pad-toolbar)", borderBottom: "var(--border-hairline)" }}>
         <span style={{ fontSize: "var(--text-xs)", textTransform: "uppercase", letterSpacing: "0.06em", color: "var(--muted)", fontWeight: "var(--weight-semibold)" }}>Row detail</span>
         <span style={{ flex: 1 }} />
-        <Button size="sm" onClick={() => navigator.clipboard?.writeText(json).catch(() => {})} title="copy JSON">Copy</Button>
+        {copied && <span style={{ fontSize: "var(--text-xs)", color: "var(--accent)" }}>{copied}</span>}
+        <Button size="sm" onClick={() => copy("JSON copied", json)} title="copy this row as JSON">JSON</Button>
+        <Button size="sm" onClick={() => copy("WHERE copied", rowAsWhere(row, dialectFor(sourcePath)))} title="copy a SQL WHERE clause matching this row">WHERE</Button>
+        <Button size="sm" onClick={() => copy("INSERT copied", rowAsInsert(row, table || "t", dialectFor(sourcePath)))} title="copy this row as a SQL INSERT">INSERT</Button>
         <Button size="sm" onClick={onClose} title="close">×</Button>
       </div>
       <div style={{ overflow: "auto", padding: "var(--gutter)" }}>

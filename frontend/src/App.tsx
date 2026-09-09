@@ -5,11 +5,30 @@
 // export/import. Open tabs + grid state persist through the store, so a reload restores the
 // workbench. Falls back to an offline localStorage store + sample tables when no server answers.
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { connectLakeleto, type Backend, type Conn, type Row, type RunRecord, type Workspace, type WorkspaceBundle, type WsConnection, type WsMeta, type WsSavedQuery } from "./api";
+import { connectLakeleto, isDatabaseUri, type Backend, type Conn, type Row, type RunRecord, type Workspace, type WorkspaceBundle, type WsConnection, type WsMeta, type WsSavedQuery } from "./api";
 import { Banner, Button, Chip } from "./components";
 import { TableView } from "./TableView";
 import { buildDoc, docToTabs, HistoryPanel, newDataTab, newLauncherTab, newTabId, resolveVars, ResultView, Sidebar, TabStrip, WorkspaceBar, basename, type OpenTab } from "./workspace";
 import { CommandPalette, CompareView, LauncherView, RowDetail, RunnerModal, type PaletteItem, type RunJob } from "./extras";
+
+/** A plausible table name for the "copy as INSERT" action.
+ *
+ *  A database URI carries the real answer in its `?table=` parameter, so that wins when present —
+ *  `sqlite:///db?table=orders` names `orders`, not a mangled file stem. For a file source the
+ *  stem is a starting point for a paste, not a lookup: a file has no table name to be right
+ *  about, so anything non-identifier-ish folds to `_`. */
+function tableNameFor(path: string): string {
+  const m = path.match(/[?&]table=([^&#]+)/);
+  if (m) {
+    try {
+      const t = decodeURIComponent(m[1]).trim();
+      if (t) return t;
+    } catch { /* malformed escape → fall through to the stem */ }
+  }
+  const stem = basename(path).replace(/\.[^.]+$/, "").replace(/[?#].*$/, "");
+  const cleaned = stem.replace(/[^A-Za-z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
+  return cleaned || "t";
+}
 
 const qs = new URLSearchParams(location.search);
 const dirOf = (p: string) => { const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); return i > 0 ? p.slice(0, i) : "/data/warehouse"; };
@@ -35,8 +54,15 @@ export function App() {
   const [savedKey, setSavedKey] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [detailRow, setDetailRow] = useState<Row | null>(null);
+  // The row detail keeps the SOURCE it was opened from, not whatever tab is active when a copy
+  // button is finally clicked — open a row, switch tabs, hit WHERE, and a render-time lookup
+  // would quote for the wrong table in the wrong dialect.
+  const [detailRow, setDetailRow] = useState<{ row: Row; path?: string } | null>(null);
   const [runner, setRunner] = useState<RunnerCfg | null>(null);
+  // Whether a run's result rows are written to the workspace store. Kept in the browser rather
+  // than in the workspace document on purpose: it is a choice about what this client sends, and a
+  // setting whose whole point is "do not ship my rows anywhere" should not itself be synced.
+  const [cacheResults, setCacheResults] = useState(false);
   const [compareSel, setCompareSel] = useState<RunRecord | null>(null);
 
   const backend: Backend | null = conn ? conn.backend : null;
@@ -164,12 +190,23 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [contentKey]);
 
+  // Restore the per-workspace choice when a workspace is opened, and persist changes to it.
+  const cacheKey = wsId ? "lakeleto.cacheResults." + wsId : null;
+  useEffect(() => {
+    if (!cacheKey) return;
+    try { setCacheResults(localStorage.getItem(cacheKey) === "1"); } catch { setCacheResults(false); }
+  }, [cacheKey]);
+  const toggleCacheResults = (v: boolean) => {
+    setCacheResults(v);
+    if (cacheKey) { try { localStorage.setItem(cacheKey, v ? "1" : "0"); } catch { /* private mode: session-only */ } }
+  };
+
   const runSql = async (tabId: string, sql: string) => {
     const t = tabs.find((x) => x.id === tabId);
     if (!backend || !wsId || !t) return;
     patchTab(tabId, { sqlBusy: true, sqlErr: null });
     try {
-      const resp = await backend.wsRun(wsId, { sql: resolve(sql), path: resolve(t.path), preview: 200 });
+      const resp = await backend.wsRun(wsId, { sql: resolve(sql), path: resolve(t.path), preview: 200, cache: cacheResults });
       patchTab(tabId, { sqlOut: resp, sqlErr: null, sqlBusy: false });
     } catch (e) { patchTab(tabId, { sqlErr: (e as Error).message, sqlOut: null, sqlBusy: false }); }
     loadHistory(wsId);
@@ -200,7 +237,7 @@ export function App() {
   // ---- runner (run across connections / run a folder) ----
   const execRun = async (sql: string, path: string) => {
     if (!backend || !wsId) throw new Error("no workspace");
-    const resp = await backend.wsRun(wsId, { sql: resolve(sql), path: resolve(path), preview: 200 });
+    const resp = await backend.wsRun(wsId, { sql: resolve(sql), path: resolve(path), preview: 200, cache: cacheResults });
     loadHistory(wsId);
     return resp;
   };
@@ -226,7 +263,18 @@ export function App() {
     if (!active || active.kind !== "data" || !ws) return;
     const exists = ws.connections.find((c) => c.path === active.path);
     if (exists) { patchTab(active.id, { connId: exists.id }); return; }
-    const c: WsConnection = { id: "conn-" + newTabId(), label: basename(active.path), path: active.path };
+    // The same cap the sidebar form enforces, or "⭑ Save source" is a side door around it — and
+    // the record is tagged by scheme so the sidebar's count sees it afterwards.
+    const isDb = isDatabaseUri(active.path);
+    const dbLimit = conn?.caps?.limits ? conn.caps.limits.max_db_connections ?? null : conn?.caps?.ee ? null : 2;
+    if (isDb && dbLimit != null) {
+      const have = ws.connections.filter((c) => c.format === "database" || isDatabaseUri(c.path)).length;
+      if (have >= dbLimit) {
+        setErr(`Open-source Lakeleto connects up to ${dbLimit} databases at once. Lakeleto Cloud unlocks unlimited connections + more databases.`);
+        return;
+      }
+    }
+    const c: WsConnection = { id: "conn-" + newTabId(), label: basename(active.path), path: active.path, format: isDb ? "database" : null };
     setWs({ ...ws, connections: [...ws.connections, c] });
     patchTab(active.id, { connId: c.id });
   };
@@ -377,7 +425,8 @@ export function App() {
         {showSidebar && (
           <Sidebar ws={ws} listing={listing} mutate={mutate}
             onOpenConnection={openConnection} onOpenQuery={openQuery} onRunFolder={runFolder}
-            onOpenFile={(p) => openPath(p)} onOpenDir={openDir} ee={conn?.caps?.ee === true} />
+            onOpenFile={(p) => openPath(p)} onOpenDir={openDir} ee={conn?.caps?.ee === true}
+            dbConnectionLimit={conn?.caps?.limits ? conn.caps.limits.max_db_connections ?? null : undefined} />
         )}
 
         {active ? (
@@ -387,8 +436,8 @@ export function App() {
               onNewQuery={(c) => launcherNewQuery(active.id, c)}
               onBrowse={() => setPaletteOpen(true)} />
           ) : active.kind === "compare" ? <CompareView tab={active} />
-            : active.kind === "result" ? <ResultView tab={active} onOpenRow={setDetailRow} />
-              : <TableView backend={conn.backend} conn={conn} tab={active} onPatch={(p) => patchTab(active.id, p)} onRunSql={(sql) => runSql(active.id, sql)} sqlAvailable={sqlAvailable} resolve={resolve} onOpenRow={setDetailRow} />
+            : active.kind === "result" ? <ResultView tab={active} onOpenRow={(row) => setDetailRow({ row, path: active.path || undefined })} />
+              : <TableView backend={conn.backend} conn={conn} tab={active} onPatch={(p) => patchTab(active.id, p)} onRunSql={(sql) => runSql(active.id, sql)} sqlAvailable={sqlAvailable} resolve={resolve} onOpenRow={(row) => setDetailRow({ row, path: active.path })} />
         ) : (
           <main style={{ flex: "1 1 auto", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)", flexDirection: "column", gap: 10 }}>
             <div>No open tabs.</div>
@@ -397,10 +446,12 @@ export function App() {
           </main>
         )}
 
-        {detailRow && <RowDetail row={detailRow} onClose={() => setDetailRow(null)} />}
+        {detailRow && <RowDetail row={detailRow.row} table={detailRow.path ? tableNameFor(detailRow.path) : undefined}
+          sourcePath={detailRow.path} onClose={() => setDetailRow(null)} />}
 
         {showHistory && (
           <HistoryPanel history={history} compareId={compareSel?.id ?? null} onOpenRun={openRunResultTab} onCompare={onCompare}
+            cacheResults={cacheResults} onToggleCache={toggleCacheResults}
             onRefresh={() => wsId && loadHistory(wsId)} onClose={() => setShowHistory(false)} busy={historyBusy} />
         )}
       </div>

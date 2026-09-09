@@ -30,6 +30,13 @@ export interface Row { [k: string]: unknown; }
 export interface Engines {
   version?: string;   // the running server's version (CARGO_PKG_VERSION); absent in sample mode
   ee?: boolean;       // Lakeleto Cloud (EE) edition — lifts the OSS connection cap when true
+  /** Bounds this server enforces. Absent when talking to a Lakeleto older than these fields. */
+  limits?: {
+    max_export_rows?: number; max_export_bytes?: number;
+    max_query_rows?: number; default_query_rows?: number; max_run_rows?: number;
+    /** null = unlimited. */
+    max_db_connections?: number | null;
+  };
   engine: { engine: string; formats: string[]; sql: boolean; profile: boolean; remote: boolean };
   sql_available: boolean;
   endpoints: string[];
@@ -66,7 +73,10 @@ export interface RunRecord {
 }
 export interface WorkspaceBundle { bundle_version: number; workspace: Workspace; history: RunRecord[]; }
 export interface RunResponse { run: RunRecord; columns: Column[]; num_rows: number; rows: Row[]; }
-export interface RunReq { sql?: string | null; path: string; format?: string | null; limit?: number; preview?: number; }
+export interface RunReq { sql?: string | null; path: string; format?: string | null; limit?: number; preview?: number;
+  /** Write the full result to the workspace store so the run can be re-opened. Opt-in: a result is
+   *  dataset content, and with a remote store configured, caching it sends those rows off the machine. */
+  cache?: boolean; }
 export const BUNDLE_VERSION = 1;
 
 export interface Backend {
@@ -94,21 +104,44 @@ export interface Backend {
 
 export interface Conn { mode: "live" | "sample"; base: string | null; caps: Engines; backend: Backend; }
 
-export const OP_SYMBOL: Record<string, string> = { ge: ">=", le: "<=", ne: "!=", eq: "=", gt: ">", lt: "<", contains: "~" };
+/** Does this path reach a live database rather than a file? Mirrors the server's
+ *  DATABASE_SCHEMES (src/source.rs) so the client and server classify a URI the same way —
+ *  a cap that only counts connections the form labelled "database" is a cap in name only. */
+export const isDatabaseUri = (p: string): boolean =>
+  /^(sqlite|postgres|postgresql|mysql):\/\//i.test((p || "").trim());
+
+export const OP_SYMBOL: Record<string, string> = {
+  ge: ">=", le: "<=", ne: "!=", eq: "=", gt: ">", lt: "<",
+  contains: "~", notcontains: "!~", startswith: "^", endswith: "$",
+  in: "in:", isnull: "null", notnull: "!null",
+};
+
+/** Ops that take no operand, so an empty value is the filter rather than an unfinished one. */
+const UNARY_OPS = new Set(["isnull", "notnull"]);
 
 // ---- shared: filter-text → {op,value} (matches the SPA's parseFilter) ----
 export function parseFilter(raw: string): { op: string; value: string } | null {
   raw = (raw || "").trim();
   if (raw === "") return null;
-  const m = raw.match(/^(>=|<=|!=|=|>|<|~)?\s*([\s\S]*)$/)!;
-  const map: Record<string, string> = { ">=": "ge", "<=": "le", "!=": "ne", "=": "eq", ">": "gt", "<": "lt", "~": "contains" };
+  // Keywords first: `!null` would otherwise be read as a `!`-prefixed comparison, and `in:` ends
+  // in a character no symbol uses.
+  const lower = raw.toLowerCase();
+  if (lower === "null") return { op: "isnull", value: "" };
+  if (lower === "!null") return { op: "notnull", value: "" };
+  if (lower.startsWith("in:")) return { op: "in", value: raw.slice(3).trim() };
+  // Two-character symbols must precede their one-character prefixes.
+  const m = raw.match(/^(>=|<=|!=|!~|=|>|<|~|\^|\$)?\s*([\s\S]*)$/)!;
+  const map: Record<string, string> = {
+    ">=": "ge", "<=": "le", "!=": "ne", "!~": "notcontains", "=": "eq",
+    ">": "gt", "<": "lt", "~": "contains", "^": "startswith", "$": "endswith",
+  };
   return { op: map[m[1]] || "contains", value: m[2] };
 }
 function filterSpecs(filters: Filters): string[] {
   const out: string[] = [];
   for (const [col, raw] of Object.entries(filters || {})) {
     const f = parseFilter(raw);
-    if (f && f.value !== "") out.push(`${col}:${f.op}:${f.value}`);
+    if (f && (f.value !== "" || UNARY_OPS.has(f.op))) out.push(`${col}:${f.op}:${f.value}`);
   }
   return out;
 }
@@ -265,20 +298,44 @@ const FS: Record<string, Listing> = {
 const columnsOf = (t: SampleTable): Column[] => t.cols.map(([name, data_type]) => ({ name, data_type, nullable: t.rows.some((r) => r[name] == null) }));
 const cmp = (a: unknown, b: unknown): number => { if (a == null) return 1; if (b == null) return -1; return (a as number) < (b as number) ? -1 : (a as number) > (b as number) ? 1 : 0; };
 
+/** Ops with no numeric meaning — mirrors `FilterOp::is_textual` on the server. */
+const TEXTUAL_OPS = new Set(["contains", "notcontains", "startswith", "endswith", "in"]);
+
 function applyFilters(rows: Row[], filters: Filters): Row[] {
   for (const spec of filterSpecs(filters)) {
     const i = spec.indexOf(":"), j = spec.indexOf(":", i + 1);
     const col = spec.slice(0, i), op = spec.slice(i + 1, j), val = spec.slice(j + 1);
+    // Split an `in:` list once rather than per row, and drop empty members so a trailing comma
+    // is a typo rather than a filter matching the empty string.
+    const members = op === "in" ? val.split(",").map((m) => m.trim()).filter((m) => m !== "") : [];
     rows = rows.filter((r) => {
       const cell = r[col];
+      // The null tests are the only ops a null cell can satisfy — checked before the guard below,
+      // which would otherwise reject exactly the rows `null` is asking for.
+      if (op === "isnull") return cell == null;
+      if (op === "notnull") return cell != null;
+      // Every other op is false on a null, so a negative filter never turns "unknown" into a
+      // match. Same rule as the server's kernels.
       if (cell == null) return false;
-      const numeric = NUMERIC(cell) && !isNaN(parseFloat(val));
+      const numeric = !TEXTUAL_OPS.has(op) && NUMERIC(cell) && !isNaN(parseFloat(val));
       if (numeric) {
         const c = cell as number, n = parseFloat(val);
         switch (op) { case "gt": return c > n; case "lt": return c < n; case "ge": return c >= n; case "le": return c <= n; case "eq": return c === n; case "ne": return c !== n; default: return String(c).includes(val); }
       }
       const s = String(cell);
-      switch (op) { case "eq": return s === val; case "ne": return s !== val; case "gt": return s > val; case "lt": return s < val; case "ge": return s >= val; case "le": return s <= val; default: return s.includes(val); }
+      switch (op) {
+        case "eq": return s === val;
+        case "ne": return s !== val;
+        case "gt": return s > val;
+        case "lt": return s < val;
+        case "ge": return s >= val;
+        case "le": return s <= val;
+        case "notcontains": return !s.includes(val);
+        case "startswith": return s.startsWith(val);
+        case "endswith": return s.endsWith(val);
+        case "in": return members.includes(s);
+        default: return s.includes(val);
+      }
     });
   }
   return rows;
@@ -445,11 +502,12 @@ export class LakeletoMockBackend implements Backend {
     const rec: RunRecord = {
       id: mockId("run"), at_ms: Date.now(), sql: sql || null, source_path: req.path, format,
       status: error ? "error" : "ok", error, row_count: error ? null : full!.num_rows,
-      duration_ms: Date.now() - started, cached: !error,
+      // Mirror the server: `cached` reports what was actually stored, not what was asked for.
+      duration_ms: Date.now() - started, cached: !error && req.cache === true,
     };
     entry.history.unshift(rec); saveDb(db);
     if (error || !full) throw new ApiError(error || "run failed", 400);
-    MOCK_RESULTS.set(id + ":" + rec.id, full);
+    if (rec.cached) MOCK_RESULTS.set(id + ":" + rec.id, full);
     return delay<RunResponse>({ run: rec, columns: full.columns, num_rows: Math.min(previewN, full.num_rows), rows: full.rows.slice(0, previewN) });
   }
   async wsRunResult(id: string, runId: string, offset = 0, limit = 200) {

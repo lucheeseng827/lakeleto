@@ -1,10 +1,13 @@
 //! Source detection — figure out *what* a path is before an engine reads it.
 //!
-//! Detection order is **directory shape → extension → magic bytes**: a directory is treated
-//! as an Iceberg table when it has a `metadata/` subdir; a directory of `.parquet` files (a
-//! multi-file dataset, with optional Hive `key=value` partition subdirs) is treated as one
-//! Parquet table; otherwise a file is classified by extension, falling back to a `PAR1`
-//! magic-byte sniff.
+//! Detection order is **directory shape → extension → magic bytes**: a directory is treated as a
+//! Delta table when it has a `_delta_log/` subdir, then as an Iceberg table when it has a
+//! `metadata/` subdir; a directory of `.parquet` files (a multi-file dataset, with optional Hive
+//! `key=value` partition subdirs) is treated as one Parquet table; otherwise a file is classified
+//! by extension, falling back to a `PAR1` magic-byte sniff.
+//!
+//! [`list_dir`] labels directories in the same order, so the file browser and the reader never
+//! disagree about what a directory is.
 //! Format is decoupled from Engine on purpose: the same `Source` is handed to whichever
 //! engine the user picked (`local`, `sql`, `remote`), so format sniffing lives in one place.
 
@@ -33,6 +36,17 @@ pub enum Format {
     /// The dialect + table live in the URI (parsed by the `database` engine), so this is just the
     /// "this source is a live DB, not a file" marker.
     Database,
+    /// **Not a format — the absence of one.** The marker for a source that was deliberately NOT
+    /// resolved on this machine because the engine that will read it resolves its own refs (see
+    /// [`Source::unresolved`]).
+    ///
+    /// Never produced by [`Source::detect`] and never parsed from user input ([`Format::parse`]
+    /// does not accept `"unknown"`), so it cannot be asked for: it exists so a client can say
+    /// "I don't know, and it is not my job to know" on the wire — omitting `?format=` entirely —
+    /// instead of guessing a format the peer would then be instructed to use. Every local engine
+    /// refuses it, because a local engine that has one has been handed a source it was never
+    /// meant to see.
+    Unknown,
 }
 
 impl Format {
@@ -45,6 +59,7 @@ impl Format {
             Format::Iceberg => "iceberg",
             Format::Delta => "delta",
             Format::Database => "database",
+            Format::Unknown => "unknown",
         }
     }
 
@@ -110,6 +125,17 @@ pub fn is_database_uri(s: &str) -> bool {
 }
 
 /// A resolved data source: a path plus the format Lakeleto detected for it.
+///
+/// **Deliberately no credential slot.** Reads of an object-store URI are configured by
+/// [`crate::objstore::StoreOptions`], which travels *alongside* a `Source`, not on it. `Source`
+/// answers "what is this and where does it live" — it is cheap, `Clone`, cached, embedded in
+/// `TableSchema`/`DirEntry` and rendered into API responses, and it is the same value whoever is
+/// asking. A credential context is the opposite on every count: it answers "who is asking", it is
+/// per-request, it must never be cloned into a cache or a response body, and it carries a live
+/// provider that cannot be serialized. Fusing the two would put secrets on the type most likely to
+/// be logged and would make one identity's cached `Source` reusable by another. So the credential
+/// context stays a separate argument, which also keeps the default `Source` path (a local file)
+/// free of any notion of credentials at all.
 #[derive(Debug, Clone)]
 pub struct Source {
     pub path: PathBuf,
@@ -210,6 +236,35 @@ impl Source {
         }
     }
 
+    /// Build a source from a raw string **without touching the filesystem** — for an engine
+    /// that resolves its own refs.
+    ///
+    /// [`Source::detect`] is a *local* operation: it stats the path, walks directories and
+    /// sniffs magic bytes. That is exactly right when the bytes are on this machine and exactly
+    /// wrong when they are not — a ref that only the far side can interpret (a catalog name, a
+    /// table id, anything a server understands and this process does not) would be resolved
+    /// against the wrong filesystem, fail there, and never reach the network.
+    ///
+    /// So this constructor resolves nothing. The string travels **opaquely** to whatever server
+    /// the caller pointed at, and that server decides what it means — the general rule is *a
+    /// remote engine resolves its own sources*, not a special case for any one scheme or
+    /// product. An explicit `format` is still honoured (the caller genuinely knows something the
+    /// name does not say); with `None` the format is left as [`Format::Unknown`], which the
+    /// remote engine sends as *no* `?format=` at all so the server infers it the way it would
+    /// for any of its own paths.
+    ///
+    /// Only the `remote` engine can read one of these. Handing it to a local engine is a
+    /// programming error and is refused with a message that says so.
+    pub fn unresolved(path: impl AsRef<Path>, format: Option<&str>) -> Result<Source> {
+        match format {
+            Some(f) => Source::resolve(path, Some(f)),
+            None => Ok(Source {
+                path: path.as_ref().to_path_buf(),
+                format: Format::Unknown,
+            }),
+        }
+    }
+
     /// Resolve a source from a path and an optional explicit format name (detect when `None`).
     pub fn resolve(path: impl AsRef<Path>, format: Option<&str>) -> Result<Source> {
         match format {
@@ -224,6 +279,12 @@ impl Source {
 
     pub fn display(&self) -> String {
         self.path.display().to_string()
+    }
+
+    /// True when nothing local resolved this source and its format is the peer's to determine
+    /// (see [`Source::unresolved`]).
+    pub fn is_unresolved(&self) -> bool {
+        self.format == Format::Unknown
     }
 
     /// True when this source lives in an object store (`s3://` / `gs://` / `az://`) rather
@@ -336,7 +397,12 @@ pub fn list_dir(dir: &str) -> Result<DirListing> {
         }
         let meta = entry.metadata().ok();
         if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
-            let format = if path.join("metadata").is_dir() {
+            // Same order as `Source::detect`, and for the same reason: a Delta table's data files
+            // are Parquet and it may also carry a `metadata/` dir, so checking `_delta_log` second
+            // would label a table in the browser as something the reader then opens as Delta.
+            let format = if path.join("_delta_log").is_dir() {
+                Some(Format::Delta.as_str().to_string())
+            } else if path.join("metadata").is_dir() {
                 Some(Format::Iceberg.as_str().to_string())
             } else {
                 None
@@ -412,6 +478,44 @@ fn sniff_magic(path: &Path) -> Result<Format> {
 mod tests {
     use super::*;
 
+    /// `Source::unresolved` must touch nothing and interpret nothing: whatever the caller typed
+    /// is what the server is asked about. The strings below are deliberately unrelated — this
+    /// is a general rule about who resolves a ref, not a special case for any one scheme, and a
+    /// test that only used the scheme some server happens to accept would not say so.
+    #[test]
+    fn an_unresolved_source_is_the_caller_string_verbatim_and_carries_no_format() {
+        for raw in [
+            "cat://acme/geo/cities",
+            "table:sales.orders@v3",
+            "/no/such/file/on/this/disk.parquet",
+            "just-a-name",
+        ] {
+            let s = Source::unresolved(raw, None).unwrap();
+            assert_eq!(s.display(), raw, "the ref travels verbatim");
+            assert!(s.is_unresolved(), "{raw}: format is the server's to decide");
+            assert_eq!(s.format, Format::Unknown);
+        }
+    }
+
+    /// The one thing a caller *can* assert. `Format::parse` still gates it, so a typo fails on
+    /// this machine rather than travelling to a server that would reject it less clearly.
+    #[test]
+    fn an_explicit_format_is_honoured_and_a_bad_one_is_refused() {
+        let s = Source::unresolved("some://opaque/ref", Some("tsv")).unwrap();
+        assert_eq!(s.format, Format::Tsv);
+        assert!(!s.is_unresolved());
+        let err = Source::unresolved("some://opaque/ref", Some("parquay")).unwrap_err();
+        assert!(err.to_string().contains("unknown format"), "{err}");
+    }
+
+    /// `Format::Unknown` is reachable only through [`Source::unresolved`]: nothing detects it,
+    /// nothing parses it, so it can never be smuggled in from a user or a wire.
+    #[test]
+    fn the_unknown_format_cannot_be_asked_for() {
+        assert_eq!(Format::parse("unknown"), None);
+        assert_eq!(Format::Unknown.as_str(), "unknown");
+    }
+
     #[test]
     fn extension_detection() {
         assert_eq!(
@@ -427,5 +531,70 @@ mod tests {
         fn detect_ext_only(p: &str) -> Option<Format> {
             format_from_extension(Path::new(p))
         }
+    }
+
+    #[test]
+    fn list_dir_labels_table_directories_the_way_detect_resolves_them() {
+        // The browser and the reader have to agree. A directory the reader opens as Delta but the
+        // browser labels as a plain folder is a table the user cannot find; one the browser labels
+        // Iceberg and the reader opens as Delta is worse.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("delta_tbl/_delta_log")).unwrap();
+        std::fs::create_dir_all(dir.path().join("iceberg_tbl/metadata")).unwrap();
+        // A Delta table that also carries a `metadata/` dir: detect checks `_delta_log` first, so
+        // the listing must too, or the two disagree on exactly the ambiguous case.
+        std::fs::create_dir_all(dir.path().join("both/_delta_log")).unwrap();
+        std::fs::create_dir_all(dir.path().join("both/metadata")).unwrap();
+        std::fs::create_dir_all(dir.path().join("plain")).unwrap();
+
+        let listing = list_dir(&dir.path().display().to_string()).unwrap();
+        let format_of = |name: &str| {
+            listing
+                .entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the listing"))
+                .format
+                .clone()
+        };
+        assert_eq!(format_of("delta_tbl").as_deref(), Some("delta"));
+        assert_eq!(format_of("iceberg_tbl").as_deref(), Some("iceberg"));
+        assert_eq!(format_of("both").as_deref(), Some("delta"));
+        assert_eq!(format_of("plain"), None);
+
+        for (name, want) in [
+            ("delta_tbl", Format::Delta),
+            ("iceberg_tbl", Format::Iceberg),
+            ("both", Format::Delta),
+        ] {
+            let resolved =
+                Source::resolve(dir.path().join(name).display().to_string().as_str(), None)
+                    .unwrap()
+                    .format;
+            assert_eq!(resolved, want, "{name}: listing and detect must agree");
+        }
+    }
+
+    #[test]
+    fn readable_formats_tracks_the_compiled_features() {
+        // The list is what `GET /v1/engines` and `lakeleto engines` both report, so it has to be
+        // derived from the build rather than hardcoded — that drift is the bug this replaced.
+        let formats = crate::engine::readable_formats();
+        for always in ["parquet", "csv", "tsv"] {
+            assert!(formats.iter().any(|f| f == always), "missing {always}");
+        }
+        assert_eq!(
+            formats.iter().any(|f| f == "iceberg"),
+            cfg!(feature = "iceberg")
+        );
+        assert_eq!(
+            formats.iter().any(|f| f == "delta"),
+            cfg!(feature = "delta")
+        );
+        assert!(
+            !formats.iter().any(|f| f == "object-store"),
+            "object-store is a source capability, not a file format — a client iterating this \
+             list to enumerate openable types must not meet it here"
+        );
     }
 }

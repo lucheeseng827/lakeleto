@@ -46,8 +46,10 @@ fn main() -> std::io::Result<()> {
 
     let windows = root.join("windows");
     std::fs::create_dir_all(&windows)?;
-    let images: Vec<(u32, Vec<u8>)> =
-        ICO_SIZES.iter().map(|&s| (s, desktop::strata_icon_at(s))).collect();
+    let images: Vec<(u32, Vec<u8>)> = ICO_SIZES
+        .iter()
+        .map(|&s| (s, desktop::strata_icon_at(s)))
+        .collect();
     let ico_path = windows.join("lakeleto.ico");
     std::fs::write(&ico_path, icon::ico(&images))?;
     println!("{} ({} sizes)", ico_path.display(), ICO_SIZES.len());

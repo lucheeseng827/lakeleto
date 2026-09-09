@@ -9,7 +9,7 @@ panic = "unwind"
 
 [package]
 name = "lakeleto"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Lakeleto — instant local lakehouse-table explorer (\"the Postman of lakehouse tables\"): reads Parquet + CSV (and Iceberg tables with --features iceberg), all behind one pluggable Engine trait; a DuckDB backend and a hosted Lakeleto Cloud are on the roadmap. MVP: schema / head / profile / grid."
@@ -85,6 +85,13 @@ arrow-schema = "58"
 arrow-cast = "58"                                    # display::ArrayFormatter — type-aware cell rendering
 arrow-csv = "58"                                     # CSV schema inference + reader/writer
 arrow-json = "58"                                    # RecordBatch -> JSON / NDJSON output
+# Arrow IPC *streaming* — the WIRE codec for row results: the server writes it on the
+# `Accept: application/vnd.apache.arrow.stream` arm of /v1/preview, /v1/rows and POST /v1/query,
+# and the `remote` engine reads it back into a RowBatch. Declared unconditionally rather than
+# behind a feature because it is ALREADY compiled in the default build — `parquet`'s `arrow`
+# feature depends on arrow-ipc (58.4.0 in the lockfile). Naming it here is a *nameability*
+# change, not a weight change, so the "lean default" note above stays honest.
+arrow-ipc = "58"
 # Arrow compute kernels powering the grid's server-side sort + filter (the "pushed to Arrow
 # compute kernels" path): arrow-ord (sort_to_indices + cmp), arrow-select (filter/take/concat).
 arrow-ord = "58"
@@ -133,8 +140,13 @@ serve = ["dep:axum", "dep:rust-embed", "dep:serde_urlencoded", "dep:tokio", "tok
 iceberg = ["dep:apache-avro", "apache-avro/snappy", "apache-avro/zstandard"]
 # `object-store` reads remote Parquet/CSV with the user's own env credentials; enables
 # parquet/object_store for the ranged async reader and a shared multi-thread Tokio runtime.
+# `object_store/fs` is on so `file://` URLs resolve through the very same seam as `s3://`:
+# it is the only store `parse_url_opts` can build with no cloud account, which is what lets the
+# credential-scope and mirror-permission tests exercise the real code path with no credentials.
+# It costs `walkdir` (pure Rust, already in the tree) and it is a genuine capability, not a
+# test-only hook. The default build has no object-store support at all, so nothing changes there.
 object-store = [
-    "dep:object_store", "dep:url", "dep:futures",
+    "dep:object_store", "object_store/fs", "dep:url", "dep:futures",
     "dep:tokio", "tokio/rt-multi-thread", "tokio/net", "tokio/time",
     "parquet/object_store",
 ]
@@ -142,7 +154,11 @@ object-store = [
 # console window, picks its own port, opens the browser, and lives in the tray so
 # there is something to quit. Implies `serve` — it has nothing to show otherwise.
 desktop = ["serve", "dep:tray-icon", "dep:winit"]
-duckdb = []    # Phase 2: alternate commodity backend (libduckdb-sys, C++ toolchain)
+# INERT. Declared so the door stays open (ROADMAP Phase 5 — deliberately not built; the `sql`
+# DataFusion engine covers the need). Nothing in `src/` is gated on it, so `--features duckdb`
+# changes nothing about the binary. `lakeleto engines` reports it as planned rather than
+# available, which is the honest surface for a flag that wires nothing.
+duckdb = []
 # `ee` — marker for the Lakeleto Cloud (paid) edition. Off in the OSS build; when set, `/v1/engines`
 # reports `ee:true`, which lifts the UI's open-source DB-connection cap (2 databases at once). The
 # actual EE capabilities live behind the hosted plane, not this flag. NOT enabled in the OSS release.
@@ -161,14 +177,14 @@ delta = []
 # SQLite stays lean (no bigdecimal/chrono/uuid — its dynamic typing maps NUMERIC/dates to text
 # already). Postgres/MySQL add `bigdecimal` (NUMERIC/DECIMAL → f64), `chrono` (DATE/TIME/TIMESTAMP →
 # ISO strings), and `uuid` (PG UUID → string) so real tables don't show NULL price/joined columns.
-sqlite = ["dep:sqlx", "sqlx/sqlite", "dep:tokio", "tokio/rt-multi-thread"]
+sqlite = ["dep:sqlx", "sqlx/sqlite", "dep:tokio", "tokio/rt-multi-thread", "dep:futures"]
 postgres = [
     "dep:sqlx", "sqlx/postgres", "sqlx/bigdecimal", "sqlx/chrono", "sqlx/uuid",
-    "dep:tokio", "tokio/rt-multi-thread",
+    "dep:tokio", "tokio/rt-multi-thread", "dep:futures",
 ]
 mysql = [
     "dep:sqlx", "sqlx/mysql", "sqlx/bigdecimal", "sqlx/chrono", "sqlx/uuid",
-    "dep:tokio", "tokio/rt-multi-thread",
+    "dep:tokio", "tokio/rt-multi-thread", "dep:futures",
 ]
 database = ["sqlite", "postgres", "mysql"]
 

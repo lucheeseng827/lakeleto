@@ -48,7 +48,7 @@ fn crate_manifest_has_no_dependency_on_the_closed_plane() {
     // closed-plane subdir (e.g. a `path = ...` pointing at the hosted-plane crate).
     let into_plane = format!("{}/", plane); // closed-plane subdir prefix
     let up_into_plane = format!("../{}", plane); // parent-relative closed-plane prefix
-    // The hosted plane's crate name, either dep-name spelling.
+                                                 // The hosted plane's crate name, either dep-name spelling.
     let cloud_underscore = format!("lakeleto_{}", "cloud");
     let cloud_hyphen = format!("lakeleto-{}", "cloud");
     for raw in cargo.lines() {

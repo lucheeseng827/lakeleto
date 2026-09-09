@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use apache_avro::types::Value;
@@ -1158,6 +1158,35 @@ fn prunes_all_null_files() {
         .unwrap();
     assert_eq!(res.scanned_rows, 1, "all-null file skipped");
     assert_eq!(res.matched_rows, 1);
+
+    // `x IS NULL` inverts the all-null rule: the all-null file is precisely the one where EVERY
+    // row matches, so pruning it would return zero rows for data sitting on disk — a silently
+    // wrong answer, not a missed optimisation. It must be read, and its three rows must match.
+    let res = engine
+        .scan(&source, &filter("x", FilterOp::IsNull, ""))
+        .unwrap();
+    assert_eq!(
+        res.matched_rows, 3,
+        "the all-null file's rows are exactly the IS NULL matches"
+    );
+
+    // `x IS NOT NULL` prunes it safely — an all-null file has no matching row by definition —
+    // and the answer is still exact.
+    let res = engine
+        .scan(&source, &filter("x", FilterOp::NotNull, ""))
+        .unwrap();
+    assert_eq!(res.scanned_rows, 1, "all-null file skipped for NotNull");
+    assert_eq!(res.matched_rows, 1);
+
+    // The text predicates compare values, and a null is not a match in either direction — so the
+    // all-null file prunes for `notcontains` too, WITHOUT surfacing its rows as "not containing".
+    let res = engine
+        .scan(&source, &filter("x", FilterOp::NotContains, "9"))
+        .unwrap();
+    assert_eq!(
+        res.matched_rows, 1,
+        "only the real value row matches notcontains"
+    );
 }
 
 /// Iceberg decimal bound: unscaled value as two's-complement big-endian (full 16 bytes here; the
@@ -1455,4 +1484,141 @@ fn prunes_by_bucket_partition() {
         .scan(&source, &filter("id", FilterOp::Gt, "0"))
         .unwrap();
     assert_eq!(res.scanned_rows, 3, "range op: no bucket pruning");
+}
+
+/// Build a table at `format-version` `version`, optionally carrying a **deletion vector**: a
+/// delete-manifest entry whose `file_format` is `puffin`, which is how Iceberg v3 represents
+/// positional deletes. The reader parses Parquet delete files only, so the DV would be dropped —
+/// and a dropped delete makes deleted rows reappear as live ones.
+fn build_table_with_format_version(dir: &Path, version: i64, deletion_vector: bool) -> PathBuf {
+    let tbl = dir.join("tbl");
+    let meta = tbl.join("metadata");
+    let data = tbl.join("data");
+    fs::create_dir_all(&meta).unwrap();
+    fs::create_dir_all(&data).unwrap();
+
+    let data_parquet = data.join("data-1.parquet");
+    write_data_parquet(&data_parquet, vec![1, 2, 3], vec!["ada", "grace", "linus"]);
+
+    let entry = |content: i32, path: &Path, file_format: &str| {
+        Value::Record(vec![
+            ("status".into(), Value::Int(1)),
+            (
+                "data_file".into(),
+                Value::Record(vec![
+                    ("content".into(), Value::Int(content)),
+                    (
+                        "file_path".into(),
+                        Value::String(path.display().to_string()),
+                    ),
+                    ("file_format".into(), Value::String(file_format.into())),
+                ]),
+            ),
+        ])
+    };
+
+    let manifest = meta.join("manifest-1.avro");
+    write_avro(
+        &manifest,
+        MANIFEST_SCHEMA,
+        vec![entry(0, &data_parquet, "PARQUET")],
+    );
+    let mut list = vec![Value::Record(vec![
+        (
+            "manifest_path".into(),
+            Value::String(manifest.display().to_string()),
+        ),
+        ("content".into(), Value::Int(0)),
+    ])];
+
+    if deletion_vector {
+        // The DV blob itself is never opened — the reader refuses at plan time, on the manifest
+        // entry alone — so its bytes do not need to be a real Puffin file.
+        let dv = data.join("deletes-1.puffin");
+        fs::write(&dv, b"PFA1").unwrap();
+        let del_manifest = meta.join("manifest-del-1.avro");
+        write_avro(
+            &del_manifest,
+            MANIFEST_SCHEMA,
+            vec![entry(1, &dv, "PUFFIN")],
+        );
+        list.push(Value::Record(vec![
+            (
+                "manifest_path".into(),
+                Value::String(del_manifest.display().to_string()),
+            ),
+            ("content".into(), Value::Int(1)),
+        ]));
+    }
+
+    let snap = meta.join("snap-1.avro");
+    write_avro(&snap, MANIFEST_LIST_SCHEMA, list);
+
+    let metadata = serde_json::json!({
+        "format-version": version,
+        "table-uuid": "00000000-0000-0000-0000-000000000000",
+        "location": tbl.display().to_string(),
+        "current-snapshot-id": 1,
+        "snapshots": [ { "snapshot-id": 1, "manifest-list": snap.display().to_string() } ]
+    });
+    fs::write(
+        meta.join("v1.metadata.json"),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    fs::write(meta.join("version-hint.text"), "1").unwrap();
+    tbl
+}
+
+#[test]
+fn deletion_vectors_are_refused_rather_than_silently_dropped() {
+    // The failure this guards is not "unsupported table" — it is a table that reads *successfully*
+    // and returns rows the writer deleted, with a row count still reported as exact.
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = build_table_with_format_version(dir.path(), 3, true);
+
+    let err = lakeleto::iceberg::plan(&tbl).unwrap_err();
+    assert!(
+        matches!(err, lakeleto::error::EngineError::UnsupportedFormat { .. }),
+        "expected UnsupportedFormat, got: {err:?}"
+    );
+    let msg = err.to_string();
+    for want in ["delete file", "puffin", "deletion vector"] {
+        assert!(
+            msg.to_lowercase().contains(want),
+            "refusal should name {want:?} so the user can act on it; got: {msg}"
+        );
+    }
+
+    // The refusal has to hold through the engine too, not just the planner — that is the path a
+    // user actually reaches, and it is where a silently-wrong answer would have been served.
+    let source = Source::resolve(tbl.display().to_string().as_str(), None).unwrap();
+    assert_eq!(source.format, Format::Iceberg);
+    let engine = LocalReaderEngine::default();
+    assert!(engine.schema(&source).is_err());
+    assert!(engine.preview(&source, 10).is_err());
+}
+
+#[test]
+fn v3_without_deletion_vectors_reads_and_reports_its_version() {
+    // The complement of the refusal above, and the reason it is scoped to deletion vectors rather
+    // than to the version: a v3 table that uses none of v3's unmodelled features reads exactly
+    // right, and refusing it wholesale would break tables that work today.
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = build_table_with_format_version(dir.path(), 3, false);
+
+    let plan = lakeleto::iceberg::plan(&tbl).unwrap();
+    assert_eq!(plan.format_version, 3);
+    assert_eq!(plan.files.len(), 1);
+
+    let source = Source::resolve(tbl.display().to_string().as_str(), None).unwrap();
+    let rows = LocalReaderEngine::default().preview(&source, 10).unwrap();
+    assert_eq!(rows.num_rows(), 3);
+}
+
+#[test]
+fn v2_tables_still_report_format_version_two() {
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = build_table(dir.path());
+    assert_eq!(lakeleto::iceberg::plan(&tbl).unwrap().format_version, 2);
 }

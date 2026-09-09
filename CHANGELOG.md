@@ -6,7 +6,102 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-10
+
 ### Added
+- **`--remote-url` forwards the path instead of resolving it, and a global `--format` was added.**
+  Every read command used to call `Source::detect` *before* it picked an engine, and `detect` is
+  local: it stats the path, walks directories and sniffs magic bytes. So a ref only the far side
+  could interpret was resolved against your own filesystem, failed there, and never reached the
+  network — `lakeleto head "some://server-ref" --remote-url https://server` died with
+  `io error: No such file or directory`.
+
+  The rule now is **a remote engine resolves its own sources** (`Source::unresolved`): when the
+  read is going out over HTTP, the string is forwarded verbatim and the server decides what it
+  names. Nothing in this crate knows what any particular ref means, which is the point — a plain
+  path, a catalog name and a table id all travel the same way.
+
+  `--format` (global) is the one thing a caller can still assert, on either engine; without it a
+  remote request now sends **no `?format=` at all**, so the server infers the format the same way
+  it would for its own paths. Guessing one would have been worse than sending nothing: `format`
+  is an explicit *override* in this contract, so a client's guess becomes a server's instruction.
+  The rule follows the selected engine rather than the mere presence of a URL, so
+  `--engine local --remote-url …` still reads locally. `tests/cli_remote.rs` pins it.
+- **The remote engine returns rows.** `RemoteEngine::preview` and `query`/`query_capped` were
+  stubs that answered with an error string, so `--remote-url` got schema and profile but never
+  data — from *any* server. They are implemented now, over a new Arrow-over-HTTP result codec,
+  so `--remote-url <a lakeleto serve>` is a working read path rather than a wired-up seam.
+
+  Scope, stated plainly: the peer is **any server that speaks this contract** — a self-hosted
+  `lakeleto serve` (your workstation talking to a box that can see a lake your laptop cannot),
+  or a hosted plane serving part of it. Partial service is normal and needs no configuration: a
+  route a server does not answer comes back as a `404`/`501` carrying that server's own message,
+  and `schema`/`profile` are separate endpoints from the row methods, so a server can answer one
+  and not the other.
+
+  The three row-returning endpoints (`GET /v1/preview`, `GET /v1/rows`, `POST /v1/query`) gained
+  content negotiation: they answer **JSON by default**, and an uncompressed **Arrow IPC stream**
+  when the request's `Accept` names the exact token `application/vnd.apache.arrow.stream`. Every
+  other `Accept` — absent, `*/*`, `application/json`, anything unrecognised — is JSON, which is
+  why the SPA needed no change; and there is no `406`, since the codec is always compiled and
+  JSON is always a valid answer. The Arrow body carries rows only, so the counts the JSON bodies
+  state inline travel as `X-Lakeleto-*` response headers (`Offset`, `Num-Rows`, `Matched-Rows`,
+  `Total-Known`, `Scanned-Rows`, `Bounded`, `Capped`) rather than as Arrow schema metadata, which
+  would have altered the schema a client decodes.
+
+  Arrow rather than JSON because a JSON body is a *rendering*: an `Int64` past 2⁵³ rounds, a
+  decimal or timestamp arrives as something the client has to guess at, and a zero-row window
+  loses its columns entirely. The remote engine now gets back the same `RowBatch` the local
+  reader produces, so everything above the `Engine` trait behaves identically no matter who read
+  the bytes. Parquet was considered for the wire and deliberately kept where it is: it remains
+  the at-rest result-cache codec (seekable, compressed, written once, windowed many times),
+  while the wire wants a framed stream with no footer to seek back to. The stream is written
+  uncompressed so any Arrow implementation can read it without a matching codec — the windows
+  are already row-capped, so there is little to save.
+
+  `arrow-ipc` is now a named dependency. It was already compiled in the default build (`parquet`
+  pulls it in for its `arrow` feature), so this is a nameability change, not weight.
+
+  Both ends of the codec are guarded rather than trusted. `to_arrow_ipc` refuses a `RowBatch`
+  whose batches do not match its declared schema: `StreamWriter::write` performs no schema check
+  of its own (unlike the Parquet writer next door, which does), so a divergent batch would be
+  encoded *positionally* and answered with a `200` carrying silently mislabelled columns. The
+  check compares `(name, data_type)` per field and ignores both metadata and nullability: neither
+  changes how a byte is interpreted, and both legitimately differ between a DataFusion result's
+  declared schema and the batches its plan emits — a `UNION ALL` mixing a `NOT NULL` source with
+  a nullable one is the standard case, and comparing nullability rejected it.
+  `from_arrow_ipc` refuses a **compressed** stream: writing uncompressed
+  is a decision about what we send, and says nothing about what a peer frames — a compressed body
+  declares its own decompressed length, and that declaration would size this client's allocation.
+  `arrow-ipc` 58 has no reader-side switch for this, so the stream's framing is walked and each
+  message's `BodyCompression` read before anything is decoded.
+
+  `RemoteEngine` also bounds what it will buffer: a response over 256 MiB is refused, on the
+  declared `Content-Length` where there is one and on the read itself where there is not. The
+  body is still read before the status is acted on — deliberately, because the server's error
+  message lives *in* that body — but it can no longer be unbounded. Every call now goes
+  through that one path, so `schema` and `profile` surface the server's `{"error": …}` body the
+  way the row calls always did — a wrong `--remote-token` reports what the server said about the
+  token, not a bare `401`.
+
+  Still deferred: `RemoteEngine::scan` (the grid's filter → sort → window over `GET /v1/rows`).
+  The server already speaks the Arrow arm there; what is missing is the request half, which needs
+  an exact inverse of the filter parser — separate risk, separate change. Until it lands, a
+  remote engine has no grid windowing: `scan` answers `UnsupportedOperation` (a `501` through the
+  API layer).
+
+- **JSON is now a readable format.** `.json`, `.ndjson`, and `.jsonl` were advertised as openable
+  but no engine read them, so every click was a guaranteed error. The engine now reads them via
+  `arrow-json` (already in-tree for the NDJSON export, so no new dependency): newline-delimited
+  JSON streams row by row, and a top-level `[...]` array is normalised to newline-delimited first,
+  so both shapes read the same — for local files and, under `object-store`, for remote (`s3://`
+  etc.) objects, mirroring how remote CSV is fetched-then-read. `/v1/engines` advertises `json` in
+  the readable-format list. A bracketed array cannot be line-streamed, so it is buffered in full
+  before the row window applies; to keep a single `preview?limit=50` from exhausting memory on a
+  huge array, arrays over 256 MiB are rejected — with an error pointing at the newline-delimited
+  form — before any allocation (checked against the file size locally, and the fetched length
+  remotely). Newline-delimited JSON has no such limit: it streams, bounded by the row window.
+
 - **Double-click installers for Windows and macOS.** Getting started used to mean
   download a zip, extract it, open a terminal in the right folder, and type a
   command — a sequence the README had to preface with *"double-clicking the file
@@ -77,6 +172,67 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   symlinking into a shared bin directory unasked is not something a table viewer
   should do merely because it started.
 
+- **`--workspace-home`.** The flag was documented in a code comment and did not exist,
+  so two servers on one machine always shared `$LAKELETO_HOME` — including the tray
+  launcher and a `serve` you started yourself. It is mutually exclusive with
+  `--workspace-remote` rather than layered: the store is either over there or in a
+  local directory, and silently picking one would put workspaces somewhere nobody asked.
+
+- **Export as NDJSON and TSV** (`?fmt=ndjson` / `?fmt=tsv`), alongside CSV, JSON and
+  Parquet. NDJSON is one object per line, which is what log and ETL pipelines consume;
+  TSV pastes into a spreadsheet without the delimiter guessing that trips CSV up on any
+  column containing a comma. `--output tsv` works on the CLI for the same reason.
+  (Arrow IPC was considered and deliberately left out: it needs a new dependency and
+  would pre-commit the result wire codec that the remote engine still has to choose.)
+
+- **`GET /v1/info` reports a size for `s3://` / `gs://` / `az://` objects**, via one `HEAD`.
+  It answered from the filesystem and returned nothing for a remote URI, which reads as
+  "unknown" when the number is one cheap metadata request away. Still `None` when the URI
+  is a prefix rather than an object, or the store will not say — a missing size is a
+  cosmetic gap and failing the whole `info` call over it would not be. HTTP surface only:
+  the CLI `lakeleto info` still sizes via the filesystem (the rest of the remote dataset
+  story is queued as `remote-dataset-io`).
+
+- **`GET /v1/engines` reports the limits it enforces** — export row and byte caps, the
+  query cap and its default, the workspace-run cap, and how many databases a workspace
+  may connect to at once (`null` = unlimited, which is what an EE build reports). A
+  client that knows a bound can show it before someone hits it, rather than explaining a
+  rejection afterwards. The database cap in particular used to be a literal in the
+  frontend bundle, so changing an edition's terms meant rebuilding the frontend; the
+  SPA now reads the server's number and keeps the old one only as a fallback for an
+  older server. A test asserts the advertised query cap is the one actually applied.
+
+- **Copy a row as a SQL `WHERE` clause or an `INSERT`**, next to the existing copy-as-JSON
+  in the row-detail drawer. Looking at one row is usually the step before mentioning it
+  somewhere else — in a ticket, a query, a fixture. String literals have their quotes
+  doubled and nulls become `IS NULL` / `NULL` rather than the string "null". The drawer
+  now says which form reached the clipboard, because three buttons that all silently
+  succeed look exactly like three that silently fail.
+
+- **A usage summary above the run history**: runs (and how many failed), rows read, total
+  time, and the slowest successful run. Computed from the history already on screen — no
+  new endpoint, no new state. A list of runs cannot answer "is this getting slower, and
+  which one is the slow one", which is the question people open history to ask. Failures
+  are excluded from "slowest" because a failed run's duration measures how long it took to
+  give up.
+
+- **Six more grid filter operators** — `does not contain`, `starts with`, `ends with`,
+  `is one of a list`, `is null`, `is not null`. In the filter box: `!~`, `^`, `$`,
+  `in:a,b,c`, `null`, `!null`, next to the `>` `<` `>=` `<=` `=` `!=` `~` already there.
+
+  Two details worth knowing. The null tests read the column as it was read from disk,
+  before any cast, because a cast can manufacture nulls and a null filter that counted
+  those would be answering about the cast rather than the data. And a negative text
+  filter is not the complement of the positive one over null cells: both `contains` and
+  `does not contain` are false for a null, so filtering for "not X" never quietly
+  surfaces rows whose value is unknown. A test pins that the two partition exactly the
+  non-null rows, and another pins that the Arrow-kernel path and the generated-SQL path
+  select **identical rows** for every operator — they are two implementations of the same
+  vocabulary, and which one runs depends on how the binary was built. The text operators
+  match `%` and `_` **literally** on every path: the SQL translations escape them (and MySQL
+  gets its own `ESCAPE` character, because a backslash is itself special inside a MySQL
+  string literal), so filtering a discount column for `50%` finds `50%`, not everything.
+
 ### Changed
 - **The Strata mark is now in the UI**, in the workspace header and as the favicon,
   as inline SVG drawn from the same geometry as the tray and installer icons — so
@@ -91,6 +247,70 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   installers still build, and the job logs a warning rather than failing the
   release. Windows packaging pins **WiX 5** — 6 and 7 refuse to run until the Open
   Source Maintenance Fee EULA is accepted (`error WIX7015`).
+
+- **Iceberg and Delta tables with modern deletes are refused, not answered wrongly.**
+  Iceberg v3 replaces positional delete files with Puffin **deletion vectors**, and
+  Delta has its own. Neither reader parses them, and both dropped them silently — so
+  the deleted rows came back as live rows while the row count was still reported as
+  exact. A table like that now refuses to open, with a message that names the
+  mechanism and says how to get a readable table (compaction / `REORG … PURGE`).
+
+  The refusal is scoped to the deletes, not to the version: a v3 Iceberg table using
+  none of v3's unmodelled features reads exactly as before, and its `format-version`
+  is now recorded rather than ignored. Delta additionally refuses **column mapping**
+  (`delta.columnMapping.mode` = `name`/`id`), where the physical Parquet columns are
+  named by id and every logical column would otherwise read as null. Any other
+  reader feature a Delta `protocol` action declares is noted on stderr and read.
+
+- **`serve --root` now confines Delta tables.** A Delta transaction log names its own
+  data files, and the path may be absolute or contain `..` — so a table sitting
+  legitimately inside the root could point at any file on the machine and have it
+  read. `--root` is a per-format traversal whitelist rather than a general sandbox,
+  and Delta had no entry in it. Iceberg and Parquet directories were already covered.
+
+  Confining means replaying the log twice per request, and a Delta replay costs a
+  read and a JSON parse per commit — so the planner now memoizes per table, keyed on
+  the log's highest version, commit count, and mtime. The confinement pass and the
+  reader's own share one replay.
+
+- **`POST /v1/query` is bounded.** It ran the uncapped query path, so `SELECT *` over
+  a large table materialized the whole result and serialized every row into one JSON
+  body. It now accepts an optional `limit` (default 10,000, clamped to 100,000),
+  pushes that bound into the plan, and returns `capped: true` when the result filled
+  it, so a truncated answer cannot be mistaken for a complete one. `GET /v1/export`
+  is still the way to pull a large result.
+
+- **Delta tables are visible in the file browser.** `GET /v1/list` marked a directory
+  as a table only when it looked like Iceberg, so a Delta table appeared as an
+  ordinary folder even though clicking through to it read fine. It now checks
+  `_delta_log/` first — the same order the reader uses, so the browser and the reader
+  agree on a directory that has both.
+
+### Fixed
+- **`GET /v1/preview` and `GET /v1/profile` now bound a caller-supplied size.** `POST /v1/query`
+  already clamped its `limit`, but `?limit=` on preview and `?scan=` on profile were taken
+  verbatim, so `?limit=999999999` still materialised the whole table. Both now clamp a
+  caller-supplied value to the same query cap; the operator-configured profile default (trusted)
+  is left untouched when no value is passed.
+- **A windowed CSV/TSV/JSON read no longer overflows on a large `offset`.** `GET /v1/rows`
+  takes a caller-supplied `offset`, and the local reader computed `offset + limit` to size the
+  scan — which panics in debug and wraps in release for an `offset` near `usize::MAX`. It now
+  uses a saturating add, so an out-of-range offset yields an empty window instead of a crash.
+- **A run no longer caches its result rows unless asked.** `POST /v1/workspaces/{id}/runs`
+  unconditionally wrote the full result to the workspace store — and the store is a
+  trait, so with `--workspace-remote` configured that sent the rows off the machine
+  without anyone choosing it. Caching is now per-run (`"cache": true`), the record's
+  `cached` flag reports what was actually written rather than what was hoped for, and
+  the workbench carries a labelled *Save result rows* switch that says what turning it
+  on does. History still records every run either way; what changes is whether the rows
+  are kept, and a run whose rows were not kept re-runs when you click it.
+
+- **`lakeleto engines` and `GET /v1/engines` stop under-reporting the binary.** Both
+  claimed `parquet, csv` no matter which features were compiled in, and the engine
+  list omitted delta, sqlite, postgres and mysql entirely. The format list is now
+  derived from the build's own feature flags, and every backend has a row. The
+  inert `duckdb` flag is shown as *planned* — ROADMAP Phase 5 said it would be, and
+  it never was, so `--features duckdb` compiled and wired nothing without saying so.
 
 ## [0.1.4] - 2026-07-21
 
@@ -244,5 +464,6 @@ one pluggable trait.
 - Release scaffolding: `LICENSE` (Apache-2.0), `NOTICE`, `CONTRIBUTING.md` (DCO),
   `SECURITY.md`, `CODE_OF_CONDUCT.md`, and this changelog.
 
-[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.2.0
 [0.1.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.1.0

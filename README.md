@@ -1,3 +1,5 @@
+<img src="docs/images/lakeleto-logo.svg" alt="" width="72">
+
 # Lakeleto
 
 **Lakeleto — the Postman of lakehouse tables.** Point it at a `.parquet`, `.csv`, or `.tsv` and
@@ -28,6 +30,15 @@ Two load-bearing seams, both traits: [`Engine`](src/engine/mod.rs) carries **rea
 [`WorkspaceStore`](src/workspace.rs) carries the **workbench** (connections, saved queries,
 run history + cached results). Everything above a seam binds only to the trait, so every
 backend below it is swappable — including a hosted cloud one.
+
+[![Lakeleto system context](docs/images/architecture-system-context.png)](docs/images/architecture-system-context.png)
+
+<sub>Redrawn from the Mermaid source below, organised around the two seams. The drawing
+merges the CLI and SPA into one clients node, merges the read and workspace route groups
+into the one server that hosts them, and collapses each trait's implementations into a
+single node per seam. Source:
+[`docs/images/architecture-system-context.html`](docs/images/architecture-system-context.html).
+The same topology as Mermaid, for diffing and for editing the drawing from:</sub>
 
 ```mermaid
 flowchart LR
@@ -275,13 +286,55 @@ connections — every query cached to a re-openable result.
 | `GET`  | `/v1/engines` | serving engine capabilities + endpoint list |
 | `GET`  | `/v1/schema?path=&format=` | columns, types, nullability, row count |
 | `GET`  | `/v1/info?path=&format=` | format, engine, size, rows, columns |
-| `GET`  | `/v1/preview?path=&limit=&format=` | first N rows as `{ columns, rows }` |
+| `GET`  | `/v1/preview?path=&limit=&format=` | first N rows as `{ columns, rows }` (or Arrow — see below) |
 | `GET`  | `/v1/profile?path=&scan=&format=` | per-column null %, distinct, min/max (`scan=0` = footer-stats fast path for Parquet) |
-| `GET`  | `/v1/rows?path=&offset=&limit=&sort=&desc=&filter=col:op:value&cols=a,b` | grid window (filter → sort → page → project) |
+| `GET`  | `/v1/rows?path=&offset=&limit=&sort=&desc=&filter=col:op:value&cols=a,b` | grid window (filter → sort → page → project; or Arrow — see below) |
 | `GET`  | `/v1/stats?path=&filter=col:op:value` | column profile over the **filtered** view |
-| `GET`  | `/v1/export?path=&fmt=csv\|json\|parquet&sort=&filter=&cols=` | current view as a download |
+| `GET`  | `/v1/export?path=&fmt=csv\|tsv\|json\|ndjson\|parquet&sort=&filter=&cols=` | current view as a download |
 | `GET`  | `/v1/list?dir=` | file browser: subdirs + readable data files |
-| `POST` | `/v1/query` | `{ sql, file?, tables[] }` → `{ columns, rows }` (needs `sql`) |
+| `POST` | `/v1/query` | `{ sql, file?, tables[] }` → `{ columns, rows }` (or Arrow — see below; needs `sql`) |
+
+**Rows as Arrow.** The three row-returning endpoints (`/v1/preview`, `/v1/rows`,
+`POST /v1/query`) answer JSON unless the request's `Accept` names the exact token
+`application/vnd.apache.arrow.stream`, in which case the body is an uncompressed **Arrow IPC
+stream** of the same rows, and the counts the JSON body carries inline travel as `X-Lakeleto-*`
+response headers instead. Which counts depends on the endpoint, because the JSON bodies differ:
+`/v1/rows` sends `X-Lakeleto-Offset`, `-Num-Rows`, `-Matched-Rows`, `-Total-Known`,
+`-Scanned-Rows` and `-Bounded`; `/v1/preview` and `POST /v1/query` send only
+`X-Lakeleto-Capped`.
+
+```console
+$ curl -H 'Accept: application/vnd.apache.arrow.stream' \
+    'http://127.0.0.1:8080/v1/preview?path=data.parquet&limit=1000' > rows.arrows
+```
+
+JSON stays the default *and* the answer to every other `Accept` — including the `*/*` a browser
+sends — so nothing that exists today changes, and no request is ever refused with a `406`. Arrow
+is the only encoding that returns a result's real Arrow types (an `Int64` past 2⁵³, a decimal, a
+timestamp) and a zero-row window's columns, which is why it — not JSON — is what one Lakeleto
+reads from another.
+
+**What `--remote-url` actually does.** The `remote` engine (`--features remote`) is a client for
+this same `/v1/*` contract, pointed at **whatever speaks it** — a `lakeleto serve` you run (a
+workstation, a jump box, a machine that can see a lake your laptop cannot), or a hosted plane
+that serves part of it. It calls `GET /v1/schema`, `GET /v1/profile` (JSON) and
+`GET /v1/preview` + `POST /v1/query` (Arrow). It does **not** call `/v1/rows`: grid windowing
+(filter → sort → page) is unimplemented on a remote engine and answers `501`, so the server
+offers that endpoint but this client does not yet use it.
+
+A server need not serve all of it, and need not read files: **the server resolves its own
+refs**. With `--remote-url` set, Lakeleto does not resolve the path on your machine — it
+forwards the string as you typed it and lets the server decide what it names, which is how a ref
+only that server understands works at all:
+
+```bash
+lakeleto head "some://ref/only/the/server/knows" --remote-url https://the-server
+```
+
+`--format` is the one thing you can still assert; without it the server infers the format the
+same way it would for its own paths. A route the server does not serve answers `404`/`501`, and
+a limit it imposes but this contract does not name (how many tables one query may register, say)
+answers `4xx` — both carrying the server's own message.
 
 Filter ops: `eq ne lt le gt ge contains` (or `= != < <= > >= ~`). With the `sql` feature, any
 sort/filter scan is **pushed into DataFusion** (`WHERE` / external `ORDER BY` / `LIMIT`/`OFFSET`

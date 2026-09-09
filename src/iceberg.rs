@@ -18,6 +18,22 @@
 //! skips data files whose manifest bounds — or, for an equality filter, whose bucket/truncate/
 //! identity **partition** value — prove they can't match; conservatively, and consistent with
 //! Arrow's `total_cmp` float order, so a hidden NaN never causes a wrong skip).
+//!
+//! ## Format versions, and the one case this reader refuses
+//!
+//! v1 and v2 are read in full. **v3** (GA across Snowflake / Databricks / AWS during 2026) is read
+//! too, with two carve-outs, because its additions land in different places:
+//!
+//! - **Deletion vectors are refused.** v3 replaces positional delete *files* with Puffin deletion
+//!   vectors, which arrive as delete-manifest entries whose `file_format` is `puffin`. This reader
+//!   parses Parquet delete files only, so a DV would be dropped — and dropping a delete makes the
+//!   deleted rows reappear as live rows while the row count is still reported as exact. An
+//!   under-report is a partial answer; this would be a *wrong* answer, so [`plan`] returns
+//!   [`EngineError::UnsupportedFormat`] instead of a plan. (Contrast the non-Parquet **data** file
+//!   case, which under-reports and is only warned about.)
+//! - **Row lineage and the VARIANT / GEOMETRY types are not modelled**, and a v3 table is noted on
+//!   stderr for that reason. It is not refused: a v3 table using none of them reads exactly right,
+//!   and refusing the version wholesale would break tables that work today.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -151,6 +167,11 @@ pub struct TablePlan {
     /// an ORC/Avro data file in a migrated table is dropped). Surfaced so callers know row counts
     /// may under-report rather than silently trusting an incomplete plan.
     pub skipped_non_parquet: usize,
+    /// The table's `format-version` (1, 2, or 3). Iceberg v3 is GA across the major platforms as
+    /// of 2026 and adds features this reader does not model — **deletion vectors** (refused at
+    /// plan time, see below), row lineage, and the VARIANT/GEOMETRY types. Recorded so callers can
+    /// say which version they are looking at rather than guessing. `0` when the metadata omits it.
+    pub format_version: i64,
 }
 
 impl TablePlan {
@@ -205,10 +226,22 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
     let meta: serde_json::Value = serde_json::from_reader(BufReader::new(File::open(&meta_path)?))
         .map_err(|e| EngineError::Other(format!("iceberg: bad metadata json: {e}")))?;
 
+    // Recorded before anything else is read: it decides how a delete file that this reader cannot
+    // parse should be described, and callers want to be able to state which version they opened.
+    let format_version = meta
+        .get("format-version")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
     // An empty table (no snapshot) is legal — return no files.
     let current = match meta.get("current-snapshot-id").and_then(|v| v.as_i64()) {
         Some(id) if id >= 0 => id,
-        _ => return Ok(TablePlan::default()),
+        _ => {
+            return Ok(TablePlan {
+                format_version,
+                ..Default::default()
+            })
+        }
     };
     let manifest_list = meta
         .get("snapshots")
@@ -232,6 +265,13 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
     let mut pos_delete_files: Vec<PathBuf> = Vec::new();
     let mut eq_delete_specs: Vec<(PathBuf, Vec<i32>, i64)> = Vec::new();
     let mut skipped_non_parquet = 0usize;
+    // Delete files this reader cannot parse — in practice **Iceberg v3 deletion vectors**, which
+    // are Puffin blobs (`file_format = "puffin"`) carried in a delete manifest. Dropping a *data*
+    // file under-reports, which is recoverable and merely warned about; dropping a *delete* file
+    // over-reports, and it does so invisibly: the deleted rows come back as live rows and the row
+    // count is still stated as exact. That is a wrong answer, not a partial one, so it is refused.
+    let mut skipped_delete_formats: BTreeSet<String> = BTreeSet::new();
+    let mut skipped_delete_files = 0usize;
     for (manifest_path, content, manifest_seq) in read_manifest_list(&guard(manifest_list)?)? {
         for mut e in read_manifest_entries(&guard(&manifest_path)?)? {
             if e.status == 2 {
@@ -242,6 +282,9 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
                 // migrations) is dropped, but counted so the caller can flag the under-report.
                 if content == 0 && e.content == 0 {
                     skipped_non_parquet += 1;
+                } else if content == 1 {
+                    skipped_delete_files += 1;
+                    skipped_delete_formats.insert(e.file_format.to_ascii_lowercase());
                 }
                 continue;
             }
@@ -305,12 +348,55 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
             table_dir.display()
         );
     }
+    // Refuse rather than answer wrongly. The message names the mechanism and the way out, because
+    // "unsupported" on its own leaves the user unable to tell a broken table from a new one.
+    if skipped_delete_files > 0 {
+        let formats: Vec<&str> = skipped_delete_formats.iter().map(String::as_str).collect();
+        return Err(EngineError::UnsupportedFormat {
+            detail: format!(
+                "iceberg: table has {skipped_delete_files} delete file(s) this reader cannot \
+                 apply (format: {}){} — reading it would return deleted rows as live rows, so \
+                 the read is refused rather than answered wrongly. Rewrite the table's deletes \
+                 into the data files (compaction / `rewrite_data_files`) and re-open it.",
+                formats.join(", "),
+                if format_version >= 3 {
+                    ", i.e. Iceberg v3 deletion vectors"
+                } else {
+                    ""
+                }
+            ),
+        });
+    }
+    if format_version >= 3 {
+        // v3 reads correctly here *once* deletion vectors are ruled out above — but it also adds
+        // row lineage and the VARIANT/GEOMETRY types, which this reader does not model. Warn
+        // rather than refuse: a v3 table that uses none of them is read exactly right, and
+        // refusing every v3 table would break tables that work today.
+        //
+        // Once per table per process, not once per plan: this planner runs on every read, and
+        // `--root` runs it twice per request — under `serve`, stderr is the operator's log, and a
+        // note repeated hundreds of times is a note nobody reads.
+        static NOTED_V3: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+            std::sync::OnceLock::new();
+        let mut noted = NOTED_V3
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if noted.insert(table_dir.to_path_buf()) {
+            eprintln!(
+                "lakeleto: NOTE {} is an Iceberg v3 table. Its data files are read correctly, \
+                 but row lineage and the VARIANT/GEOMETRY types are not modelled by this reader.",
+                table_dir.display()
+            );
+        }
+    }
     Ok(TablePlan {
         files,
         schema: parse_current_schema(&meta),
         equality_deletes,
         partition_spec: parse_partition_spec(&meta),
         skipped_non_parquet,
+        format_version,
     })
 }
 
@@ -887,7 +973,15 @@ fn chunk_might_match(
     value: Option<&PruneVal>,
 ) -> bool {
     if all_null {
-        return false; // no non-null row → nothing matches any op (incl. Ne / Contains)
+        // No non-null row, so nothing matches any op that compares a VALUE — including `Ne` and
+        // the text predicates, since a null matches neither direction of a substring test.
+        //
+        // `IsNull` inverts, and it is the one case where pruning here would be a WRONG ANSWER
+        // rather than a missed optimisation: an all-null file is precisely the file where every
+        // row matches, so dropping it returns zero rows for data sitting on disk, with nothing in
+        // the keep-mask to say it happened. `NotNull` is safe to prune — an all-null file has no
+        // matching row by definition.
+        return op == FilterOp::IsNull;
     }
     if op == FilterOp::Contains {
         return true; // substring — bounds can't prove absence
@@ -917,7 +1011,17 @@ fn range_might_match(op: FilterOp, lower: &PruneVal, upper: &PruneVal, value: &P
         FilterOp::Le => lo != Greater,               // needs lower ≤ v
         FilterOp::Gt => hi == Greater,               // some value > v needs upper > v
         FilterOp::Ge => hi != Less,                  // needs upper ≥ v
-        FilterOp::Contains => true,                  // substring — bounds can't prune
+        // Everything below is a text or null predicate that min/max bounds cannot disprove:
+        // a file whose values range "apple".."cherry" may still hold one starting with "b", and
+        // Iceberg's bounds say nothing about which rows are null. Keep the file — pruning is only
+        // ever allowed to drop a file it can PROVE cannot match.
+        FilterOp::Contains
+        | FilterOp::NotContains
+        | FilterOp::StartsWith
+        | FilterOp::EndsWith
+        | FilterOp::In
+        | FilterOp::IsNull
+        | FilterOp::NotNull => true,
     }
 }
 
@@ -1248,6 +1352,7 @@ pub fn prune(plan: &TablePlan, filters: &[FilterSpec]) -> (TablePlan, usize) {
             equality_deletes: plan.equality_deletes.clone(),
             partition_spec: plan.partition_spec.clone(),
             skipped_non_parquet: plan.skipped_non_parquet,
+            format_version: plan.format_version,
         },
         skipped,
     )

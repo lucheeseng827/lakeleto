@@ -134,6 +134,37 @@ pub struct Capabilities {
     pub remote: bool,
 }
 
+/// The formats a file-reading engine can actually open in **this** build.
+///
+/// Both the local reader and the SQL engine answered a hardcoded `["parquet", "csv"]` regardless
+/// of which features were compiled in, so a binary built with `iceberg,delta,object-store` told
+/// `GET /v1/engines` — and therefore the SPA, and `lakeleto engines` — that it could read two
+/// formats when it could read six. The list is derived from the feature flags instead, so it
+/// cannot drift from what the build can do.
+///
+/// The two engines report the same set because they cover the same set: `DataFusionEngine`
+/// registers Iceberg, Delta and Parquet *directories* through the local reader
+/// (`register_via_local`), and reads plain Parquet/CSV/TSV natively.
+pub fn readable_formats() -> Vec<String> {
+    let mut formats = vec![
+        "parquet".to_string(),
+        "csv".to_string(),
+        "tsv".to_string(),
+        "json".to_string(),
+    ];
+    if cfg!(feature = "iceberg") {
+        formats.push("iceberg".to_string());
+    }
+    if cfg!(feature = "delta") {
+        formats.push("delta".to_string());
+    }
+    // `object-store` is deliberately NOT in this list: it is a source of files, not a format of
+    // them, and a client iterating formats to build an "openable types" list would choke on it.
+    // The capability is already visible on its own terms — `lakeleto engines` gives it a row, and
+    // an `s3://` path answers with a clear rebuild-with-the-feature error when it is absent.
+    formats
+}
+
 /// A source registered under a name, for multi-table SQL (`FROM orders JOIN customers`).
 pub struct NamedSource {
     pub name: String,
@@ -209,6 +240,19 @@ pub enum FilterOp {
     Gt,
     Ge,
     Contains,
+    /// Substring absent. Not the negation of [`FilterOp::Contains`] over nulls: both are false for
+    /// a null cell, matching the SQL-ish rule the comparison kernels already follow, so filtering
+    /// for "not X" never surfaces rows whose value is unknown.
+    NotContains,
+    StartsWith,
+    EndsWith,
+    /// Value is one of a comma-separated list (`status:in:new,open,pending`).
+    In,
+    /// The cell is null. Evaluated on the column as it was read, before any cast — a cast can
+    /// manufacture nulls, and a null filter that reported those would be answering about the
+    /// cast rather than about the data.
+    IsNull,
+    NotNull,
 }
 
 impl FilterOp {
@@ -221,8 +265,33 @@ impl FilterOp {
             "gt" | ">" => FilterOp::Gt,
             "ge" | ">=" => FilterOp::Ge,
             "contains" | "~" => FilterOp::Contains,
+            "notcontains" | "not_contains" | "!~" => FilterOp::NotContains,
+            "startswith" | "starts_with" | "^" => FilterOp::StartsWith,
+            "endswith" | "ends_with" | "$" => FilterOp::EndsWith,
+            "in" => FilterOp::In,
+            "isnull" | "is_null" => FilterOp::IsNull,
+            "notnull" | "not_null" | "isnotnull" => FilterOp::NotNull,
             _ => return None,
         })
+    }
+
+    /// Does this op ignore the filter's `value` entirely? The null tests do, so the grid can offer
+    /// them without demanding a value the user has nothing to type into.
+    pub fn is_unary(&self) -> bool {
+        matches!(self, FilterOp::IsNull | FilterOp::NotNull)
+    }
+
+    /// Ops with no numeric meaning — they compare text, so a numeric column is rendered to text
+    /// first rather than taking the f64 fast path.
+    fn is_textual(&self) -> bool {
+        matches!(
+            self,
+            FilterOp::Contains
+                | FilterOp::NotContains
+                | FilterOp::StartsWith
+                | FilterOp::EndsWith
+                | FilterOp::In
+        )
     }
 }
 
@@ -609,13 +678,25 @@ fn combined_mask(batch: &RecordBatch, filters: &[FilterSpec]) -> Result<BooleanA
     acc.ok_or_else(|| EngineError::Other("no filters".to_string()))
 }
 
+/// A row-at-a-time text test, for the predicates Arrow has no scalar kernel for. The lifetime is
+/// the filter value it borrows — these live only for the length of one `column_mask` call.
+type TextPredicate<'a> = Box<dyn Fn(&str) -> bool + 'a>;
+
 /// Build a boolean mask for `column op value`, pushing the comparison to Arrow's `cmp`
 /// kernels (numeric columns compared as f64; everything else lexically as Utf8).
 fn column_mask(column: &arrow_array::ArrayRef, op: FilterOp, value: &str) -> Result<BooleanArray> {
-    let numeric = matches!(
-        num_class(column.data_type()),
-        NumClass::Int | NumClass::Float
-    );
+    // Null tests read the column's own validity, before any cast — see `FilterOp::IsNull`.
+    if op.is_unary() {
+        let want_null = op == FilterOp::IsNull;
+        return Ok((0..column.len())
+            .map(|i| Some(column.is_null(i) == want_null))
+            .collect());
+    }
+    let numeric = !op.is_textual()
+        && matches!(
+            num_class(column.data_type()),
+            NumClass::Int | NumClass::Float
+        );
     if numeric {
         if let Ok(v) = value.parse::<f64>() {
             let casted =
@@ -634,11 +715,27 @@ fn column_mask(column: &arrow_array::ArrayRef, op: FilterOp, value: &str) -> Res
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| EngineError::Other("utf8 cast failed".to_string()))?;
-    if op == FilterOp::Contains {
-        return Ok(col
-            .iter()
-            .map(|opt| Some(opt.is_some_and(|s| s.contains(value))))
-            .collect());
+    // The text predicates Arrow has no scalar kernel for. Each is false on a null cell, so a
+    // negative filter never turns "unknown" into a match.
+    let textual: Option<TextPredicate<'_>> = match op {
+        FilterOp::Contains => Some(Box::new(|s: &str| s.contains(value))),
+        FilterOp::NotContains => Some(Box::new(|s: &str| !s.contains(value))),
+        FilterOp::StartsWith => Some(Box::new(|s: &str| s.starts_with(value))),
+        FilterOp::EndsWith => Some(Box::new(|s: &str| s.ends_with(value))),
+        FilterOp::In => {
+            // Split once, not per row. Empty members are dropped so a trailing comma is a typo
+            // rather than a filter that matches the empty string.
+            let members: Vec<&str> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .collect();
+            Some(Box::new(move |s: &str| members.contains(&s)))
+        }
+        _ => None,
+    };
+    if let Some(pred) = textual {
+        return Ok(col.iter().map(|opt| Some(opt.is_some_and(&pred))).collect());
     }
     let scalar = StringArray::new_scalar(value);
     cmp_apply(op, col, &scalar)
@@ -651,13 +748,27 @@ where
 {
     use arrow_ord::cmp;
     let r = match op {
-        // `Contains` on a numeric column has no substring sense — treat it as equality.
-        FilterOp::Eq | FilterOp::Contains => cmp::eq(lhs, rhs),
+        FilterOp::Eq => cmp::eq(lhs, rhs),
         FilterOp::Ne => cmp::neq(lhs, rhs),
         FilterOp::Lt => cmp::lt(lhs, rhs),
         FilterOp::Le => cmp::lt_eq(lhs, rhs),
         FilterOp::Gt => cmp::gt(lhs, rhs),
         FilterOp::Ge => cmp::gt_eq(lhs, rhs),
+        // The text predicates and the null tests are answered in `column_mask` before it reaches
+        // a scalar kernel — there is no Arrow `cmp` for "starts with" or "is null". Listing them
+        // as unreachable keeps the match exhaustive, so a future op cannot be added without
+        // deciding here what it means.
+        FilterOp::Contains
+        | FilterOp::NotContains
+        | FilterOp::StartsWith
+        | FilterOp::EndsWith
+        | FilterOp::In
+        | FilterOp::IsNull
+        | FilterOp::NotNull => {
+            return Err(EngineError::Other(format!(
+                "internal: {op:?} reached the comparison kernel; it is handled in column_mask"
+            )))
+        }
     };
     r.map_err(EngineError::arrow)
 }
