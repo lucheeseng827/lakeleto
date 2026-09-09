@@ -25,7 +25,24 @@ TARGET="${2:-}"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 module_root="$(cd "$here/../.." && pwd)"
-repo_root="$(cd "$module_root/../../.." && pwd)"
+
+# Walk up to the nearest Cargo.toml that declares a [workspace] — the directory
+# cargo resolves against — instead of counting parent hops. In the monorepo that
+# is three levels above the module; on the OSS mirror the module root IS the repo
+# root, and its Cargo.toml gains a [workspace] table at sync time. The old fixed
+# "../../.." was correct only in the monorepo: on the mirror it walked above the
+# checkout and cargo failed with "could not find Cargo.toml".
+repo_root="$module_root"
+probe="$module_root"
+while :; do
+  if [ -f "$probe/Cargo.toml" ] && grep -qE '^\[workspace\]' "$probe/Cargo.toml"; then
+    repo_root="$probe"
+    break
+  fi
+  parent="$(dirname "$probe")"
+  [ "$parent" = "$probe" ] && break
+  probe="$parent"
+done
 
 if [[ -n "$TARGET" ]]; then
     release_dir="$repo_root/target/$TARGET/release"

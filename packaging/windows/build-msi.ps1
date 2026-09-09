@@ -39,7 +39,25 @@ $ErrorActionPreference = 'Stop'
 
 $packagingWindows = Split-Path -Parent $MyInvocation.MyCommand.Path
 $moduleRoot = Resolve-Path (Join-Path $packagingWindows '..\..')
-$repoRoot = Resolve-Path (Join-Path $moduleRoot '..\..\..')
+
+# Walk up to the nearest Cargo.toml that declares a [workspace] - the directory
+# cargo resolves against - instead of counting parent hops. In the monorepo that
+# is three levels above the module; on the OSS mirror the module root IS the repo
+# root, and its Cargo.toml gains a [workspace] table at sync time. The old fixed
+# '..\..\..' was correct only in the monorepo: on the mirror it walked off the
+# checkout to D:\, and cargo failed with "could not find Cargo.toml in D:\".
+$repoRoot = $moduleRoot
+$probe = $moduleRoot
+while ($true) {
+    $manifest = Join-Path $probe 'Cargo.toml'
+    if ((Test-Path $manifest) -and (Select-String -Path $manifest -Pattern '^\[workspace\]' -Quiet)) {
+        $repoRoot = $probe
+        break
+    }
+    $parent = Split-Path -Parent $probe
+    if ([string]::IsNullOrEmpty($parent) -or $parent -eq $probe) { break }
+    $probe = $parent
+}
 $releaseDir = Join-Path $repoRoot 'target\release'
 
 # Keep this in step with `FEATURES` in ops/release.yml, which the installer job
