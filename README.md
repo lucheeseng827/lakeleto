@@ -7,7 +7,7 @@ see the schema, a clean row preview, and per-column profiles **near-instantly** 
 upload, no server, offline. A single static binary that runs on your laptop or inside a
 locked-down CI runner. (`.tsv` is read tab-delimited; `--format tsv` forces it for any name.)
 
-> **Status: v0.1.0 — MVP scaffold (lakeleto).** *Low-Med MVP, "fastest to lovable,"
+> **Status: v0.3.0 — released 2026-10-03 (lakeleto).** *Low-Med MVP, "fastest to lovable,"
 > engine is a commodity → pure UX.* The MVP
 > ships the lean, pure-Rust **local reader** engine (`arrow` + `parquet` + `csv`) behind a
 > single [`Engine`](src/engine/mod.rs) trait, with `schema` / `head` / `profile` / `info`
@@ -15,7 +15,7 @@ locked-down CI runner. (`.tsv` is read tab-delimited; `--format tsv` forces it f
 > opt-in DataFusion **SQL** engine (`--features sql`, read-only), a self-contained **Iceberg**
 > reader (`--features iceberg`), **BYO-credential `s3://`/`gs://`/`az://` reads**
 > (`--features object-store`), and the **Lakeleto Cloud** engine seam (`--features
-> remote`). Last updated 2026-07-13.
+> remote`). Last updated 2026-10-03.
 
 ## Why it exists
 
@@ -394,10 +394,12 @@ Recognised schemes: `s3://` (`s3a://`), `gs://` (`gcs://`), `az://` (`azure://`/
 `GOOGLE_APPLICATION_CREDENTIALS` / `GOOGLE_SERVICE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT_NAME` /
 `AZURE_STORAGE_ACCOUNT_KEY`); S3-compatible stores (MinIO, R2) work via `AWS_ENDPOINT`.
 **Remote Parquet is read with ranged requests** (only the footer + the row groups a window
-touches), so it stays larger-than-memory just like local files; CSV is fetched whole. Every
-`Engine` op — `schema`/`head`/`profile`/grid/`export`/browse — works over a remote URI for
-free. Build without the feature and a URI gets a clear "rebuild with `--features
-object-store`" message rather than a filesystem error.
+touches), so it stays larger-than-memory just like local files. **Remote JSON and CSV stream**:
+a read requests the object and stops the transfer where it stops reading, a located JSON records
+member is fetched by its byte range, and every request is pinned to the version (ETag) the read
+began with. Every `Engine` op — `schema`/`head`/`profile`/grid/`export`/browse — works over a
+remote URI for free. Build without the feature and a URI gets a clear "rebuild
+with `--features object-store`" message rather than a filesystem error.
 
 ## The one idea: an `Engine` trait
 
@@ -407,11 +409,11 @@ Because the engine is a commodity, everything is built around a single trait
 
 | Backend | Feature | Reads | SQL | Role |
 |---------|---------|-------|-----|------|
-| `LocalReaderEngine` | *(default)* | Parquet, CSV | — | lean, pure-Rust MVP engine; compiles in seconds |
-| `DataFusionEngine` | `sql` | Parquet, CSV | ✅ (read-only) | the SQL power engine |
+| `LocalReaderEngine` | *(default)* | Parquet, CSV/TSV, JSON | — | lean, pure-Rust MVP engine; compiles in seconds |
+| `DataFusionEngine` | `sql` | Parquet, CSV/TSV natively; JSON streamed through the local reader; Iceberg/Delta through it, in memory | ✅ (read-only) | the SQL power engine |
 | `RemoteEngine` | `remote` | server-defined | ✅ | the **Lakeleto Cloud** seam |
 | Iceberg reader | `iceberg` | Iceberg | — | self-contained (metadata + Avro manifests → Parquet); merge-on-read **positional + equality deletes** (sequence-number aware), compressed manifests, **schema evolution** (field-id match/cast/null-fill), **statistics/partition pruning** (skip files by manifest bounds) |
-| Object-store reads | `object-store` | remote Parquet/CSV (`s3://`/`gs://`/`az://`) | — | the local engine over your bucket with your own creds; ranged Parquet, zero hosted compute |
+| Object-store reads | `object-store` | remote Parquet/CSV/JSON (`s3://`/`gs://`/`az://`) | — | the local engine over your bucket with your own creds; ranged Parquet, streamed JSON and CSV, zero hosted compute |
 
 **Which engine does the UI get built on first? The local one.** The hosted engine is *not* a
 separate product — it is one more `Engine`, added later, behind the same trait. That is a

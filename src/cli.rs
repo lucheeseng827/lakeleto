@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::context::RequestContext;
 use crate::engine::local::LocalReaderEngine;
 use crate::engine::{Engine, NamedSource};
 use crate::error::{EngineError, Result};
 use crate::render::{self, Output};
-use crate::source::Source;
+use crate::source::{Flatten, Source};
 
 /// Rows a profile scans when nobody says otherwise — the `--scan` default, the
 /// `serve --default-scan` default, and what the desktop launcher serves with.
@@ -58,6 +59,32 @@ pub struct Cli {
     /// no `--format` the server infers it (see `Source::unresolved`).
     #[arg(long, global = true, value_name = "FORMAT")]
     pub format: Option<String>,
+
+    /// Read a JSON source's rows from this place inside the document instead of detecting it:
+    /// a JSON Pointer (`/data`, `/response/items`) or a top-level member name (`data`). `""`
+    /// reads the document as it is, unwrapping nothing.
+    ///
+    /// Without it, a single JSON object with exactly one member holding an array of objects is
+    /// read from that member (`lakeleto schema` shows which). Travels to `--remote-url` as
+    /// `?json_path=`.
+    #[arg(long, global = true, value_name = "POINTER")]
+    pub json_path: Option<String>,
+
+    /// Read struct columns as one column per field, named by its path (`user.geo.lat`), so nested
+    /// data sorts, filters and exports like any other column. `--flatten` spreads every level,
+    /// `--flatten=1` only the first; lists and maps stay whole.
+    ///
+    /// Takes its value after `=` only, so `--flatten data.json` still reads `data.json`. Travels to
+    /// `--remote-url` as `?flatten=`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "LEVELS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "all"
+    )]
+    pub flatten: Option<String>,
 
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -164,17 +191,27 @@ pub enum Cmd {
 
 /// Run the CLI. Returns a process exit code.
 pub fn run(cli: Cli) -> Result<i32> {
+    // A one-shot CLI invocation genuinely has nothing to say about the call: no deadline, no
+    // canceller, no tenant. `detached()` names that rather than pretending otherwise — and it
+    // is the context on which `RequestContext::check` short-circuits, so threading it through
+    // the readers costs a branch here.
+    //
+    // The obvious upgrade is Ctrl-C cancelling the read instead of killing the process
+    // mid-write. That needs a portable signal handler, which std does not have and which is
+    // not worth a dependency on the lean default build; when `serve` is compiled in, its
+    // tokio signal handling could supply one.
+    let ctx = RequestContext::detached();
     match &cli.cmd {
         Cmd::Schema { path } => {
             let source = source_for(&cli, path)?;
             let engine = engine_for(&cli)?;
-            let schema = engine.schema(&source)?;
+            let schema = engine.schema(&ctx, &source)?;
             print!("{}", render::schema(&schema, cli.output)?);
         }
         Cmd::Head { path, rows } => {
             let source = source_for(&cli, path)?;
             let engine = engine_for(&cli)?;
-            let batch = engine.preview(&source, *rows)?;
+            let batch = engine.preview(&ctx, &source, *rows)?;
             print!("{}", render::rows(&batch, cli.output)?);
         }
         Cmd::Profile { path, scan, fast } => {
@@ -182,13 +219,13 @@ pub fn run(cli: Cli) -> Result<i32> {
             let engine = engine_for(&cli)?;
             // `--fast` selects the footer-statistics path (scan_limit 0).
             let scan_limit = if *fast { 0 } else { *scan };
-            let prof = engine.profile(&source, scan_limit)?;
+            let prof = engine.profile(&ctx, &source, scan_limit)?;
             print!("{}", render::profile(&prof, cli.output)?);
         }
         Cmd::Info { path } => {
             let source = source_for(&cli, path)?;
             let engine = engine_for(&cli)?;
-            let schema = engine.schema(&source)?;
+            let schema = engine.schema(&ctx, &source)?;
             let size = std::fs::metadata(&source.path).map(|m| m.len()).ok();
             println!("path   : {}", source.display());
             // An unresolved source has no format *here* — the server resolved the ref and read
@@ -219,8 +256,17 @@ pub fn run(cli: Cli) -> Result<i32> {
         Cmd::Query { sql, tables, file } => {
             let engine = query_engine(&cli)?;
             let named = build_named_sources(&cli, tables, file)?;
-            let batch = engine.query(sql, &named)?;
-            print!("{}", render::rows(&batch, cli.output)?);
+            // Streamed, and uncapped: on your own machine a `SELECT *` you typed is a `SELECT *`
+            // you meant. With `--output csv|tsv|ndjson|json` the rows reach stdout as the engine
+            // produces them, so memory is one batch rather than the whole answer and `| head`
+            // starts printing immediately. `--output table` still collects — column widths are a
+            // property of every row, so alignment cannot begin before the last one arrives.
+            //
+            // An engine that cannot produce incrementally takes the trait's default here and
+            // behaves exactly as it did before.
+            let stream = engine.query_stream(&ctx, sql, &named, None)?;
+            let mut out = std::io::stdout().lock();
+            render::stream_rows(stream, cli.output, &mut out)?;
         }
         #[cfg(feature = "serve")]
         Cmd::Serve {
@@ -411,11 +457,18 @@ fn uses_remote(cli: &Cli) -> bool {
 /// understands travels this way, and a plain path that happens to exist on both machines is
 /// simply one of them.
 fn source_for(cli: &Cli, path: &Path) -> Result<Source> {
-    if uses_remote(cli) {
-        Source::unresolved(path, cli.format.as_deref())
+    let source = if uses_remote(cli) {
+        Source::unresolved(path, cli.format.as_deref())?
     } else {
-        Source::resolve(path, cli.format.as_deref())
-    }
+        Source::resolve(path, cli.format.as_deref())?
+    };
+    let flatten = match cli.flatten.as_deref() {
+        Some(value) => Flatten::parse(value)?,
+        None => None,
+    };
+    Ok(source
+        .with_json_path(cli.json_path.as_deref())?
+        .with_flatten(flatten))
 }
 
 /// Engine for read commands (schema/head/profile/info).
@@ -533,17 +586,23 @@ enum CapState {
 fn render_engines() -> String {
     let mut out = String::from("Lakeleto engine backends:\n\n");
 
-    // The format lists come from the same helper the `Engine::capabilities` surface uses, so
-    // this command and `GET /v1/engines` cannot disagree about what the build can read.
+    // The format lists come from the same helpers the engines' `capabilities()` use, so this
+    // command and `GET /v1/engines` cannot disagree about what the build can read.
     let formats = crate::engine::readable_formats().join(", ");
     out.push_str(&cap_line(
         "local (arrow/parquet/csv)",
         &formats,
         CapState::On,
     ));
+    // The SQL engine's own list, not the local reader's: they answer different questions (today
+    // with the same formats), and this row has to match what `DataFusionEngine::capabilities`
+    // reports.
     out.push_str(&cap_line(
         "sql (DataFusion)",
-        &format!("{formats} + read-only SQL"),
+        &format!(
+            "{} + read-only SQL",
+            crate::engine::sql_readable_formats().join(", ")
+        ),
         feature_state(cfg!(feature = "sql")),
     ));
     // Named by the CONTRACT rather than by any one server, because that is what the engine

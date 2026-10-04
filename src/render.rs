@@ -39,6 +39,84 @@ pub fn rows(rb: &RowBatch, output: Output) -> Result<String> {
     }
 }
 
+/// Write a [`RowStream`] in `output`'s format, one batch at a time, without ever holding the whole
+/// result. Returns the number of rows written.
+///
+/// **Three of the five formats stream; two cannot, and the reason is the format, not the plumbing.**
+/// CSV, TSV and NDJSON are line-oriented — a row's bytes depend on nothing after it — and a JSON
+/// array is `[`, comma-separated values, `]`, which an incremental writer handles. `Table` aligns
+/// columns, and a column's width is a property of every row in the result, so the last row can widen
+/// the first; rendering it means having them all. That is not a limitation worth hiding behind a
+/// streaming signature, so `Table` collects and says so here.
+///
+/// Empty results match the buffered [`rows`] renderer byte for byte: a stream that yields no batches
+/// at all emits `[]` for JSON and nothing for the rest, rather than a bare `[` or a lone header.
+pub fn stream_rows<W: std::io::Write>(
+    stream: crate::engine::RowStream,
+    output: Output,
+    out: &mut W,
+) -> Result<usize> {
+    let delimiter = match output {
+        Output::Csv => Some(b','),
+        Output::Tsv => Some(b'\t'),
+        _ => None,
+    };
+    // Aligned output needs every row before it can place the first one.
+    if matches!(output, Output::Table) {
+        let rb = stream.collect_batch()?;
+        let rows = rb.num_rows();
+        out.write_all(rows_table(&rb).as_bytes())
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        return Ok(rows);
+    }
+
+    let mut iter = stream;
+    let Some(first) = iter.next() else {
+        // No batches at all. The buffered renderer emits `[]` here and nothing for the others;
+        // matching it exactly is what lets a caller switch paths without changing its output.
+        if matches!(output, Output::Json) {
+            out.write_all(b"[]")
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+        }
+        return Ok(0);
+    };
+    let first = first?;
+    let mut rows = first.num_rows();
+
+    if let Some(delimiter) = delimiter {
+        let mut w = arrow_csv::writer::WriterBuilder::new()
+            .with_header(true)
+            .with_delimiter(delimiter)
+            .build(out);
+        w.write(&nested_as_json(&first)?)
+            .map_err(EngineError::arrow)?;
+        for b in iter {
+            let b = b?;
+            rows += b.num_rows();
+            w.write(&nested_as_json(&b)?).map_err(EngineError::arrow)?;
+        }
+    } else if matches!(output, Output::Ndjson) {
+        let mut w = arrow_json::LineDelimitedWriter::new(out);
+        w.write(&first).map_err(EngineError::arrow)?;
+        for b in iter {
+            let b = b?;
+            rows += b.num_rows();
+            w.write(&b).map_err(EngineError::arrow)?;
+        }
+        w.finish().map_err(EngineError::arrow)?;
+    } else {
+        let mut w = arrow_json::ArrayWriter::new(out);
+        w.write(&first).map_err(EngineError::arrow)?;
+        for b in iter {
+            let b = b?;
+            rows += b.num_rows();
+            w.write(&b).map_err(EngineError::arrow)?;
+        }
+        w.finish().map_err(EngineError::arrow)?;
+    }
+    Ok(rows)
+}
+
 fn rows_table(rb: &RowBatch) -> String {
     let opts = FormatOptions::default().with_null("·");
     let headers: Vec<String> = rb
@@ -440,10 +518,48 @@ fn rows_delimited(rb: &RowBatch, delimiter: u8) -> Result<String> {
             .with_delimiter(delimiter)
             .build(&mut buf);
         for b in &rb.batches {
-            w.write(b).map_err(EngineError::arrow)?;
+            w.write(&nested_as_json(b)?).map_err(EngineError::arrow)?;
         }
     }
     String::from_utf8(buf).map_err(|e| EngineError::Other(e.to_string()))
+}
+
+/// `batch` with each nested column — a list, a struct, a map — replaced by its values as JSON
+/// text, so the CSV writer can take it.
+///
+/// A CSV cell holds one value, and Arrow's CSV writer refuses a whole batch over one nested column
+/// ("Nested type List(…) is not supported in CSV"). Each nested cell is written as the compact JSON
+/// the grid shows for it ([`crate::engine::json_text`]) — the form the web app's in-browser CSV
+/// already used — and a null as an empty cell. Columns are picked by Arrow's own
+/// [`DataType::is_nested`](arrow_schema::DataType::is_nested), the test the writer refuses by, so
+/// nothing left in the batch can be refused. Scalar columns pass through and keep the writer's
+/// formatting.
+fn nested_as_json(batch: &arrow_array::RecordBatch) -> Result<arrow_array::RecordBatch> {
+    let schema = batch.schema();
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if column.data_type().is_nested() {
+            fields.push(std::sync::Arc::new(arrow_schema::Field::new(
+                field.name(),
+                arrow_schema::DataType::Utf8,
+                true,
+            )));
+            columns.push(
+                std::sync::Arc::new(crate::engine::json_text(column)?) as arrow_array::ArrayRef
+            );
+        } else {
+            fields.push(field.clone());
+            columns.push(column.clone());
+        }
+    }
+    let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    arrow_array::RecordBatch::try_new_with_options(
+        std::sync::Arc::new(arrow_schema::Schema::new(fields)),
+        columns,
+        &options,
+    )
+    .map_err(EngineError::arrow)
 }
 
 // ---- schema ---------------------------------------------------------------------------
@@ -457,14 +573,17 @@ pub fn schema(s: &TableSchema, output: Output) -> Result<String> {
         .row_count
         .map(|n| n.to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let mut out = format!(
-        "source : {}\nformat : {}\nengine : {}\nrows   : {}\ncolumns: {}\n\n",
-        s.source,
-        s.format,
+    let mut out = format!("source : {}\nformat : {}\n", s.source, s.format);
+    // Only when the rows came from inside the document (`{"data": [...]}`) — say where.
+    if let Some(path) = &s.records_path {
+        out.push_str(&format!("records: {path}\n"));
+    }
+    out.push_str(&format!(
+        "engine : {}\nrows   : {}\ncolumns: {}\n\n",
         s.engine,
         rows_count,
         s.columns.len()
-    );
+    ));
     let name_w = s
         .columns
         .iter()
@@ -990,6 +1109,131 @@ mod tests {
         assert!(json.contains("\"n\":30"), "{json}");
     }
 
+    /// Three rows over a list, a struct and a map: values, nulls, empties, and a string that needs
+    /// escaping both as JSON (`"`) and as CSV (`,`).
+    pub(super) fn nested_rows() -> RowBatch {
+        use arrow_array::builder::{Int64Builder, ListBuilder, MapBuilder, StringBuilder};
+        use arrow_array::StructArray;
+
+        let mut tags = ListBuilder::new(StringBuilder::new());
+        tags.values().append_value("x");
+        tags.values().append_value("y");
+        tags.append(true);
+        tags.append(false);
+        tags.append(true);
+        let tags = tags.finish();
+
+        // Row 2's struct is null over non-null fields — it must read as null, not as the fields.
+        // (The null buffer is borrowed from a `BooleanArray`, so the test need not name its type.)
+        let addr = StructArray::try_new(
+            vec![
+                Field::new("city", DataType::Utf8, true),
+                Field::new("zip", DataType::Utf8, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("KL"), Some("x"), Some("S\"G")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![None, Some("y"), Some("018")])) as ArrayRef,
+            ],
+            BooleanArray::from(vec![Some(true), None, Some(true)])
+                .nulls()
+                .cloned(),
+        )
+        .unwrap();
+
+        let mut m = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        m.keys().append_value("k");
+        m.values().append_value(1);
+        m.append(true).unwrap();
+        m.append(true).unwrap();
+        m.append(false).unwrap();
+        let m = m.finish();
+
+        let sch = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("tags", tags.data_type().clone(), true),
+            Field::new("addr", addr.data_type().clone(), true),
+            Field::new("m", m.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            sch.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![Some("ada"), None, Some("b,c")])),
+                Arc::new(tags),
+                Arc::new(addr),
+                Arc::new(m),
+            ],
+        )
+        .unwrap();
+        RowBatch {
+            schema: sch,
+            batches: vec![batch],
+        }
+    }
+
+    #[test]
+    fn csv_and_tsv_write_a_nested_cell_as_the_json_the_grid_shows() {
+        let rb = nested_rows();
+        assert_eq!(
+            rows(&rb, Output::Csv).unwrap(),
+            concat!(
+                "id,name,tags,addr,m\n",
+                r#"1,ada,"[""x"",""y""]","{""city"":""KL""}","{""k"":1}""#,
+                "\n",
+                "2,,,,{}\n",
+                r#"3,"b,c",[],"{""city"":""S\""G"",""zip"":""018""}","#,
+                "\n",
+            )
+        );
+        // The same cells, tab-separated: `|` stands for the tab, which no value here contains.
+        // With tabs between cells the comma in `b,c` is plain text, so that cell is not quoted.
+        let tsv = concat!(
+            "id|name|tags|addr|m\n",
+            r#"1|ada|"[""x"",""y""]"|"{""city"":""KL""}"|"{""k"":1}""#,
+            "\n",
+            "2||||{}\n",
+            r#"3|b,c|[]|"{""city"":""S\""G"",""zip"":""018""}"|"#,
+            "\n",
+        );
+        assert_eq!(rows(&rb, Output::Tsv).unwrap(), tsv.replace('|', "\t"));
+    }
+
+    /// Arrow's CSV writer refuses a dictionary of nested values as well, so it is written too — by
+    /// the value each key points at, and empty where that value is null, not just where the key is.
+    #[test]
+    fn csv_writes_a_dictionary_of_structs_by_value() {
+        use arrow_array::types::Int8Type;
+        use arrow_array::{DictionaryArray, Int8Array, StructArray};
+
+        let values = StructArray::try_new(
+            vec![Field::new("a", DataType::Int64, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+            BooleanArray::from(vec![Some(true), None]).nulls().cloned(),
+        )
+        .unwrap();
+        let keys = Int8Array::from(vec![Some(0), Some(1), None, Some(0)]);
+        let d = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
+        let sch = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("d", d.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            sch.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4])), Arc::new(d)],
+        )
+        .unwrap();
+        let rb = RowBatch {
+            schema: sch,
+            batches: vec![batch],
+        };
+        assert_eq!(
+            rows(&rb, Output::Csv).unwrap(),
+            "id,d\n1,\"{\"\"a\"\":1}\"\n2,\n3,\n4,\"{\"\"a\"\":1}\"\n"
+        );
+    }
+
     #[test]
     fn arrow_ipc_round_trips_all_null_columns() {
         // An all-null column is where a "clever" encoder is most tempted to drop a buffer.
@@ -1092,5 +1336,169 @@ mod tests {
         let bytes = to_arrow_ipc(&rb).unwrap();
         let cut = &bytes[..bytes.len() - 16];
         assert!(from_arrow_ipc(cut).is_err());
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
+
+    use super::{rows, stream_rows, Output};
+    use crate::engine::{RowBatch, RowStream};
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    /// Several batches, so a streaming writer has to get the joins between them right — the comma
+    /// between two JSON array elements, and the header appearing exactly once in a CSV.
+    fn batches(n: usize, per: usize) -> RowBatch {
+        let mut batches = Vec::new();
+        let mut next = 0i64;
+        for _ in 0..n {
+            let ids: ArrayRef = Arc::new(Int64Array::from(
+                (0..per).map(|i| next + i as i64).collect::<Vec<_>>(),
+            ));
+            let names: ArrayRef = Arc::new(StringArray::from(
+                (0..per)
+                    .map(|i| format!("row-{}", next + i as i64))
+                    .collect::<Vec<_>>(),
+            ));
+            batches.push(RecordBatch::try_new(schema(), vec![ids, names]).unwrap());
+            next += per as i64;
+        }
+        RowBatch {
+            schema: schema(),
+            batches,
+        }
+    }
+
+    fn streamed(rb: &RowBatch, output: Output) -> (String, usize) {
+        let stream = RowStream::from_batch(RowBatch {
+            schema: rb.schema.clone(),
+            batches: rb.batches.clone(),
+        });
+        let mut out = Vec::new();
+        let rows_written = stream_rows(stream, output, &mut out).unwrap();
+        (String::from_utf8(out).unwrap(), rows_written)
+    }
+
+    /// The property that lets a caller switch to the streaming path without its output changing:
+    /// byte-for-byte equality with the buffered renderer, in every format.
+    #[test]
+    fn streamed_output_is_byte_identical_to_the_buffered_renderer() {
+        let rb = batches(4, 3);
+        for output in [
+            Output::Csv,
+            Output::Tsv,
+            Output::Ndjson,
+            Output::Json,
+            Output::Table,
+        ] {
+            let (streamed, rows_written) = streamed(&rb, output);
+            assert_eq!(
+                streamed,
+                rows(&rb, output).unwrap(),
+                "{output:?} differs between the streaming and buffered renderers"
+            );
+            assert_eq!(rows_written, 12, "{output:?} miscounted rows");
+        }
+    }
+
+    /// The joins between batches, asserted directly rather than only via equality — so a change
+    /// that breaks both renderers the same way still fails here.
+    #[test]
+    fn batch_boundaries_do_not_leak_into_the_output() {
+        let rb = batches(3, 2);
+
+        let (csv, _) = streamed(&rb, Output::Csv);
+        assert_eq!(
+            csv.lines().filter(|l| l.starts_with("id,")).count(),
+            1,
+            "the CSV header must appear once, not once per batch: {csv:?}"
+        );
+        assert_eq!(csv.lines().count(), 7, "1 header + 6 rows: {csv:?}");
+
+        let (json, _) = streamed(&rb, Output::Json);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid JSON array");
+        assert_eq!(parsed.len(), 6, "{json}");
+        assert_eq!(parsed[0]["id"], 0);
+        assert_eq!(parsed[5]["id"], 5);
+
+        let (ndjson, _) = streamed(&rb, Output::Ndjson);
+        assert_eq!(ndjson.lines().count(), 6);
+        for line in ndjson.lines() {
+            serde_json::from_str::<serde_json::Value>(line).expect("each line is a JSON object");
+        }
+    }
+
+    /// An empty result is the case where "write as you go" is most tempting to get wrong — a bare
+    /// `[` with no closing bracket, or a header for a table with no rows.
+    #[test]
+    fn an_empty_stream_matches_the_buffered_renderer_too() {
+        let empty = RowBatch {
+            schema: schema(),
+            batches: Vec::new(),
+        };
+        for output in [Output::Csv, Output::Tsv, Output::Ndjson, Output::Json] {
+            let (streamed, rows_written) = streamed(&empty, output);
+            assert_eq!(rows_written, 0);
+            assert_eq!(
+                streamed,
+                rows(&empty, output).unwrap(),
+                "{output:?} differs on an empty result"
+            );
+        }
+        // And the JSON is still a parseable document rather than a truncated one.
+        let (json, _) = streamed(&empty, Output::Json);
+        assert_eq!(
+            serde_json::from_str::<Vec<serde_json::Value>>(&json).unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
+    /// Nested columns stream as they render: each batch is written the same way, and the header
+    /// still appears once.
+    #[test]
+    fn nested_columns_stream_as_they_render() {
+        let one = super::tests::nested_rows();
+        let rb = RowBatch {
+            schema: one.schema.clone(),
+            batches: vec![one.batches[0].slice(0, 2), one.batches[0].slice(2, 1)],
+        };
+        for output in [Output::Csv, Output::Tsv] {
+            let (streamed, rows_written) = streamed(&rb, output);
+            assert_eq!(rows_written, 3, "{output:?} miscounted rows");
+            assert_eq!(
+                streamed,
+                rows(&one, output).unwrap(),
+                "{output:?}: two batches stream as the one they were cut from renders"
+            );
+        }
+    }
+
+    /// An error partway through a stream reaches the caller instead of being written as rows.
+    #[test]
+    fn an_error_mid_stream_propagates_rather_than_truncating_silently() {
+        let schema = schema();
+        let good = batches(1, 2).batches.remove(0);
+        let stream = RowStream::new(
+            schema,
+            vec![
+                Ok(good),
+                Err(crate::error::EngineError::Query("boom".into())),
+            ]
+            .into_iter(),
+        );
+        let mut out = Vec::new();
+        let err = stream_rows(stream, Output::Csv, &mut out)
+            .expect_err("the error must surface, not be swallowed");
+        assert!(err.to_string().contains("boom"), "{err}");
     }
 }

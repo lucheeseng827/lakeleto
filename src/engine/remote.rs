@@ -52,8 +52,9 @@
 use std::io::Read;
 
 use super::{Capabilities, Engine, NamedSource, RowBatch, TableProfile, TableSchema};
+use crate::context::RequestContext;
 use crate::error::{EngineError, Result};
-use crate::source::Source;
+use crate::source::{is_database_uri, Format, Source};
 
 /// The media type that asks a Lakeleto server for rows as an Arrow IPC stream.
 const ARROW_STREAM_MIME: &str = "application/vnd.apache.arrow.stream";
@@ -93,10 +94,45 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 /// any of its own paths. Sending a placeholder instead would be worse than sending nothing — the
 /// contract treats `format` as an explicit **override**, so a guess here becomes an instruction
 /// there, and the peer would be told to misread its own bytes.
+/// Refuse a source whose URI carries a connection credential, before any of it reaches the wire.
+///
+/// Every path below sends `source.uri()` verbatim, because the peer has to resolve the string — so
+/// a database source would hand its password to another server as a query parameter or a JSON
+/// field, and land it in that server's request log. This used to be stated as a caveat on
+/// `wire_params` and left to caller discipline; a caveat is not a control, and the only way for a
+/// reader to know it holds is for the code to enforce it.
+///
+/// Both tests matter. `Format::Database` catches a source the caller resolved explicitly, and
+/// [`is_database_uri`] catches the case the format check alone would miss: a `postgres://…` ref
+/// passed with no `--format` at all, which stays [`Source::unresolved`] and keeps `Format`'s
+/// default.
+fn refuse_database_source(source: &Source) -> Result<()> {
+    if source.format == Format::Database || is_database_uri(&source.uri()) {
+        return Err(EngineError::Forbidden(
+            "the remote engine will not read a database source: its URI carries the connection \
+             credential, and the peer resolves the path verbatim, so sending it would disclose \
+             that credential to another server"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn wire_params(source: &Source) -> Vec<(&'static str, String)> {
-    let mut params = vec![("path", source.display())];
+    // `uri`, not `display`: the peer has to resolve this string, so it travels verbatim. A
+    // database URI must never get this far — `refuse_database_source` above rejects it at every
+    // entry point, which is what makes sending `uri()` here safe.
+    let mut params = vec![("path", source.uri())];
     if !source.is_unresolved() {
         params.push(("format", source.format.to_string()));
+    }
+    // An explicit records path and flattening are the caller's choices, like an explicit format:
+    // they travel.
+    if let Some(json_path) = &source.json_path {
+        params.push(("json_path", json_path.clone()));
+    }
+    if let Some(flatten) = source.flatten {
+        params.push(("flatten", flatten.as_param()));
     }
     params
 }
@@ -157,12 +193,33 @@ impl RemoteEngine {
     /// the information the first step needs: a declared `Content-Length` over the cap is refused
     /// before a single body byte is read, and the read itself is then bounded anyway so a
     /// chunked (or simply lying) response cannot go past it either.
-    fn send(&self, req: reqwest::blocking::RequestBuilder, url: &str) -> Result<Vec<u8>> {
+    fn send(
+        &self,
+        ctx: &RequestContext,
+        req: reqwest::blocking::RequestBuilder,
+        url: &str,
+    ) -> Result<Vec<u8>> {
+        // Never open a connection for work whose answer is already unwanted.
+        ctx.check()?;
         let cap = self.max_response_bytes;
-        let mut resp = self
-            .auth(req)
-            .send()
-            .map_err(|e| EngineError::Remote(format!("request to {url} failed: {e}")))?;
+        // A deadline becomes the request's own timeout, so it bounds the network wait rather
+        // than only being noticed once the bytes are already back. `remaining()` is recomputed
+        // per request, which is what makes an absolute deadline shared across several calls
+        // behave as one budget instead of resetting for each.
+        let req = match ctx.remaining() {
+            Some(left) => req.timeout(left),
+            None => req,
+        };
+        let mut resp = self.auth(req).send().map_err(|e| {
+            // Prefer the context's explanation over the transport's: if the deadline is what
+            // elapsed, "cancelled: the deadline for this request passed" is the true cause and
+            // `Cancelled` is the variant a caller should branch on. A timeout with no deadline
+            // set is the client's own configured timeout and stays a transport error.
+            if e.is_timeout() && ctx.deadline().is_some() {
+                return EngineError::Cancelled(crate::error::CancelReason::Deadline);
+            }
+            EngineError::Remote(format!("request to {url} failed: {e}"))
+        })?;
         let status = resp.status();
         if let Some(declared) = resp.content_length() {
             if declared > cap as u64 {
@@ -203,24 +260,33 @@ impl RemoteEngine {
     /// methods do. It also means the byte cap covers metadata responses too.
     fn get_json<T: serde::de::DeserializeOwned>(
         &self,
+        ctx: &RequestContext,
         path: &str,
         source: &Source,
         extra: &[(&str, String)],
     ) -> Result<T> {
+        refuse_database_source(source)?;
         let url = self.url(path);
         let req = self
             .client
             .get(&url)
             .query(&wire_params(source))
             .query(extra);
-        let body = self.send(req, &url)?;
+        let body = self.send(ctx, req, &url)?;
         serde_json::from_slice(&body)
             .map_err(|e| EngineError::Remote(format!("decoding response from {url}: {e}")))
     }
 
     /// The row twin of [`Self::get_json`]: same `?path=&format=` shape, but asks for — and
     /// decodes — an Arrow IPC stream instead of a JSON rendering.
-    fn get_arrow(&self, path: &str, source: &Source, extra: &[(&str, String)]) -> Result<RowBatch> {
+    fn get_arrow(
+        &self,
+        ctx: &RequestContext,
+        path: &str,
+        source: &Source,
+        extra: &[(&str, String)],
+    ) -> Result<RowBatch> {
+        refuse_database_source(source)?;
         let url = self.url(path);
         let req = self
             .client
@@ -228,7 +294,7 @@ impl RemoteEngine {
             .header(reqwest::header::ACCEPT, ARROW_STREAM_MIME)
             .query(&wire_params(source))
             .query(extra);
-        let body = self.send(req, &url)?;
+        let body = self.send(ctx, req, &url)?;
         crate::render::from_arrow_ipc(&body)
             .map_err(|e| EngineError::Remote(format!("decoding Arrow stream from {url}: {e}")))
     }
@@ -236,25 +302,26 @@ impl RemoteEngine {
     /// `POST /v1/query` — [`Self::get_json`] is GET-only, and the SQL endpoint takes a body.
     ///
     /// [`NamedSource`] is not `Serialize` (it holds a resolved [`Source`]), so the body is built
-    /// by hand from the three fields the endpoint actually reads: the registered name, the
-    /// source's display path, and its format.
+    /// by hand from the fields the endpoint reads: the registered name, and the same path, format
+    /// and read options [`wire_params`] sends for a single source.
     fn post_query(
         &self,
+        ctx: &RequestContext,
         sql: &str,
         tables: &[NamedSource],
         limit: Option<usize>,
     ) -> Result<RowBatch> {
+        for named in tables {
+            refuse_database_source(&named.source)?;
+        }
         let tables: Vec<serde_json::Value> = tables
             .iter()
             .map(|n| {
-                // Same rule as `wire_params`: an unresolved source carries no `format` key at
-                // all, rather than a made-up one the server would be told to honour.
-                let mut spec = serde_json::json!({
-                    "name": n.name,
-                    "path": n.source.display(),
-                });
-                if !n.source.is_unresolved() {
-                    spec["format"] = serde_json::json!(n.source.format.to_string());
+                // The same keys `wire_params` sends, so a table here and a source there cannot
+                // disagree about how it is read — an unresolved source still carries no `format`.
+                let mut spec = serde_json::json!({ "name": n.name });
+                for (key, value) in wire_params(&n.source) {
+                    spec[key] = serde_json::json!(value);
                 }
                 spec
             })
@@ -269,7 +336,7 @@ impl RemoteEngine {
             .post(&url)
             .header(reqwest::header::ACCEPT, ARROW_STREAM_MIME)
             .json(&body);
-        let bytes = self.send(req, &url)?;
+        let bytes = self.send(ctx, req, &url)?;
         crate::render::from_arrow_ipc(&bytes)
             .map_err(|e| EngineError::Remote(format!("decoding Arrow stream from {url}: {e}")))
     }
@@ -299,36 +366,58 @@ impl Engine for RemoteEngine {
             sql: true,
             profile: true,
             remote: true,
+            // Neither is implemented here: `scan` needs a `ScanSpec` encoder (now available —
+            // `FilterSpec::to_wire` — but the method is still unwritten), and `stats` inherits
+            // the filter-dropping default. Both previously read as capable because the struct
+            // had no bit for either, which is how a client discovered the gap by taking a 501.
+            scan: false,
+            filtered_stats: false,
         }
     }
 
-    fn schema(&self, source: &Source) -> Result<TableSchema> {
-        self.get_json("v1/schema", source, &[])
+    fn schema(&self, ctx: &RequestContext, source: &Source) -> Result<TableSchema> {
+        self.get_json(ctx, "v1/schema", source, &[])
     }
 
-    fn preview(&self, source: &Source, limit: usize) -> Result<RowBatch> {
-        self.get_arrow("v1/preview", source, &[("limit", limit.to_string())])
+    fn preview(&self, ctx: &RequestContext, source: &Source, limit: usize) -> Result<RowBatch> {
+        self.get_arrow(ctx, "v1/preview", source, &[("limit", limit.to_string())])
     }
 
-    fn profile(&self, source: &Source, scan_limit: usize) -> Result<TableProfile> {
+    fn profile(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        scan_limit: usize,
+    ) -> Result<TableProfile> {
         // Forward the scan limit so `--fast` (scan=0, footer-stats) and `--scan N` reach the
         // server instead of silently falling back to the server's default scan.
-        self.get_json("v1/profile", source, &[("scan", scan_limit.to_string())])
+        self.get_json(
+            ctx,
+            "v1/profile",
+            source,
+            &[("scan", scan_limit.to_string())],
+        )
     }
 
-    fn query(&self, sql: &str, tables: &[NamedSource]) -> Result<RowBatch> {
+    fn query(&self, ctx: &RequestContext, sql: &str, tables: &[NamedSource]) -> Result<RowBatch> {
         // No `limit` in the body: the server applies its own default and hard ceiling
         // (advertised on `GET /v1/engines` as `limits.default_query_rows` / `max_query_rows`).
         // A remote result is bounded by the plane, not by this client — the wire contract offers
         // no "give me everything", and inventing a large number here would only pretend it does.
-        self.post_query(sql, tables, None)
+        self.post_query(ctx, sql, tables, None)
     }
 
-    fn query_capped(&self, sql: &str, tables: &[NamedSource], cap: usize) -> Result<RowBatch> {
+    fn query_capped(
+        &self,
+        ctx: &RequestContext,
+        sql: &str,
+        tables: &[NamedSource],
+        cap: usize,
+    ) -> Result<RowBatch> {
         // Push the cap into the request rather than trimming a default-sized result locally, so
         // the server can plan with it (a plan-level LIMIT on its SQL engine) and never
         // materialize — or transfer — rows this caller is going to throw away.
-        self.post_query(sql, tables, Some(cap))
+        self.post_query(ctx, sql, tables, Some(cap))
     }
 
     // `scan` — the grid's filter → sort → window over `GET /v1/rows` — is deliberately NOT

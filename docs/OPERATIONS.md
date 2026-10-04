@@ -93,7 +93,11 @@ URIs. A `serve` deployment that must stay on-disk only is naturally covered by `
   the total and fetches windows from `/v1/rows` on scroll, so it browses
   **larger-than-memory Parquet**. Remote Parquet is read with ranged requests (footer +
   only the row groups a window touches); local Parquet reads are windowed the same way.
-  CSV is fetched/scanned whole.
+  A CSV window is read from the file's start as far as the window: from local disk, or as
+  one streamed request to an object store. A JSON window is read the same way, except that
+  one in a records member (`/data`) starts at the member, read by its byte range. A JSON
+  file's first read also learns its layout and schema, in passes of their own, kept per file
+  version; locating a records member reads the whole document.
 - **Bounded scans.** Profiles scan up to `--scan` rows (CLI, default 10k) /
   `--default-scan` (server). Without the `sql` feature, grid sort/filter runs over a
   bounded working set (~200k rows) and the `/v1/rows` response's `bounded` flag marks a

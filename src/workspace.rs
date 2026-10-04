@@ -84,6 +84,16 @@ pub struct SavedQuery {
     pub folder: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Struct flattening the query reads its source with (`all`, or a number of levels) — see
+    /// [`Source::flatten`](crate::source::Source::flatten). Kept with the query because its SQL
+    /// names flattened columns (`"user.name"`) that do not exist without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flatten: Option<String>,
+    /// The JSON records path the query reads its source at (`/data`, or `""` for the whole
+    /// document) — see [`Source::json_path`](crate::source::Source::json_path). Kept with the query
+    /// for the same reason as `flatten`: it decides the rows and columns the SQL is written against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_path: Option<String>,
 }
 
 /// serde `skip_serializing_if` helper: keep the JSON clean by omitting `false` bools.
@@ -132,6 +142,15 @@ pub struct RunRecord {
     pub duration_ms: u64,
     /// Whether a result Parquet was cached for this run (re-openable via `run_result`).
     pub cached: bool,
+    /// Struct flattening the run read its source with (`all`, or a number of levels), when it
+    /// flattened — needed to run its SQL again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flatten: Option<String>,
+    /// The JSON records path the run read its source at, when it was given one — see
+    /// [`Source::json_path`](crate::source::Source::json_path). Like `flatten`, it decides which
+    /// rows and columns the SQL sees, so the run cannot be repeated without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -266,7 +285,7 @@ impl WorkspaceStore for LocalStore {
                 });
             }
         }
-        out.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        out.sort_by_key(|a| std::cmp::Reverse(a.updated_at_ms));
         Ok(out)
     }
 
@@ -595,6 +614,8 @@ mod tests {
             description: None,
             folder: Some("dashboards".into()),
             pinned: false,
+            flatten: None,
+            json_path: None,
         });
         ws.variables.push(Variable {
             key: "city".into(),
@@ -639,6 +660,8 @@ mod tests {
             row_count: Some(3),
             duration_ms: 5,
             cached: true,
+            flatten: None,
+            json_path: None,
         };
         s.append_run(&ws.id, &run, Some(&sample_batch())).unwrap();
 
@@ -670,6 +693,8 @@ mod tests {
                 row_count: Some(3),
                 duration_ms: 1,
                 cached: true,
+                flatten: None,
+                json_path: None,
             },
             Some(&sample_batch()),
         )

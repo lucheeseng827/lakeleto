@@ -131,6 +131,65 @@ pub struct EqualityDelete {
     /// Encoded keys (one per delete row) over the equality columns.
     pub keys: HashSet<String>,
     pub seq: i64,
+    /// The delete file's own partition tuple, in the same shape as [`DataFileEntry::partition`].
+    /// Empty when the delete was written under an unpartitioned spec, in which case it applies
+    /// table-wide. See [`EqualityDelete::applies_to_partition`].
+    pub partition: Vec<Option<PartVal>>,
+}
+
+/// An equality-delete file located during the manifest walk, before its keys are read.
+///
+/// A named struct rather than a tuple because it carries four fields whose order is not
+/// self-evident — and `partition` in particular is easy to lose, which is exactly how the
+/// partition-scope condition came to be missing in the first place.
+struct EqDeleteSpec {
+    path: PathBuf,
+    field_ids: Vec<i32>,
+    seq: i64,
+    partition: Vec<Option<PartVal>>,
+}
+
+impl EqualityDelete {
+    /// The spec's partition-scope condition, which the sequence-number check alone does not cover.
+    ///
+    /// Iceberg v2 scan planning applies a delete file to a data file only when **both** hold: the
+    /// data file's sequence number is strictly lower (implemented at the call site), **and** the
+    /// two share a partition — or the delete file is unpartitioned. Without the second half an
+    /// equality delete written for `region=EU` also deletes the matching keys out of `region=US`,
+    /// which is a silent over-delete: rows vanish, no error is raised, and the row count is still
+    /// presented as exact.
+    ///
+    /// **Precondition: both tuples come from the same partition spec.** Nothing in a tuple records
+    /// which spec produced it, so the caller establishes that — see `TablePlan::single_partition_spec`
+    /// and the filter in `engine/local.rs`. Comparing tuples across specs is not merely imprecise:
+    /// two same-arity tuples can be over different source columns, so "provably different" would be
+    /// a false conclusion in the unsafe direction.
+    ///
+    /// Conservative in the direction this module already chose. `PartVal` decodes only ints and
+    /// strings, so a slot is `None` for a null value *or* for a type this reader does not model —
+    /// and those two cases are indistinguishable here. A delete is therefore skipped **only when
+    /// the two tuples are provably different**: same arity, and some slot where both sides are
+    /// decoded and unequal. Anything less certain keeps the previous behaviour of applying the
+    /// delete, because under-reporting live rows is recoverable while resurfacing deleted rows is
+    /// the failure this file refuses elsewhere (see the `content == 1` arm of `plan`).
+    pub fn applies_to_partition(&self, data_partition: &[Option<PartVal>]) -> bool {
+        if self.partition.is_empty() {
+            return true; // unpartitioned delete spec — applies table-wide
+        }
+        if self.partition.len() != data_partition.len() {
+            return true; // spec evolution or a shape we cannot line up — cannot prove difference
+        }
+        let provably_different =
+            self.partition
+                .iter()
+                .zip(data_partition)
+                .any(|(d, f)| match (d, f) {
+                    (Some(d), Some(f)) => d != f,
+                    // A `None` on either side is "unknown", never "equal to the other side".
+                    _ => false,
+                });
+        !provably_different
+    }
 }
 
 /// A column of the table's **current** schema (field-id, name, nullability, and the Arrow type
@@ -167,6 +226,14 @@ pub struct TablePlan {
     /// an ORC/Avro data file in a migrated table is dropped). Surfaced so callers know row counts
     /// may under-report rather than silently trusting an incomplete plan.
     pub skipped_non_parquet: usize,
+    /// Can a partition tuple in this table be attributed to a single partition spec?
+    ///
+    /// True when the metadata declares at most one spec. Partition tuples here carry no spec id, so
+    /// comparing two of them is only sound when there is only one spec they could belong to; see
+    /// [`EqualityDelete::applies_to_partition`] and its caller in `engine/local.rs`. `false` is the
+    /// conservative value and therefore the right `Default`: it makes the reader apply deletes it
+    /// cannot scope rather than skip them.
+    pub single_partition_spec: bool,
     /// The table's `format-version` (1, 2, or 3). Iceberg v3 is GA across the major platforms as
     /// of 2026 and adds features this reader does not model — **deletion vectors** (refused at
     /// plan time, see below), row lineage, and the VARIANT/GEOMETRY types. Recorded so callers can
@@ -263,7 +330,7 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
     #[allow(clippy::type_complexity)]
     let mut data_files: Vec<(PathBuf, i64, FileStats, Vec<Option<PartVal>>)> = Vec::new();
     let mut pos_delete_files: Vec<PathBuf> = Vec::new();
-    let mut eq_delete_specs: Vec<(PathBuf, Vec<i32>, i64)> = Vec::new();
+    let mut eq_delete_specs: Vec<EqDeleteSpec> = Vec::new();
     let mut skipped_non_parquet = 0usize;
     // Delete files this reader cannot parse — in practice **Iceberg v3 deletion vectors**, which
     // are Puffin blobs (`file_format = "puffin"`) carried in a delete manifest. Dropping a *data*
@@ -297,7 +364,12 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
                     std::mem::take(&mut e.partition),
                 )),
                 (1, 1) => pos_delete_files.push(guard(&e.file_path)?),
-                (1, 2) => eq_delete_specs.push((guard(&e.file_path)?, e.equality_ids, seq)),
+                (1, 2) => eq_delete_specs.push(EqDeleteSpec {
+                    path: guard(&e.file_path)?,
+                    field_ids: std::mem::take(&mut e.equality_ids),
+                    seq,
+                    partition: std::mem::take(&mut e.partition),
+                }),
                 _ => {}
             }
         }
@@ -316,15 +388,16 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
 
     // Read every equality-delete file into its key set over the equality columns.
     let mut equality_deletes = Vec::new();
-    for (path, field_ids, seq) in eq_delete_specs {
-        if field_ids.is_empty() {
+    for spec in eq_delete_specs {
+        if spec.field_ids.is_empty() {
             continue;
         }
-        let keys = read_equality_delete_keys(&path, &field_ids)?;
+        let keys = read_equality_delete_keys(&spec.path, &spec.field_ids)?;
         equality_deletes.push(EqualityDelete {
-            field_ids,
+            field_ids: spec.field_ids,
             keys,
-            seq,
+            seq: spec.seq,
+            partition: spec.partition,
         });
     }
 
@@ -395,9 +468,27 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
         schema: parse_current_schema(&meta),
         equality_deletes,
         partition_spec: parse_partition_spec(&meta),
+        single_partition_spec: has_single_partition_spec(&meta),
         skipped_non_parquet,
         format_version,
     })
+}
+
+/// Does the metadata declare at most one partition spec?
+///
+/// This reader stores each file's partition tuple as bare values with no spec id, so two tuples are
+/// comparable only when the table has never evolved its spec. With two specs, `[EU]` written under
+/// spec 0 and `[US]` under spec 1 need not even be tuples over the same source column, so
+/// concluding they differ would skip an equality delete that should apply — and resurfacing deleted
+/// rows is the one direction this module refuses.
+///
+/// v1 metadata carries a single `partition-spec` and no history, so its absence of
+/// `partition-specs` means one spec, not an unknown number.
+fn has_single_partition_spec(meta: &serde_json::Value) -> bool {
+    match meta.get("partition-specs").and_then(|v| v.as_array()) {
+        Some(specs) => specs.len() <= 1,
+        None => true,
+    }
 }
 
 /// Parse the default partition spec (v2 `partition-specs` + `default-spec-id`, else v1
@@ -509,14 +600,14 @@ fn iceberg_type_to_arrow(t: &serde_json::Value) -> Option<DataType> {
                 .and_then(|r| r.strip_suffix(']'))
             {
                 DataType::FixedSizeBinary(n.trim().parse().ok()?)
-            } else if let Some(inner) = other
-                .strip_prefix("decimal(")
-                .and_then(|r| r.strip_suffix(')'))
-            {
+            } else {
+                // Anything that is not `fixed[..]` has to be `decimal(p,s)`; `?` on the prefix
+                // strip is what turns an unrecognised type name into `None`.
+                let inner = other
+                    .strip_prefix("decimal(")
+                    .and_then(|r| r.strip_suffix(')'))?;
                 let (p, sc) = inner.split_once(',')?;
                 DataType::Decimal128(p.trim().parse().ok()?, sc.trim().parse().ok()?)
-            } else {
-                return None;
             }
         }
     })
@@ -616,20 +707,82 @@ fn current_metadata(table_dir: &Path) -> Result<PathBuf> {
         }
     }
     // Fall back to the highest-versioned metadata file.
-    let mut best: Option<(u64, PathBuf)> = None;
+    //
+    // The tie-break is load-bearing, not tidiness. `metadata_version` takes the leading digits,
+    // so the `<version>-<uuid>.metadata.json` naming that Hive- and Glue-style writers use puts
+    // several files at the SAME version in one directory. Comparing with `>` alone let whichever
+    // one `read_dir` happened to yield first win — and `read_dir` order is filesystem-dependent,
+    // so the same table could resolve to a different snapshot on two machines, or on the same
+    // machine after a copy. Ordering by `(version, file name)` makes the choice stable.
+    //
+    // Stable is not the same as correct: a uuid carries no ordering, so with a tie there is no
+    // way to tell which of them is current. That is a table that needs a `version-hint.text` or
+    // a catalog, and the read says so rather than quietly picking one.
+    let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(&mdir)? {
         let p = entry?.path();
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if let Some(ver) = metadata_version(name) {
-            if best.as_ref().map(|(v, _)| ver > *v).unwrap_or(true) {
-                best = Some((ver, p));
+            candidates.push((ver, p));
+        }
+    }
+    candidates.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.file_name().cmp(&b.1.file_name()))
+    });
+    let Some((top_version, chosen)) = candidates.pop() else {
+        return Err(EngineError::UnsupportedFormat {
+            detail: format!("iceberg: no *.metadata.json under {}", mdir.display()),
+        });
+    };
+    let tied: Vec<&PathBuf> = candidates
+        .iter()
+        .rev()
+        .take_while(|(v, _)| *v == top_version)
+        .map(|(_, p)| p)
+        .collect();
+
+    // A tie is only a problem when the tied files disagree about what is current. Several
+    // `<version>-<uuid>.metadata.json` naming the same `current-snapshot-id` describe one state,
+    // and reading any of them is correct — that is a leftover file, not an ambiguous table, and
+    // refusing it would reject tables that are perfectly well-defined.
+    //
+    // Genuine disagreement is different in kind: two files claim the same version and different
+    // current snapshots, so nothing in the directory says which one the table is at, and the
+    // greatest file name is a coin flip dressed as an answer. A uuid carries no ordering. This
+    // used to warn on stderr and read one anyway, which is not a control — under `lakeleto serve`
+    // that warning reaches a log nobody is reading per request, while the caller receives rows
+    // that may be from the wrong snapshot with nothing marking them as such. Refusing is the same
+    // choice this reader makes for deletion vectors: say what is missing, rather than answer
+    // confidently from an unverified state.
+    if !tied.is_empty() {
+        let snapshot_of = |p: &Path| -> Result<Option<i64>> {
+            let v: serde_json::Value = serde_json::from_reader(BufReader::new(File::open(p)?))
+                .map_err(|e| EngineError::UnsupportedFormat {
+                    detail: format!("iceberg: {} is not readable metadata: {e}", p.display()),
+                })?;
+            Ok(v.get("current-snapshot-id").and_then(|x| x.as_i64()))
+        };
+        let want = snapshot_of(&chosen)?;
+        for other in &tied {
+            if snapshot_of(other)? != want {
+                return Err(EngineError::UnsupportedFormat {
+                    detail: format!(
+                        "iceberg: {} holds {} metadata files at version {top_version} that name \
+                         different current snapshots ({} and {}), and there is no \
+                         metadata/version-hint.text to say which is current. Refusing rather than \
+                         reading one at random — add metadata/version-hint.text, or read this \
+                         table through its catalog.",
+                        mdir.display(),
+                        tied.len() + 1,
+                        chosen.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        other.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                    ),
+                });
             }
         }
     }
-    best.map(|(_, p)| p)
-        .ok_or_else(|| EngineError::UnsupportedFormat {
-            detail: format!("iceberg: no *.metadata.json under {}", mdir.display()),
-        })
+    Ok(chosen)
 }
 
 /// Parse the version out of a metadata filename (`v3.metadata.json` / `3.metadata.json`).
@@ -1281,10 +1434,9 @@ fn murmur3_32(data: &[u8]) -> u32 {
     const C1: u32 = 0xcc9e_2d51;
     const C2: u32 = 0x1b87_3593;
     let mut h: u32 = 0;
-    let chunks = data.chunks_exact(4);
-    let tail = chunks.remainder();
-    for c in chunks {
-        let mut k = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+    let (blocks, tail) = data.as_chunks::<4>();
+    for c in blocks {
+        let mut k = u32::from_le_bytes(*c);
         k = k.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
         h ^= k;
         h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
@@ -1351,6 +1503,10 @@ pub fn prune(plan: &TablePlan, filters: &[FilterSpec]) -> (TablePlan, usize) {
             schema: plan.schema.clone(),
             equality_deletes: plan.equality_deletes.clone(),
             partition_spec: plan.partition_spec.clone(),
+            // Carried, not recomputed: pruning drops files, it does not change how many partition
+            // specs the table has, and defaulting this to `false` here would silently widen every
+            // pruned scan's deletes.
+            single_partition_spec: plan.single_partition_spec,
             skipped_non_parquet: plan.skipped_non_parquet,
             format_version: plan.format_version,
         },
@@ -1537,6 +1693,229 @@ mod tests {
         assert_eq!(
             transform_value(&Transform::Day, &ts, "1970-01-02T23:59:59"),
             Some(PartVal::Int(1))
+        );
+    }
+
+    /// Helper: an equality delete carrying a partition tuple.
+    fn eq_delete(partition: Vec<Option<PartVal>>) -> EqualityDelete {
+        EqualityDelete {
+            field_ids: vec![1],
+            keys: HashSet::new(),
+            seq: 10,
+            partition,
+        }
+    }
+
+    /// An unpartitioned delete spec applies table-wide — the pre-existing behaviour, and the
+    /// only case in which a delete legitimately reaches every file.
+    #[test]
+    fn unpartitioned_equality_delete_applies_everywhere() {
+        let d = eq_delete(vec![]);
+        assert!(d.applies_to_partition(&[]));
+        assert!(d.applies_to_partition(&[Some(PartVal::Str("EU".into()))]));
+        assert!(d.applies_to_partition(&[Some(PartVal::Int(3)), None]));
+    }
+
+    /// The bug this fixes: a delete written for one partition must not delete matching keys out
+    /// of another. Before the partition-scope check, both of these returned true.
+    #[test]
+    fn equality_delete_does_not_cross_partitions() {
+        let eu = eq_delete(vec![Some(PartVal::Str("EU".into()))]);
+        assert!(eu.applies_to_partition(&[Some(PartVal::Str("EU".into()))]));
+        assert!(!eu.applies_to_partition(&[Some(PartVal::Str("US".into()))]));
+
+        let bucket7 = eq_delete(vec![Some(PartVal::Int(7))]);
+        assert!(bucket7.applies_to_partition(&[Some(PartVal::Int(7))]));
+        assert!(!bucket7.applies_to_partition(&[Some(PartVal::Int(8))]));
+    }
+
+    /// Multi-field specs: differing in ANY decoded slot is proof enough to skip.
+    #[test]
+    fn equality_delete_multi_field_partition() {
+        let d = eq_delete(vec![
+            Some(PartVal::Str("EU".into())),
+            Some(PartVal::Int(2026)),
+        ]);
+        assert!(
+            d.applies_to_partition(&[Some(PartVal::Str("EU".into())), Some(PartVal::Int(2026))])
+        );
+        assert!(
+            !d.applies_to_partition(&[Some(PartVal::Str("EU".into())), Some(PartVal::Int(2025))])
+        );
+        assert!(
+            !d.applies_to_partition(&[Some(PartVal::Str("US".into())), Some(PartVal::Int(2026))])
+        );
+    }
+
+    /// The conservative direction, stated as a test because it is a deliberate asymmetry: an
+    /// undecoded slot (`None` — a null value, or a partition type this reader does not model) is
+    /// "unknown", never "equal". Unknown keeps the delete, because resurfacing a deleted row is
+    /// the failure this module refuses elsewhere, while dropping a live row is recoverable.
+    #[test]
+    fn undecoded_partition_slots_keep_the_delete() {
+        let d = eq_delete(vec![None]);
+        assert!(d.applies_to_partition(&[Some(PartVal::Str("EU".into()))]));
+
+        let d = eq_delete(vec![Some(PartVal::Str("EU".into()))]);
+        assert!(d.applies_to_partition(&[None]));
+        assert!(
+            d.applies_to_partition(&[None, Some(PartVal::Int(1))]),
+            "arity mismatch keeps it"
+        );
+    }
+
+    /// Same-version metadata files must resolve identically on every run and every filesystem.
+    /// `<version>-<uuid>` naming puts several files at one version, and before the tie-break the
+    /// winner was whichever `read_dir` yielded first.
+    #[test]
+    fn current_metadata_tie_breaks_deterministically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mdir = dir.path().join("metadata");
+        std::fs::create_dir_all(&mdir).expect("mkdir");
+        // Written in an order that does not match the sorted order, so a read_dir-order
+        // implementation has a good chance of disagreeing with the expected answer.
+        for name in [
+            "00003-ffff.metadata.json",
+            "00002-zzzz.metadata.json",
+            "00003-aaaa.metadata.json",
+            "00003-cccc.metadata.json",
+        ] {
+            std::fs::write(mdir.join(name), "{}").expect("write");
+        }
+        let chosen = current_metadata(dir.path()).expect("resolve");
+        assert_eq!(
+            chosen.file_name().and_then(|n| n.to_str()),
+            Some("00003-ffff.metadata.json"),
+            "highest version, then greatest file name"
+        );
+        // And it is stable across repeated calls.
+        for _ in 0..5 {
+            assert_eq!(current_metadata(dir.path()).expect("resolve"), chosen);
+        }
+    }
+
+    /// `version-hint.text` still wins over the fallback — the tie-break is only for its absence.
+    #[test]
+    fn version_hint_beats_the_tie_break() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mdir = dir.path().join("metadata");
+        std::fs::create_dir_all(&mdir).expect("mkdir");
+        std::fs::write(mdir.join("v7.metadata.json"), "{}").expect("write");
+        std::fs::write(mdir.join("v9.metadata.json"), "{}").expect("write");
+        std::fs::write(mdir.join("version-hint.text"), "7\n").expect("write");
+        assert_eq!(
+            current_metadata(dir.path())
+                .expect("resolve")
+                .file_name()
+                .and_then(|n| n.to_str()),
+            Some("v7.metadata.json"),
+        );
+    }
+}
+
+#[cfg(test)]
+mod partition_spec_identity_tests {
+    use super::*;
+
+    /// One spec, or v1's single `partition-spec`, means a tuple is attributable; two specs mean it
+    /// is not, and the reader must stop trusting tuple comparisons.
+    #[test]
+    fn spec_uniqueness_is_read_from_the_metadata() {
+        let one = serde_json::json!({ "partition-specs": [{ "spec-id": 0, "fields": [] }] });
+        assert!(has_single_partition_spec(&one));
+
+        let evolved = serde_json::json!({
+            "partition-specs": [
+                { "spec-id": 0, "fields": [] },
+                { "spec-id": 1, "fields": [] },
+            ]
+        });
+        assert!(
+            !has_single_partition_spec(&evolved),
+            "a table with two specs cannot attribute a bare partition tuple to either"
+        );
+
+        // v1 carries one `partition-spec` and no history of them; absence is one spec, not unknown.
+        let v1 =
+            serde_json::json!({ "partition-spec": [{ "source-id": 1, "transform": "identity" }] });
+        assert!(has_single_partition_spec(&v1));
+    }
+
+    /// The conservative value has to be the `Default`, because a plan built any other way than by
+    /// `plan_inner` must not be assumed to have a stable spec.
+    #[test]
+    fn the_default_plan_does_not_claim_a_unique_spec() {
+        assert!(!TablePlan::default().single_partition_spec);
+    }
+}
+
+#[cfg(test)]
+mod metadata_tie_tests {
+    use super::*;
+
+    fn table_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mdir = dir.path().join("metadata");
+        std::fs::create_dir_all(&mdir).expect("mkdir");
+        for (name, body) in files {
+            std::fs::write(mdir.join(name), body).expect("write");
+        }
+        dir
+    }
+
+    /// Duplicates that name the same snapshot describe one state, so reading either is correct.
+    /// Refusing these would reject well-defined tables over a leftover file.
+    #[test]
+    fn tied_metadata_naming_the_same_snapshot_still_reads() {
+        let dir = table_with(&[
+            ("00007-aaaa.metadata.json", r#"{"current-snapshot-id": 42}"#),
+            ("00007-bbbb.metadata.json", r#"{"current-snapshot-id": 42}"#),
+        ]);
+        let chosen = current_metadata(dir.path()).expect("agreeing duplicates must resolve");
+        assert_eq!(
+            chosen.file_name().and_then(|n| n.to_str()),
+            Some("00007-bbbb.metadata.json"),
+            "still the deterministic choice: highest version, then greatest file name"
+        );
+    }
+
+    /// Two files at the same version naming *different* snapshots leave nothing in the directory
+    /// to say which the table is at. The old code warned on stderr and read one anyway; under
+    /// `serve` that reaches a log nobody reads per request while the caller gets rows from a
+    /// possibly-wrong snapshot. It must refuse instead.
+    #[test]
+    fn tied_metadata_naming_different_snapshots_is_refused() {
+        let dir = table_with(&[
+            ("00007-aaaa.metadata.json", r#"{"current-snapshot-id": 42}"#),
+            ("00007-bbbb.metadata.json", r#"{"current-snapshot-id": 99}"#),
+        ]);
+        let err = current_metadata(dir.path()).expect_err("a contradictory tie must not resolve");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("different current snapshots"),
+            "the error must name the actual problem: {msg}"
+        );
+        assert!(
+            msg.contains("version-hint.text"),
+            "and the remedy the reader needs: {msg}"
+        );
+    }
+
+    /// `version-hint.text` is authoritative, so a contradiction below it is not consulted at all.
+    #[test]
+    fn a_version_hint_resolves_what_would_otherwise_be_a_contradiction() {
+        let dir = table_with(&[
+            ("00007-aaaa.metadata.json", r#"{"current-snapshot-id": 42}"#),
+            ("00007-bbbb.metadata.json", r#"{"current-snapshot-id": 99}"#),
+            ("v7.metadata.json", r#"{"current-snapshot-id": 7}"#),
+            ("version-hint.text", "7\n"),
+        ]);
+        assert_eq!(
+            current_metadata(dir.path())
+                .expect("the hint decides")
+                .file_name()
+                .and_then(|n| n.to_str()),
+            Some("v7.metadata.json")
         );
     }
 }

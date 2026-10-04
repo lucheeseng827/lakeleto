@@ -19,6 +19,7 @@ use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use parquet::arrow::ArrowWriter;
 
 use lakeleto::engine::{Engine, FilterOp, FilterSpec, ScanSpec};
+use lakeleto::RequestContext;
 use lakeleto::{Format, LocalReaderEngine, Source};
 
 const MANIFEST_LIST_SCHEMA: &str = r#"{"type":"record","name":"manifest_file","fields":[
@@ -267,12 +268,14 @@ fn reads_a_minimal_iceberg_table() {
 
     let engine = LocalReaderEngine::default();
 
-    let schema = engine.schema(&source).unwrap();
+    let schema = engine.schema(&RequestContext::detached(), &source).unwrap();
     assert_eq!(schema.row_count, Some(3), "sum of data-file footers");
     let cols: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(cols, vec!["id", "name"]);
 
-    let preview = engine.preview(&source, 2).unwrap();
+    let preview = engine
+        .preview(&RequestContext::detached(), &source, 2)
+        .unwrap();
     assert_eq!(preview.num_rows(), 2);
     let ids = preview.batches[0]
         .column_by_name("id")
@@ -292,6 +295,7 @@ fn iceberg_windowed_scan_offsets() {
 
     let res = LocalReaderEngine::default()
         .scan(
+            &RequestContext::detached(),
             &source,
             &ScanSpec {
                 offset: 1,
@@ -425,11 +429,13 @@ fn applies_positional_deletes_over_compressed_manifests() {
     let engine = LocalReaderEngine::default();
 
     // row count reflects the delete: 4 physical − 1 deleted = 3 live.
-    let schema = engine.schema(&source).unwrap();
+    let schema = engine.schema(&RequestContext::detached(), &source).unwrap();
     assert_eq!(schema.row_count, Some(3), "4 rows − 1 positional delete");
 
     // preview skips the deleted physical position 1 (id=2 "grace").
-    let preview = engine.preview(&source, 10).unwrap();
+    let preview = engine
+        .preview(&RequestContext::detached(), &source, 10)
+        .unwrap();
     let ids: Vec<i64> = preview
         .batches
         .iter()
@@ -682,10 +688,12 @@ fn applies_equality_deletes_respecting_sequence_numbers() {
     let engine = LocalReaderEngine::default();
 
     // count is unknown (equality deletes remove by value, not cheaply countable).
-    let schema = engine.schema(&source).unwrap();
+    let schema = engine.schema(&RequestContext::detached(), &source).unwrap();
     assert_eq!(schema.row_count, None);
 
-    let preview = engine.preview(&source, 10).unwrap();
+    let preview = engine
+        .preview(&RequestContext::detached(), &source, 10)
+        .unwrap();
     let ids: Vec<i64> = preview
         .batches
         .iter()
@@ -715,12 +723,14 @@ fn unifies_evolved_schemas_by_field_id() {
     let engine = LocalReaderEngine::default();
 
     // schema reflects the current table schema (id long, name string, score int).
-    let schema = engine.schema(&source).unwrap();
+    let schema = engine.schema(&RequestContext::detached(), &source).unwrap();
     let cols: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(cols, vec!["id", "name", "score"]);
     assert_eq!(schema.row_count, Some(3));
 
-    let preview = engine.preview(&source, 10).unwrap();
+    let preview = engine
+        .preview(&RequestContext::detached(), &source, 10)
+        .unwrap();
     // id: file A promoted Int32→Int64, file B native Int64.
     let ids: Vec<i64> = preview
         .batches
@@ -788,6 +798,7 @@ fn positional_delete_windowed_scan_maps_logical_rows() {
     // Logical rows after delete are [1, 3, 4]; offset 1 → [3, 4].
     let res = LocalReaderEngine::default()
         .scan(
+            &RequestContext::detached(),
             &source,
             &ScanSpec {
                 offset: 1,
@@ -996,7 +1007,11 @@ fn prunes_data_files_by_column_bounds() {
 
     // x > 150 → only file C (200..210) can match; A and B are skipped by their upper bounds.
     let res = engine
-        .scan(&source, &filter("x", FilterOp::Gt, "150"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("x", FilterOp::Gt, "150"),
+        )
         .unwrap();
     assert_eq!(
         res.scanned_rows, 11,
@@ -1007,14 +1022,22 @@ fn prunes_data_files_by_column_bounds() {
 
     // x = 105 → only file B ([100..110]) survives.
     let res = engine
-        .scan(&source, &filter("x", FilterOp::Eq, "105"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("x", FilterOp::Eq, "105"),
+        )
         .unwrap();
     assert_eq!(res.scanned_rows, 11, "only file B read");
     assert_eq!(res.matched_rows, 1);
 
     // x > 1000 → every file pruned → empty, exact, no error.
     let res = engine
-        .scan(&source, &filter("x", FilterOp::Gt, "1000"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("x", FilterOp::Gt, "1000"),
+        )
         .unwrap();
     assert_eq!(res.scanned_rows, 0);
     assert_eq!(res.matched_rows, 0);
@@ -1072,7 +1095,11 @@ fn nan_disables_unsafe_float_pruning_but_allows_it_when_nan_free() {
 
     // y != 5 : the NaN row matches (NaN != 5 is true) — the file must NOT be pruned.
     let res = engine
-        .scan(&src_nan, &filter("y", FilterOp::Ne, "5"))
+        .scan(
+            &RequestContext::detached(),
+            &src_nan,
+            &filter("y", FilterOp::Ne, "5"),
+        )
         .unwrap();
     assert_eq!(
         res.scanned_rows, 2,
@@ -1082,7 +1109,11 @@ fn nan_disables_unsafe_float_pruning_but_allows_it_when_nan_free() {
 
     // y > 100 : under Arrow total order NaN is the max, so NaN matches — must NOT be pruned.
     let res = engine
-        .scan(&src_nan, &filter("y", FilterOp::Gt, "100"))
+        .scan(
+            &RequestContext::detached(),
+            &src_nan,
+            &filter("y", FilterOp::Gt, "100"),
+        )
         .unwrap();
     assert_eq!(
         res.scanned_rows, 2,
@@ -1108,7 +1139,11 @@ fn nan_disables_unsafe_float_pruning_but_allows_it_when_nan_free() {
     );
     let src_z = Source::detect(&tblz).unwrap();
     let res = engine
-        .scan(&src_z, &filter("y", FilterOp::Gt, "100"))
+        .scan(
+            &RequestContext::detached(),
+            &src_z,
+            &filter("y", FilterOp::Gt, "100"),
+        )
         .unwrap();
     assert_eq!(
         res.scanned_rows, 0,
@@ -1154,7 +1189,11 @@ fn prunes_all_null_files() {
     let engine = LocalReaderEngine::default();
     // x = 5 : the all-null file can't match any op → skipped; only the value file is read.
     let res = engine
-        .scan(&source, &filter("x", FilterOp::Eq, "5"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("x", FilterOp::Eq, "5"),
+        )
         .unwrap();
     assert_eq!(res.scanned_rows, 1, "all-null file skipped");
     assert_eq!(res.matched_rows, 1);
@@ -1163,7 +1202,11 @@ fn prunes_all_null_files() {
     // row matches, so pruning it would return zero rows for data sitting on disk — a silently
     // wrong answer, not a missed optimisation. It must be read, and its three rows must match.
     let res = engine
-        .scan(&source, &filter("x", FilterOp::IsNull, ""))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("x", FilterOp::IsNull, ""),
+        )
         .unwrap();
     assert_eq!(
         res.matched_rows, 3,
@@ -1173,7 +1216,11 @@ fn prunes_all_null_files() {
     // `x IS NOT NULL` prunes it safely — an all-null file has no matching row by definition —
     // and the answer is still exact.
     let res = engine
-        .scan(&source, &filter("x", FilterOp::NotNull, ""))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("x", FilterOp::NotNull, ""),
+        )
         .unwrap();
     assert_eq!(res.scanned_rows, 1, "all-null file skipped for NotNull");
     assert_eq!(res.matched_rows, 1);
@@ -1181,7 +1228,11 @@ fn prunes_all_null_files() {
     // The text predicates compare values, and a null is not a match in either direction — so the
     // all-null file prunes for `notcontains` too, WITHOUT surfacing its rows as "not containing".
     let res = engine
-        .scan(&source, &filter("x", FilterOp::NotContains, "9"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("x", FilterOp::NotContains, "9"),
+        )
         .unwrap();
     assert_eq!(
         res.matched_rows, 1,
@@ -1247,7 +1298,11 @@ fn prunes_decimal_columns() {
     let engine = LocalReaderEngine::default();
     // price > 75 → file A (max 50.00) pruned, file B kept.
     let res = engine
-        .scan(&source, &filter("price", FilterOp::Gt, "75"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("price", FilterOp::Gt, "75"),
+        )
         .unwrap();
     assert_eq!(
         res.scanned_rows, 2,
@@ -1310,7 +1365,11 @@ fn prunes_date_columns() {
     let engine = LocalReaderEngine::default();
     // d >= <day 500> → file A (max day 200) pruned lexically, file B kept.
     let res = engine
-        .scan(&source, &filter("d", FilterOp::Ge, &day_str(500)))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("d", FilterOp::Ge, &day_str(500)),
+        )
         .unwrap();
     assert_eq!(
         res.scanned_rows, 2,
@@ -1362,7 +1421,11 @@ fn skips_row_groups_within_a_file() {
     let engine = LocalReaderEngine::default();
     // x > 1500 → only the third row group ([2000..2099]) can match.
     let res = engine
-        .scan(&source, &filter("x", FilterOp::Gt, "1500"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("x", FilterOp::Gt, "1500"),
+        )
         .unwrap();
     assert_eq!(
         res.scanned_rows, 100,
@@ -1372,7 +1435,11 @@ fn skips_row_groups_within_a_file() {
 
     // A filter matching everything reads all three row groups (no skipping).
     let res = engine
-        .scan(&source, &filter("x", FilterOp::Ge, "0"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("x", FilterOp::Ge, "0"),
+        )
         .unwrap();
     assert_eq!(res.scanned_rows, 300, "no row group excluded");
 }
@@ -1471,7 +1538,11 @@ fn prunes_by_bucket_partition() {
 
     // id = 34 → bucket 3 → only file A (bucket 3) can match; file B (bucket 5) is pruned.
     let res = engine
-        .scan(&source, &filter("id", FilterOp::Eq, "34"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("id", FilterOp::Eq, "34"),
+        )
         .unwrap();
     assert_eq!(
         res.scanned_rows, 1,
@@ -1481,7 +1552,11 @@ fn prunes_by_bucket_partition() {
 
     // A range filter can't prune across a bucket transform → both files read (3 rows).
     let res = engine
-        .scan(&source, &filter("id", FilterOp::Gt, "0"))
+        .scan(
+            &RequestContext::detached(),
+            &source,
+            &filter("id", FilterOp::Gt, "0"),
+        )
         .unwrap();
     assert_eq!(res.scanned_rows, 3, "range op: no bucket pruning");
 }
@@ -1595,8 +1670,10 @@ fn deletion_vectors_are_refused_rather_than_silently_dropped() {
     let source = Source::resolve(tbl.display().to_string().as_str(), None).unwrap();
     assert_eq!(source.format, Format::Iceberg);
     let engine = LocalReaderEngine::default();
-    assert!(engine.schema(&source).is_err());
-    assert!(engine.preview(&source, 10).is_err());
+    assert!(engine.schema(&RequestContext::detached(), &source).is_err());
+    assert!(engine
+        .preview(&RequestContext::detached(), &source, 10)
+        .is_err());
 }
 
 #[test]
@@ -1612,7 +1689,9 @@ fn v3_without_deletion_vectors_reads_and_reports_its_version() {
     assert_eq!(plan.files.len(), 1);
 
     let source = Source::resolve(tbl.display().to_string().as_str(), None).unwrap();
-    let rows = LocalReaderEngine::default().preview(&source, 10).unwrap();
+    let rows = LocalReaderEngine::default()
+        .preview(&RequestContext::detached(), &source, 10)
+        .unwrap();
     assert_eq!(rows.num_rows(), 3);
 }
 

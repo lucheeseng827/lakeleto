@@ -11,10 +11,12 @@
 //! Format is decoupled from Engine on purpose: the same `Source` is handed to whichever
 //! engine the user picked (`local`, `sql`, `remote`), so format sniffing lives in one place.
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::context::RequestContext;
 use crate::error::{EngineError, Result};
 
 /// A table format Lakeleto knows how to talk about. Whether a given *engine* can read it is a
@@ -69,7 +71,7 @@ impl Format {
             "parquet" | "pq" => Some(Format::Parquet),
             "csv" => Some(Format::Csv),
             "tsv" => Some(Format::Tsv),
-            "json" | "ndjson" | "jsonl" => Some(Format::Json),
+            "json" | "ndjson" | "jsonl" | "geojson" => Some(Format::Json),
             "iceberg" => Some(Format::Iceberg),
             "delta" | "deltalake" => Some(Format::Delta),
             "database" | "db" | "sqlite" | "postgres" | "postgresql" | "mysql" => {
@@ -124,6 +126,82 @@ pub fn is_database_uri(s: &str) -> bool {
     }
 }
 
+/// Query parameters whose value is a secret. Lower-case; matching is case-insensitive.
+const SECRET_QUERY_KEYS: [&str; 4] = ["password", "pwd", "secret", "token"];
+
+/// Replace the password in a URI-shaped string with `***`, leaving everything else verbatim.
+///
+/// Exists because a database source's credentials have nowhere else to live. An object-store URI
+/// names a location and its credentials arrive beside it
+/// ([`StoreOptions`](crate::objstore::StoreOptions)); a database URI is the connection string, so
+/// `postgres://alice:hunter2@db/orders?table=t` *is* the location, and there is no form of it that
+/// both connects and keeps the secret out. So the secret is in the [`Source`] — the one type this
+/// module's own documentation says must never reach a response body or a cache — and the split
+/// between [`Source::display`] and [`Source::uri`] is how both things stay true: one renders, one
+/// connects.
+///
+/// The username survives. It is useful in the error it appears in ("which account was refused?"),
+/// it is not the secret, and a message with no principal in it at all sends people guessing.
+///
+/// Parses per RFC 3986: userinfo ends at the first `@` of the authority, and the authority ends at
+/// the first `/`, `?` or `#`. A password containing an unencoded one of those is malformed and
+/// could not connect, so it is not a case worth being wrong in either direction about.
+pub fn redact_uri_password(s: &str) -> std::borrow::Cow<'_, str> {
+    // Requires a scheme, and that is a deliberate limit rather than an oversight. Without one there
+    // is no way to tell `alice:hunter2@db/orders` (a connection string with the `://` forgotten)
+    // from `table:sales.orders@v3` (an opaque catalog ref a remote engine resolves) or from a file
+    // named `a:b@c` — and this function's output is what the *unresolved* remote ref path renders,
+    // where mangling an identifier is a bug of its own. A caller that already knows its string was
+    // meant to be a connection URI can redact the schemeless form safely; `engine::database`'s
+    // `safe` is that caller, and the only one.
+    let Some(scheme_end) = s.find("://") else {
+        return std::borrow::Cow::Borrowed(s);
+    };
+    let rest_at = scheme_end + 3;
+    let rest = &s[rest_at..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let mut out: Option<String> = None;
+
+    // 1. `scheme://user:password@host` -> `scheme://user:***@host`
+    if let Some(at) = rest[..authority_end].find('@') {
+        if let Some(colon) = rest[..at].find(':') {
+            let mut redacted = String::with_capacity(s.len());
+            redacted.push_str(&s[..rest_at + colon + 1]);
+            redacted.push_str("***");
+            redacted.push_str(&s[rest_at + at..]);
+            out = Some(redacted);
+        }
+    }
+
+    // 2. `?password=…` and friends, wherever they sit in the query.
+    let current = out.as_deref().unwrap_or(s);
+    if let Some(q) = current.find('?') {
+        let (head, query) = current.split_at(q + 1);
+        let mut rebuilt = String::with_capacity(current.len());
+        rebuilt.push_str(head);
+        for (i, pair) in query.split('&').enumerate() {
+            if i > 0 {
+                rebuilt.push('&');
+            }
+            match pair.split_once('=') {
+                Some((k, _)) if SECRET_QUERY_KEYS.contains(&k.to_ascii_lowercase().as_str()) => {
+                    rebuilt.push_str(k);
+                    rebuilt.push_str("=***");
+                }
+                _ => rebuilt.push_str(pair),
+            }
+        }
+        if rebuilt != current {
+            out = Some(rebuilt);
+        }
+    }
+
+    match out {
+        Some(redacted) => std::borrow::Cow::Owned(redacted),
+        None => std::borrow::Cow::Borrowed(s),
+    }
+}
+
 /// A resolved data source: a path plus the format Lakeleto detected for it.
 ///
 /// **Deliberately no credential slot.** Reads of an object-store URI are configured by
@@ -136,45 +214,229 @@ pub fn is_database_uri(s: &str) -> bool {
 /// be logged and would make one identity's cached `Source` reusable by another. So the credential
 /// context stays a separate argument, which also keeps the default `Source` path (a local file)
 /// free of any notion of credentials at all.
+/// Whether [`Source::detect`] may spend a network round-trip to classify a remote prefix, and
+/// whose credentials it may spend it as.
+///
+/// `detect` is the one identity-bearing operation in the crate that sits **outside** the
+/// [`Engine`](crate::engine::Engine) seam. An extensionless `s3://…/table` gives its format away
+/// only by being probed — one `list` for a `metadata/` child — and a probe is a read, so it is
+/// performed as *somebody*. Every other remote read resolves identity per call from a
+/// [`RequestContext`](crate::context::RequestContext); this one had no context to resolve from and
+/// so read as the process, which is the right answer for exactly one caller and the wrong one for
+/// the rest.
+///
+/// The identity still comes from the context. What this enum decides is the question a context
+/// cannot answer: what the *absence* of a vended identity means. It is the caller's posture, not
+/// the request's, which is why it is a separate argument rather than another context field — the
+/// context carries what is true of this call, and "I am a single-user binary on my own machine" is
+/// true of the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemoteProbe {
+    /// Probe as the context's identity if it has one, else as the process environment.
+    ///
+    /// The offline binary's posture, and correct there: one user, their own machine, their own
+    /// credentials, and no one else's data within reach.
+    #[default]
+    Ambient,
+    /// Probe as the context's identity, and refuse to probe at all without one.
+    ///
+    /// A multi-tenant server's posture. Falling back to the environment here would make a
+    /// tenant-supplied location into a probe performed as the *server* — a confused deputy, and an
+    /// existence oracle for any bucket the server's own role can see. Refusing costs the tenant an
+    /// explicit `format` on their catalog entry and costs the server nothing.
+    VendedOnly,
+    /// Never probe. Classification is by name or not at all.
+    Never,
+}
+
+/// How far to spread struct columns into top-level ones — see [`Source::flatten`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flatten {
+    /// Every level: `user: {name, geo: {lat}}` becomes `user.name` and `user.geo.lat`.
+    All,
+    /// The first `n` levels only: at 1 the same column becomes `user.name` and a `user.geo`
+    /// struct.
+    Levels(NonZeroUsize),
+}
+
+impl Flatten {
+    /// Parse a `--flatten=` / `?flatten=` value. `all` (or an empty value, or `true`) is every
+    /// level and a positive number is that many; `0`, `false` and `none` are no flattening at all,
+    /// which is `Ok(None)` — so a caller can turn off a default without a second flag.
+    pub fn parse(s: &str) -> Result<Option<Flatten>> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "all" | "true" => Ok(Some(Flatten::All)),
+            "0" | "false" | "none" => Ok(None),
+            n => n
+                .parse::<usize>()
+                .ok()
+                .and_then(NonZeroUsize::new)
+                .map(|n| Some(Flatten::Levels(n)))
+                .ok_or_else(|| {
+                    EngineError::Other(format!(
+                        "flatten takes `all`, a number of levels, or `none` — got `{s}`"
+                    ))
+                }),
+        }
+    }
+
+    /// The value [`Flatten::parse`] reads back: what a remote engine sends for it.
+    pub fn as_param(&self) -> String {
+        match self {
+            Flatten::All => "all".to_string(),
+            Flatten::Levels(n) => n.to_string(),
+        }
+    }
+
+    /// Levels to descend: `None` for every one.
+    pub fn max_levels(&self) -> Option<usize> {
+        match self {
+            Flatten::All => None,
+            Flatten::Levels(n) => Some(n.get()),
+        }
+    }
+}
+
+/// How a file's bytes are compressed on top of its format: `t.ndjson.zst` is JSON, compressed with
+/// zstd. Orthogonal to [`Format`], so every text format gains a codec at once when its decoder
+/// lands — and only a text format can have one: Parquet compresses inside its own container and
+/// is read by seeking, which a compressed stream cannot do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    Gzip,
+    Zstd,
+    Bzip2,
+    Xz,
+}
+
+impl Codec {
+    /// The codec a file extension names (case-insensitive).
+    pub fn from_extension(ext: &str) -> Option<Codec> {
+        match ext.to_ascii_lowercase().as_str() {
+            "gz" | "gzip" => Some(Codec::Gzip),
+            "zst" | "zstd" => Some(Codec::Zstd),
+            "bz2" => Some(Codec::Bzip2),
+            "xz" => Some(Codec::Xz),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Codec::Gzip => "gzip",
+            Codec::Zstd => "zstd",
+            Codec::Bzip2 => "bzip2",
+            Codec::Xz => "xz",
+        }
+    }
+}
+
+impl std::fmt::Display for Codec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Source {
     pub path: PathBuf,
     pub format: Format,
+    /// How the file is compressed, from its name's last extension (`t.csv.gz`); `None` for a
+    /// file read as it is. Detected so that a compressed file is named for what it is — and refused
+    /// as such — rather than misread as its own bytes. Decoding it is Phase 2 of
+    /// `docs/FORMATS-PLAN.md`.
+    pub codec: Option<Codec>,
+    /// Where inside a JSON document to read records from, as a JSON Pointer (`/data`,
+    /// `/response/items`) — the caller's explicit choice, overriding the reader's own detection of
+    /// a records member. `Some("")` names the whole document and so turns unwrapping off. `None`
+    /// leaves it to the reader. Only JSON sources carry one; see [`Source::with_json_path`].
+    pub json_path: Option<String>,
+    /// Read struct columns as one top-level column per field, named by its path (`user.geo.lat`),
+    /// so nested data sorts, filters and exports like any other column. `None` reads them as
+    /// they are.
+    ///
+    /// A view of the source rather than a way of parsing it, so any format takes it: a source
+    /// with no struct columns — every CSV, every database table — reads the same either way.
+    /// Lists and maps stay whole, because spreading those would mean one row becoming many.
+    pub flatten: Option<Flatten>,
 }
 
 impl Source {
-    /// Detect the format of `path` (extension -> magic bytes -> directory shape).
+    /// Detect the format of `path` (extension -> magic bytes -> directory shape), using the
+    /// process environment for the one remote probe that needs an identity.
+    ///
+    /// Equivalent to [`detect_in`](Self::detect_in) with a detached context and
+    /// [`RemoteProbe::Ambient`] — the offline binary's posture, spelled out there. A server that
+    /// resolves a location someone else supplied wants `detect_in` instead.
     pub fn detect(path: impl AsRef<Path>) -> Result<Source> {
+        Source::detect_in(path, &RequestContext::detached(), RemoteProbe::Ambient)
+    }
+
+    /// [`detect`](Self::detect) with an explicit identity and probe posture.
+    ///
+    /// Only the object-store branch consults either: a local path is classified by stat'ing it and
+    /// reading its first bytes, which needs no credentials and reaches nobody else's data.
+    #[cfg_attr(not(feature = "object-store"), allow(unused_variables))]
+    pub fn detect_in(
+        path: impl AsRef<Path>,
+        ctx: &RequestContext,
+        probe: RemoteProbe,
+    ) -> Result<Source> {
         let path = path.as_ref().to_path_buf();
 
         // Database connection URI (sqlite://… / postgres://… / mysql://…): a live DB, never a file.
         // Classify without touching the filesystem — the `database` engine parses the URI.
         if path.to_str().is_some_and(is_database_uri) {
-            return Ok(Source {
-                path,
-                format: Format::Database,
-            });
+            return Ok(Source::with_format(path, Format::Database));
         }
 
         // Object-store URI (s3://…): classify by the key's extension without touching the
         // filesystem. Magic-byte sniffing would require fetching, so an unknown extension
         // needs an explicit `--format`.
         if path.to_str().is_some_and(is_object_uri) {
-            if let Some(format) = format_from_extension(&path) {
-                return Ok(Source { path, format });
+            if let Some((format, codec)) = format_from_name(&path) {
+                return Ok(Source::with_format(path, format).with_codec(codec));
             }
             // No data-file extension: a bare prefix is likely an Iceberg table — one cheap probe
             // for a `metadata/` child. (Only object stores; a network round-trip, so gated behind
             // the feature and reached only when the name gives nothing away.)
+            //
+            // Whose round-trip it is, is `probe`'s to decide — see [`RemoteProbe`]. The identity
+            // resolves the same way an engine's does: the call's, else this caller's fallback,
+            // else no probe.
             #[cfg(feature = "object-store")]
-            if path
-                .to_str()
-                .is_some_and(crate::objstore::looks_like_iceberg)
             {
-                return Ok(Source {
-                    path,
-                    format: Format::Iceberg,
-                });
+                let identity: Option<std::borrow::Cow<'_, crate::objstore::StoreOptions>> =
+                    match (probe, ctx.store_options()) {
+                        (RemoteProbe::Never, _) => None,
+                        (_, Some(vended)) => Some(std::borrow::Cow::Borrowed(vended)),
+                        (RemoteProbe::Ambient, None) => Some(std::borrow::Cow::Owned(
+                            crate::objstore::StoreOptions::from_env(),
+                        )),
+                        // Refused, and said so rather than falling through to the generic message
+                        // below. The two are a different problem with a different fix: that one
+                        // means the name gave nothing away, this one means nobody would tell us
+                        // whose credentials to find out with. Only one of them is the operator's.
+                        (RemoteProbe::VendedOnly, None) => {
+                            return Err(EngineError::UnsupportedFormat {
+                                detail: format!(
+                                    "cannot infer the format of {} from its name, and no \
+                                     credentials were vended for this call — probing it would \
+                                     read as the server rather than as you. Declare the format \
+                                     (`parquet`/`csv`/`json`/`iceberg`) on this location.",
+                                    path.display()
+                                ),
+                            });
+                        }
+                    };
+                if let (Some(opts), Some(uri)) = (identity, path.to_str()) {
+                    // `?`, not a swallowed `false`: an identity that cannot address this URI is a
+                    // fact about the caller, and reporting it as "not an Iceberg table" would send
+                    // them to fix their `--format` instead of their credentials.
+                    if crate::objstore::looks_like_iceberg_as(uri, &opts)? {
+                        return Ok(Source::with_format(path, Format::Iceberg));
+                    }
+                }
             }
             return Err(EngineError::UnsupportedFormat {
                 detail: format!(
@@ -190,25 +452,16 @@ impl Source {
             // parquet-dir fallback — a Delta table's data files are Parquet, so without this it
             // would be misread as a raw parquet dataset (ignoring the log: stale/removed rows).
             if path.join("_delta_log").is_dir() {
-                return Ok(Source {
-                    path,
-                    format: Format::Delta,
-                });
+                return Ok(Source::with_format(path, Format::Delta));
             }
             // An Iceberg table is a directory containing a `metadata/` catalog dir.
             if path.join("metadata").is_dir() {
-                return Ok(Source {
-                    path,
-                    format: Format::Iceberg,
-                });
+                return Ok(Source::with_format(path, Format::Iceberg));
             }
             // Otherwise a directory of `.parquet` files (incl. Hive-partitioned subdirs, and the
             // `foo.parquet/part-*.parquet` split-file shape) is read as one multi-file dataset.
             if !list_parquet_files(&path).is_empty() {
-                return Ok(Source {
-                    path,
-                    format: Format::Parquet,
-                });
+                return Ok(Source::with_format(path, Format::Parquet));
             }
             return Err(EngineError::UnsupportedFormat {
                 detail: format!(
@@ -219,13 +472,13 @@ impl Source {
             });
         }
 
-        if let Some(format) = format_from_extension(&path) {
-            return Ok(Source { path, format });
+        if let Some((format, codec)) = format_from_name(&path) {
+            return Ok(Source::with_format(path, format).with_codec(codec));
         }
 
         // No/unknown extension: sniff the magic bytes.
         let format = sniff_magic(&path)?;
-        Ok(Source { path, format })
+        Ok(Source::with_format(path, format))
     }
 
     /// Build a source with an explicit format (used by `--format` overrides and tests).
@@ -233,7 +486,60 @@ impl Source {
         Source {
             path: path.as_ref().to_path_buf(),
             format,
+            codec: None,
+            json_path: None,
+            flatten: None,
         }
+    }
+
+    /// Refuse a compressed source with an error that says so — until decoders exist, the one
+    /// honest answer. Without it, a `.csv.gz` read as CSV is a table of binary garbage.
+    pub fn require_uncompressed(&self) -> Result<()> {
+        match self.codec {
+            None => Ok(()),
+            Some(codec) => Err(EngineError::UnsupportedFormat {
+                detail: format!(
+                    "{} is {codec}-compressed, and Lakeleto does not decompress files yet — \
+                     decompress it first",
+                    self.display()
+                ),
+            }),
+        }
+    }
+
+    /// This source with its struct columns flattened as `flatten` says — see [`Source::flatten`].
+    pub fn with_flatten(mut self, flatten: Option<Flatten>) -> Source {
+        self.flatten = flatten;
+        self
+    }
+
+    /// This source, compressed with `codec` — see [`Source::codec`].
+    pub fn with_codec(mut self, codec: Option<Codec>) -> Source {
+        self.codec = codec;
+        self
+    }
+
+    /// This source, read from `json_path` inside the document — see [`Source::json_path`].
+    ///
+    /// A bare member name (`data`) means that top-level member and becomes the pointer `/data`;
+    /// anything starting with `/` is taken as a JSON Pointer as written. Refused for a source
+    /// that is not JSON, because it would otherwise be silently ignored; a source whose format a
+    /// server will decide ([`Source::unresolved`]) passes it on for that server to judge.
+    pub fn with_json_path(mut self, json_path: Option<&str>) -> Result<Source> {
+        let Some(json_path) = json_path else {
+            return Ok(self);
+        };
+        if !matches!(self.format, Format::Json | Format::Unknown) {
+            return Err(EngineError::UnsupportedFormat {
+                detail: format!(
+                    "a JSON path selects records inside a JSON document, but {} is {}",
+                    self.display(),
+                    self.format
+                ),
+            });
+        }
+        self.json_path = Some(normalize_json_path(json_path));
+        Ok(self)
     }
 
     /// Build a source from a raw string **without touching the filesystem** — for an engine
@@ -258,27 +564,71 @@ impl Source {
     pub fn unresolved(path: impl AsRef<Path>, format: Option<&str>) -> Result<Source> {
         match format {
             Some(f) => Source::resolve(path, Some(f)),
-            None => Ok(Source {
-                path: path.as_ref().to_path_buf(),
-                format: Format::Unknown,
-            }),
+            None => Ok(Source::with_format(path, Format::Unknown)),
         }
     }
 
     /// Resolve a source from a path and an optional explicit format name (detect when `None`).
+    ///
+    /// Uses the process environment for the one remote probe that needs an identity — see
+    /// [`detect`](Self::detect). A server resolving someone else's location wants
+    /// [`resolve_in`](Self::resolve_in).
     pub fn resolve(path: impl AsRef<Path>, format: Option<&str>) -> Result<Source> {
+        Source::resolve_in(
+            path,
+            format,
+            &RequestContext::detached(),
+            RemoteProbe::Ambient,
+        )
+    }
+
+    /// [`resolve`](Self::resolve) with an explicit identity and probe posture.
+    ///
+    /// An explicit `format` short-circuits before any probe, which is what makes
+    /// [`RemoteProbe::VendedOnly`] a cost a caller can always avoid: naming the format is the
+    /// answer to being refused a probe.
+    pub fn resolve_in(
+        path: impl AsRef<Path>,
+        format: Option<&str>,
+        ctx: &RequestContext,
+        probe: RemoteProbe,
+    ) -> Result<Source> {
         match format {
+            // The name still says how the bytes are compressed, whatever format they hold.
             Some(f) => Format::parse(f)
-                .map(|fmt| Source::with_format(path, fmt))
+                .map(|fmt| {
+                    let codec = codec_of(path.as_ref());
+                    Source::with_format(path, fmt).with_codec(codec)
+                })
                 .ok_or_else(|| EngineError::UnsupportedFormat {
                     detail: format!("unknown format `{f}` (expected parquet/csv/tsv/json/iceberg)"),
                 }),
-            None => Source::detect(path),
+            None => Source::detect_in(path, ctx, probe),
         }
     }
 
+    /// This source rendered for a **human**: an API response body, a run record, a log line, an
+    /// error message, the CLI's `path :` row.
+    ///
+    /// A database password is replaced with `***` — see [`redact_uri_password`]. Everything that
+    /// renders a source goes through here, which is what makes that one function enough: the
+    /// alternative is remembering to redact at each of the dozen places a source is printed, and
+    /// the one that gets forgotten is a credential in someone's saved run history.
+    ///
+    /// Never use this to *reach* the source. [`Source::uri`] is that.
     pub fn display(&self) -> String {
-        self.path.display().to_string()
+        redact_uri_password(&self.path.to_string_lossy()).into_owned()
+    }
+
+    /// This source rendered for a **machine**: the string that opens a connection, or that a peer
+    /// engine is asked to resolve.
+    ///
+    /// Verbatim, secrets included, because a redacted connection string does not connect. Every
+    /// caller of this is a caller that would break if it were redacted, which is the property that
+    /// makes the pair reviewable — a new `uri()` in a `format!` bound for a response body is
+    /// visibly the wrong one of the two.
+    pub fn uri(&self) -> String {
+        self.path.to_string_lossy().into_owned()
     }
 
     /// True when nothing local resolved this source and its format is the peer's to determine
@@ -291,6 +641,16 @@ impl Source {
     /// than on the local filesystem. The reading itself needs `--features object-store`.
     pub fn is_remote(&self) -> bool {
         self.path.to_str().is_some_and(is_object_uri)
+    }
+}
+
+/// A records path as a JSON Pointer: `""` (the whole document) and `/…` pointers as written, a
+/// bare member name as that top-level member, escaped per RFC 6901 (`~` → `~0`, `/` → `~1`).
+fn normalize_json_path(path: &str) -> String {
+    if path.is_empty() || path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path.replace('~', "~0").replace('/', "~1"))
     }
 }
 
@@ -439,17 +799,29 @@ pub fn list_dir(dir: &str) -> Result<DirListing> {
     })
 }
 
+/// The format and codec a file's name gives: `t.csv` is CSV, `t.csv.gz` gzip-compressed CSV. Only a
+/// registry format takes a codec (see [`Codec`]), so `t.parquet.gz` names nothing and is sniffed
+/// like any unknown name.
+fn format_from_name(path: &Path) -> Option<(Format, Option<Codec>)> {
+    let Some(codec) = codec_of(path) else {
+        return Some((format_from_extension(path)?, None));
+    };
+    let format = format_from_extension(Path::new(path.file_stem()?))?;
+    crate::format::reader(format)?;
+    Some((format, Some(codec)))
+}
+
+/// The codec a name's last extension gives, if any.
+fn codec_of(path: &Path) -> Option<Codec> {
+    Codec::from_extension(path.extension()?.to_str()?)
+}
+
 pub(crate) fn format_from_extension(path: &Path) -> Option<Format> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("parquet") | Some("pq") => Some(Format::Parquet),
-        Some("csv") => Some(Format::Csv),
-        Some("tsv") => Some(Format::Tsv),
-        Some("json") | Some("ndjson") | Some("jsonl") => Some(Format::Json),
-        _ => None,
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "parquet" | "pq" => Some(Format::Parquet),
+        // Every other file format is a registry reader's, and names its own extensions.
+        ext => crate::format::format_for_extension(ext),
     }
 }
 
@@ -524,6 +896,7 @@ mod tests {
         );
         assert_eq!(Source::detect_ext_only("t.csv").unwrap(), Format::Csv);
         assert_eq!(Source::detect_ext_only("t.jsonl").unwrap(), Format::Json);
+        assert_eq!(Source::detect_ext_only("t.geojson").unwrap(), Format::Json);
     }
 
     impl Source {
@@ -531,6 +904,53 @@ mod tests {
         fn detect_ext_only(p: &str) -> Option<Format> {
             format_from_extension(Path::new(p))
         }
+    }
+
+    #[test]
+    fn a_compressed_name_gives_its_format_and_codec() {
+        let name = |p: &str| format_from_name(Path::new(p));
+        assert_eq!(name("t.csv.gz"), Some((Format::Csv, Some(Codec::Gzip))));
+        assert_eq!(
+            name("t.ndjson.zst"),
+            Some((Format::Json, Some(Codec::Zstd)))
+        );
+        assert_eq!(name("T.TSV.BZ2"), Some((Format::Tsv, Some(Codec::Bzip2))));
+        assert_eq!(
+            name("dir.v2/t.json.xz"),
+            Some((Format::Json, Some(Codec::Xz)))
+        );
+        assert_eq!(name("t.csv"), Some((Format::Csv, None)));
+        // Parquet compresses inside its container; a codec around one names nothing.
+        assert_eq!(name("t.parquet.gz"), None);
+        assert_eq!(name("t.gz"), None);
+        // The browser's plain lookup still hides them until they can be read.
+        assert_eq!(format_from_extension(Path::new("t.csv.gz")), None);
+    }
+
+    #[test]
+    fn a_compressed_file_is_detected_as_such_and_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.csv.gz");
+        std::fs::write(&path, b"\x1f\x8b not really gzip").unwrap();
+        let source = Source::detect(&path).unwrap();
+        assert_eq!(
+            (source.format, source.codec),
+            (Format::Csv, Some(Codec::Gzip))
+        );
+        let err = source.require_uncompressed().unwrap_err().to_string();
+        assert!(
+            err.ends_with("t.csv.gz is gzip-compressed, and Lakeleto does not decompress files yet — decompress it first"),
+            "{err}"
+        );
+        // An explicit format keeps the codec the name gives.
+        let explicit = Source::resolve(&path, Some("tsv")).unwrap();
+        assert_eq!(explicit.codec, Some(Codec::Gzip));
+        // Object-store names are classified the same way, without a request.
+        let remote = Source::detect("s3://bucket/logs/day.ndjson.zst").unwrap();
+        assert_eq!(
+            (remote.format, remote.codec),
+            (Format::Json, Some(Codec::Zstd))
+        );
     }
 
     #[test]
@@ -596,5 +1016,198 @@ mod tests {
             "object-store is a source capability, not a file format — a client iterating this \
              list to enumerate openable types must not meet it here"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Whose credentials the remote probe spends — see [`RemoteProbe`]
+    // ---------------------------------------------------------------------------------------
+
+    /// The confused deputy, stated as a test.
+    ///
+    /// An extensionless `s3://…/prefix` is classified by probing it, and before this the probe
+    /// always ran on `StoreOptions::from_env()` — the *process's* identity — over a location the
+    /// caller supplied. On a multi-tenant server that is a read performed as the server against a
+    /// bucket a tenant named, which is both a credential nobody authorized spending and an
+    /// existence oracle for anything the server's own role can see. `VendedOnly` is the posture
+    /// that says: my identity is not available for this.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn a_server_posture_refuses_to_probe_a_prefix_it_has_no_vended_identity_for() {
+        let err = Source::detect_in(
+            "s3://someone-elses-bucket/table",
+            &RequestContext::detached(),
+            RemoteProbe::VendedOnly,
+        )
+        .unwrap_err();
+
+        // Refused for the credential reason, not merely "unknown format" — the two have different
+        // fixes and a caller reading this should be sent to the right one.
+        let msg = err.to_string();
+        assert!(msg.contains("no credentials were vended"), "{msg}");
+        assert!(msg.contains("read as the server"), "{msg}");
+    }
+
+    /// `Never` is the same refusal without the explanation: classification by name or not at all.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn the_never_posture_falls_through_to_the_plain_unknown_format_error() {
+        let err = Source::detect_in(
+            "s3://bucket/table",
+            &RequestContext::detached(),
+            RemoteProbe::Never,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot infer the format"), "{err}");
+    }
+
+    /// The other half: the probe uses the identity it was *handed*, not the environment.
+    ///
+    /// Observable with no network and no credentials, by the same trick the engine tests use —
+    /// `objstore` refuses a provider whose family does not match the URI's scheme before it builds
+    /// a store, so an `s3://` probe that comes back mentioning GCS can only have gone through the
+    /// options carrying a GCS provider. Had it read `from_env()` the mismatch could not arise.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn the_probe_reads_as_the_context_says_rather_than_as_the_process() {
+        let provider: object_store::gcp::GcpCredentialProvider = std::sync::Arc::new(
+            object_store::StaticCredentialProvider::new(object_store::gcp::GcpCredential {
+                bearer: "not-a-real-token".to_string(),
+            }),
+        );
+        let ctx = RequestContext::detached().with_store_options(
+            crate::objstore::StoreOptions::empty()
+                .with_credentials(crate::objstore::StoreCredentials::Gcs(provider)),
+        );
+
+        let err = Source::detect_in("s3://bucket/table", &ctx, RemoteProbe::VendedOnly)
+            .expect_err("a GCS identity cannot address an s3:// URI");
+        assert!(err.to_string().contains("GCS"), "{err}");
+
+        // And the vended identity is used under `Ambient` too: the fallback is a fallback, not a
+        // preference. Same assertion, opposite posture — if `Ambient` consulted the environment
+        // first, this would be an unknown-format error with no mention of GCS.
+        let err = Source::detect_in("s3://bucket/table", &ctx, RemoteProbe::Ambient)
+            .expect_err("a GCS identity cannot address an s3:// URI");
+        assert!(err.to_string().contains("GCS"), "{err}");
+    }
+
+    /// Naming the format is always the way out of a refused probe, whatever the posture — which is
+    /// what makes `VendedOnly` a cost a caller can pay rather than a wall.
+    #[test]
+    fn an_explicit_format_short_circuits_every_probe_posture() {
+        for probe in [
+            RemoteProbe::Ambient,
+            RemoteProbe::VendedOnly,
+            RemoteProbe::Never,
+        ] {
+            let s = Source::resolve_in(
+                "s3://bucket/table",
+                Some("iceberg"),
+                &RequestContext::detached(),
+                probe,
+            )
+            .unwrap_or_else(|e| panic!("{probe:?} should not probe at all: {e}"));
+            assert_eq!(s.format, Format::Iceberg);
+        }
+    }
+
+    /// A local path reaches none of this: no identity is consulted, so the posture cannot change
+    /// the answer. Guards against a future refactor that gates local detection on a credential.
+    #[test]
+    fn a_local_path_is_classified_the_same_under_every_posture() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.csv");
+        std::fs::write(&file, "a,b\n1,2\n").unwrap();
+        for probe in [
+            RemoteProbe::Ambient,
+            RemoteProbe::VendedOnly,
+            RemoteProbe::Never,
+        ] {
+            let s = Source::detect_in(&file, &RequestContext::detached(), probe).unwrap();
+            assert_eq!(
+                s.format,
+                Format::Csv,
+                "posture {probe:?} changed a local answer"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // A database source's password is the one secret that has to ride on a `Source`
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn redaction_replaces_the_password_and_keeps_everything_useful() {
+        // The username survives: it says which account was refused, and it is not the secret.
+        assert_eq!(
+            redact_uri_password("postgres://alice:hunter2@db.internal:5432/orders?table=t"),
+            "postgres://alice:***@db.internal:5432/orders?table=t"
+        );
+        // A password in the query string, wherever it sits.
+        assert_eq!(
+            redact_uri_password("postgres://db/orders?table=t&password=hunter2&sslmode=require"),
+            "postgres://db/orders?table=t&password=***&sslmode=require"
+        );
+        // Both at once.
+        assert_eq!(
+            redact_uri_password("mysql://root:a@h/d?password=b"),
+            "mysql://root:***@h/d?password=***"
+        );
+    }
+
+    #[test]
+    fn redaction_leaves_alone_everything_that_carries_no_secret() {
+        for untouched in [
+            "/var/data/events.parquet",              // a plain filesystem path
+            "C:\\data\\events.parquet",              // ...on Windows
+            "s3://bucket/prefix/t.parquet",          // credentials travel beside this, not in it
+            "sqlite:///var/data/app.db?table=t",     // no authority, so no userinfo
+            "postgres://db.internal/orders?table=t", // a location and nothing else: the goal shape
+            "postgres://alice@db/orders",            // a username with no password
+            "data/2024/events.parquet",              // relative, no authority
+            "./cache@v2/t.parquet",                  // an `@` in a directory name, no userinfo
+            "runs/a@b/t.parquet",                    // ...not in the first segment either
+            // An opaque ref a remote engine resolves. It has a colon and an `@` in the shape
+            // of userinfo and is not a credential at all — the reason this function needs a scheme.
+            "table:sales.orders@v3",
+        ] {
+            assert_eq!(
+                redact_uri_password(untouched),
+                untouched,
+                "redaction should not have touched {untouched}"
+            );
+            // And it borrows rather than allocating when there is nothing to do.
+            assert!(matches!(
+                redact_uri_password(untouched),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
+    }
+
+    /// The split that keeps both invariants true at once: this module's own documentation says a
+    /// `Source` must never reach a response body carrying a credential, and a database URI cannot
+    /// name its location without one.
+    #[test]
+    fn display_is_redacted_and_uri_is_verbatim() {
+        let raw = "postgres://alice:hunter2@db/orders?table=events";
+        let src = Source::with_format(raw, Format::Database);
+
+        // What a person sees — an API response, a run record, a log line, an error.
+        assert_eq!(src.display(), "postgres://alice:***@db/orders?table=events");
+        assert!(!src.display().contains("hunter2"));
+
+        // What connects. Redacting here would mean not connecting at all.
+        assert_eq!(src.uri(), raw);
+    }
+
+    /// A local path must round-trip through `display()` unchanged, because plenty of things print a
+    /// path and then expect to be able to use what they printed.
+    #[test]
+    fn display_still_round_trips_for_everything_that_is_not_a_connection_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.parquet");
+        let src = Source::with_format(&file, Format::Parquet);
+        assert_eq!(src.display(), src.uri());
+        assert_eq!(src.display(), file.to_string_lossy());
     }
 }

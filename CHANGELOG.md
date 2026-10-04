@@ -6,6 +6,185 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-03
+
+### Added
+- **A JSON document's records member unwraps to its rows.** `{"meta": {…}, "data": [{…}, …]}` —
+  an API response, a GeoJSON `FeatureCollection` — used to be one row with a list column (or,
+  pretty-printed, to fail outright). When a single top-level object has exactly one member holding
+  a non-empty array of objects, its elements are the rows; `lakeleto schema` prints the member
+  (`records: /data`) and `/v1/schema` returns it as `records_path`, so the unwrap is never silent.
+  With no such member, or several, the object is still one row. The member is found once per file
+  version, as the byte range of its array, and its records then stream like a top-level array's —
+  sampled schema, widening on drift — so a grid window does not parse the document again.
+  `.geojson` is now read as JSON.
+- **`--json-path` / `?json_path=` choose the records explicitly**: a JSON Pointer
+  (`/response/items`) or a top-level member name (`groups`), for documents detection cannot
+  settle — two candidate arrays, records below the top level — and `""` to unwrap nothing. It
+  travels to a `--remote-url` server, is accepted on every `/v1/*` read route and on workspace
+  runs, and is refused on a source that is not JSON instead of being silently ignored.
+- **The web app reads JSON at a records path.** A JSON tab's toolbar says where its rows come
+  from — the member the reader detected (`Records: /data · auto`), a path set for the tab, or the
+  whole document — and sets it as `--json-path` does: a JSON Pointer or a member name, **Whole
+  document**, or **Auto** to detect again. The path is kept with the tab, applied to its SQL,
+  saved with a saved query (`json_path`, like `flatten`) and restored when that query or a run
+  from history is reopened, so SQL written against the records finds them again.
+- **`--flatten[=levels]` / `?flatten=` read struct columns as one column per field**, named by its
+  path — `user: {name, geo: {lat}}` becomes `user.name` and `user.geo.lat` — so nested data sorts,
+  filters, profiles and exports like flat data, and SQL can name a field (`"user.name"`). `--flatten`
+  is every level, a number that many. It works for any format with structs (JSON, nested Parquet,
+  Iceberg, Delta): the local engine flattens as it reads, and the SQL engine through a view, so the
+  file still streams and a sorted grid window still covers all of it. A field of a null struct is
+  null in both — DataFusion's `get_field` alone would show a value stored beneath one. Lists, maps
+  and empty structs stay whole, and two columns that would share a name are refused. The grid
+  gains a **Flatten structs** toggle, kept with the tab and applied to its SQL.
+- **SQL reads JSON.** `lakeleto query`, `POST /v1/query` and workspace runs accept `.json` /
+  `.ndjson` / `.jsonl` / `.geojson` tables. They are read by the local JSON reader, not DataFusion's
+  — which infers line by line and fails on pretty, wrapped or BOM-prefixed files — so every layout,
+  `--json-path`, `--flatten` and schema widening apply in SQL as in the grid; a parity test reads
+  each layout through both engines and gets the same schema and rows. A file is streamed into the
+  query a batch at a time, one pass per query — read from disk, or for a file in an object store,
+  requested afresh by each pass — so a query holds the batches in flight rather than the file:
+  `LIMIT 10` stops reading once it has its rows, and a `count(*)` or `GROUP BY` over a large file
+  runs in memory set by the query, not by the file. A value past the sampled rows that does not fit
+  their column types widens the file's schema, and the query is planned again with it — unless it
+  was already streaming rows to its caller; then it stops with an error, and the next run reads the
+  value. Sorted and filtered JSON grid windows now go through SQL as well, so they cover the whole
+  file rather than its first 200,000 rows; a sorted one counts what matches in the pass that sorts
+  it, so it reads the file, or downloads the object, once.
+
+### Changed
+- **JSON and CSV in an object store stream.** An `s3://` / `gs://` / `az://` JSON, CSV or TSV file
+  was fetched whole for every read — each grid window, schema and preview downloaded all of it. It
+  is now read as its bytes arrive, as a local file is: a window requests the object and stops the
+  transfer at its last row. A CSV read is one request: the rows its schema is inferred from are the
+  first it decodes, so their bytes are kept as they arrive rather than downloaded again. A JSON
+  records member is fetched by its byte range once located, and a JSON object's layout and schema
+  are kept per version (its ETag) and per credential identity, so the next read goes straight to its
+  rows. Every request asks for the version its read looked up, so an object replaced mid-read fails
+  that read, with a message to run it again, rather than mixing two versions. A read that outlasts
+  the store client's request timeout — a large object, or a streamed result its consumer reads
+  slowly — asks again for what is left, of the same version. A connection that drops mid-read and
+  cannot be resumed fails the read as the I/O error it is, rather than being taken for a malformed
+  record. Over 2 million rows served by a local S3 stand-in, a grid window went from 0.7–0.9 s to
+  0.2 s as a 255 MB NDJSON, and from 0.6 s to 0.03 s as a 256 MB CSV, with the server's peak memory
+  down from about 510 MiB to 25–26 MiB for both.
+- **A sorted grid window over a CSV is one pass over the file, tied or not.** With `sql`, a sorted
+  window over a CSV or TSV file was counted by a query of its own — a pass over the whole file, and
+  for an object in a store a download of all of it — before its parallel probe read the file again
+  to sort it, and a tie that touched the window sent it to a third read on one partition, to break
+  ties in the file's order. Now the scan numbers each row as it reads it, by partition and by place
+  within one — DataFusion lays a file's partitions out in order, and the scan is kept to each
+  partition's own ranges — so the parallel sort breaks ties by that number itself, and the TopK that
+  keeps the best rows takes in every one that matches, so how many it took in is the count. Parquet
+  keeps its probe and its count: its scan skips row groups by the threshold the TopK sets, which
+  numbering its rows would cost it on every sort. Over the 256 MB CSV in a local S3 stand-in, every
+  sorted window is now one download of the object, where an untied one was two and a tied one three.
+  Against the version that already counted as it sorted, a tied window went from 1.3–1.6 s to 0.4 s
+  and a window at row 1,000,000 from 9 s to 2.1 s; on a local file, a tied window from 1.4 s to
+  0.3 s.
+- **A sorted grid window deep into a CSV no longer holds every row before it.** With `sql`, a sorted
+  window over a CSV or TSV kept the best `offset + limit` rows in every partition until its one pass
+  was through, and every batch they came in, so the deeper the window the more memory: at row
+  1,000,000 of the 256 MB benchmark CSV the server peaked at 705–781 MiB, and a window in the middle
+  of a bigger file kept more. A window that reaches past 50,000 rows is now read in two passes. The
+  first counts the rows that match and samples 65,536 of them by a hash of their place in the file,
+  which bounds where the window falls; the second keeps only the rows between the bounds, about 2.3%
+  of them, and cuts the window from those. Its rows and count are the one-pass read's, and should
+  the bounds miss the window, about one time in a billion, it is read the one-pass way. At row
+  1,000,000 of a local file the server now peaks at 82 MiB, and the window takes 0.57 s, from
+  1.7–1.8 s. An object in a store is still downloaded once: the first pass writes the rows it reads
+  to a temporary file, as a JSON file's does (below), for the second to read back, and the object is
+  downloaded again only if that file can't be written. From a local S3 stand-in the window takes
+  1.3–1.6 s, from 2.4 s, and peaks at 118–135 MiB, from 684–717 MiB, with 116–120 MiB on disk.
+  A window whose filter keeps few rows can take longer than it did: with a filter that keeps an
+  eighth of the rows, at row 100,000, 0.46–0.48 s from 0.34–0.36 s locally, at 75 MiB from
+  118–119, and 0.56–0.62 s from 0.48–0.50 s over the stand-in.
+- **A sorted grid window deep into Parquet or JSON no longer holds every row before it either.**
+  With `sql`, a window that reaches past 50,000 rows into any table now takes the two passes a
+  CSV's does. A Parquet file's rows are numbered as its parallel scan reads its row groups, and a
+  filter still skips the row groups it rules out; a JSON file's, a flattened view's and a table's
+  read into memory are numbered on one partition. Over the 2 million benchmark rows as a 98 MB
+  Parquet file, at row 1,000,000, the server peaks at 142–168 MiB, from 1.1 GiB, and a window
+  sorted by a key with ties takes 0.4–0.5 s, from 8.6–9.6 s, as a tie no longer sends it to a
+  second read on one partition. A JSON file is still decoded, and downloaded from a store, once:
+  its first pass writes the rows it reads to a temporary file, LZ4-compressed Arrow in the system's
+  temporary directory, removed once the window is read, and the second pass reads them back. Should
+  that file fail to be written, the second pass decodes the file again. As a 255 MB NDJSON file, at
+  row 1,000,000, the server peaks at 52–55 MiB, from 349–352 MiB, and the window takes 3.0–3.2 s,
+  from 7.4–7.9 s, with 86–88 MiB on disk; sorted by `id`, 2.9–3.2 s from 3.1–3.4 s, and with a
+  filter that keeps an eighth of the rows, at row 100,000, 2.4–2.6 s from 2.5–2.7 s.
+- **A JSON file's schema no longer depends on how far you scrolled.** Inference sampled 1,000
+  values for `schema` but the whole window for a read, so a key first seen at row 1,200 was
+  missing from `schema` yet present in a window past it, and a column could change type between
+  windows; an unbounded read (SQL registration, `query`) sampled only 1,000 rows and failed on a
+  later drift. Every read now uses the same first 20,000 values, remembered per file version
+  (about 0.1 s on a 60 MiB file, paid once per version in `serve`), and a value past them that
+  disagrees widens the file's schema instead of failing the read. Sampling streams, so the
+  200,000-row sort/filter working set no longer holds its sample in memory as parsed values.
+- **Every non-Parquet format is read through one registry.** CSV, TSV and JSON are
+  `FormatReader`s in `src/format/`; the local engine has one arm for them where it had a CSV and a
+  JSON branch in five places, and the format lists `GET /v1/engines` reports, SQL routing and
+  extension detection are read off the registry. No behaviour change — the seam new formats plug
+  into.
+- **A compressed file is named, not misread.** `t.csv.gz` failed detection as an unknown
+  extension, and with `--format csv` it was read as a table of compressed bytes. The last extension
+  is now recognised as a codec (`gz`, `zst`, `bz2`, `xz`) over the format before it, and every
+  read — local, SQL — refuses it with an error that says it is compressed. The file browser keeps
+  hiding such files until they can be read.
+- **JSON columns come in the order their keys first appear**, not alphabetically, nested fields
+  included (`serde_json`'s `preserve_order`; `indexmap` was already in the tree).
+- **Top-level JSON arrays stream.** An array used to be parsed whole and was refused above
+  256 MiB; it is now fed element by element into the decoder, so it is bounded by the row window
+  like NDJSON. An array cut off before its closing `]` is an error rather than a shorter table.
+
+### Fixed
+- **Nested columns work in the grid.** A struct cell showed `[object Object]` (and a list its
+  elements comma-joined); sorting a struct column failed with "Sort not supported for data type
+  Struct", and filtering any struct column failed because Arrow cannot cast a struct to text. Cells
+  now show compact JSON (pretty-printed in the row drawer, and in copies, CSV downloads, the quick
+  search and generated `WHERE`/`INSERT` too), nested columns get a wider default width, and
+  sort/filter work on the same JSON text — structs and maps sorted by it, lists still sorted natively.
+- **JSON files that failed to open now read.** A column whose values disagree in type
+  (`{"v": 1}` then `{"v": "a"}`) failed on the first row that differed; it now reads as text.
+  Pretty-printed objects and `jq` output failed in schema inference, which read lines rather than
+  values; it now reads values. A UTF-8 byte-order mark failed the decoder; it is skipped. The
+  reader lives in the new `src/format/json.rs`.
+- **Sorting or filtering a JSON file in the grid works in `sql` builds.** `/v1/rows` sent every
+  sorted or filtered window to the SQL engine whenever one was compiled in — the release binaries
+  and the Docker image — and that engine cannot register JSON, so sorting or filtering *any*
+  column of a `.json`/`.ndjson`/`.jsonl` file failed with "the `sql` engine cannot read json
+  sources yet"; `/v1/export` of a filtered view failed the same way. A window now goes to the SQL
+  engine only when its capabilities list the source's format, and the local reader's Arrow-kernel
+  sort/filter answers the rest. The SQL engine's capabilities — and its `lakeleto engines` row —
+  are now derived from the same predicate `register` refuses by, so the list the API routes on
+  cannot drift from what the engine accepts.
+- **Paging a sorted or filtered grid through SQL no longer repeats or skips rows.** DataFusion's
+  parallel plan guarantees no order beyond the `ORDER BY`: a filtered window came back in
+  whatever order its partitions finished, and a sorted one left rows with equal keys to timing —
+  and even on one partition each page's `LIMIT` ordered them its own way. So the same window
+  differed between runs, and the next page, a fresh query at a new offset, could overlap the last
+  (14 of 100 rows, sorting a 5-million-row CSV by a three-value column). A filter-only window (and
+  a filtered export) now runs on one partition, in the file's order. A sorted window is taken
+  from the parallel plan with one row either side, and kept when no tie touches it — then it is
+  the only right answer, so a sort by distinct values (an id, a timestamp) costs what it did.
+  When a tie does touch it, it is read again with ties broken by position in the file: on 5
+  million rows and 4 cores, ~1.2 s for a 146 MB CSV and ~0.5 s for Parquet, where the old,
+  unstable answer took 0.3 s and 0.05 s.
+- **The local engine orders tied sort keys as they were read.** Arrow's sort is unstable, so ties
+  came out in an order of its own — the same on every request, but not the SQL engine's, so a
+  lean build and a `sql` build showed a tied sort differently. Both now use file order.
+- **A remote query's tables keep their read options.** `RemoteEngine::query` sent each table's
+  name, path and format only, so a table read with `--json-path` reached the server without it.
+  Tables now carry the same keys a single-source call sends (`json_path`, `flatten`).
+- **CSV and TSV exports take nested columns.** Arrow's CSV writer refuses a list, struct or map
+  column outright, so a view holding one — a JSON document read whole, a list of tags, a query
+  that returns an array — failed to download as CSV or TSV with "Nested type List(…) is not
+  supported in CSV", from `/v1/export` (the web app's **Download view**) and from
+  `-o csv` / `-o tsv`. Each nested cell is now the compact JSON the grid shows for it, the form
+  the web app's in-browser CSV already used, and a null is an empty cell; other columns are
+  written as before.
+
 ## [0.2.0] - 2026-09-10
 
 ### Added
@@ -464,6 +643,7 @@ one pluggable trait.
 - Release scaffolding: `LICENSE` (Apache-2.0), `NOTICE`, `CONTRIBUTING.md` (DCO),
   `SECURITY.md`, `CODE_OF_CONDUCT.md`, and this changelog.
 
-[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.3.0
 [0.2.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.2.0
 [0.1.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.1.0

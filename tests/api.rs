@@ -12,6 +12,7 @@ use lakeleto::api::router;
 use lakeleto::engine::Engine;
 use lakeleto::workspace::{LocalStore, WorkspaceStore};
 use lakeleto::LocalReaderEngine;
+use lakeleto::RequestContext;
 
 const CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/people.csv");
 
@@ -953,6 +954,165 @@ async fn workspace_crud_run_history_and_cached_result() {
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
 
+/// A saved query and a run keep the flattening their SQL was written against, so reopening either
+/// runs it again over the columns it named — `"user.name"` does not exist unflattened.
+#[tokio::test]
+async fn saved_queries_and_runs_keep_their_flattening() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn WorkspaceStore> = Arc::new(LocalStore::at(dir.path()).unwrap());
+    let (_, ws) = send(
+        app_store(store.clone()),
+        "POST",
+        "/v1/workspaces",
+        Some(serde_json::json!({ "name": "flat" })),
+    )
+    .await;
+    let id = ws["id"].as_str().unwrap().to_string();
+
+    let mut doc = ws.clone();
+    doc["saved_queries"] = serde_json::json!([{
+        "id": "q1", "name": "names", "sql": "SELECT \"user.name\" FROM t", "flatten": "all"
+    }]);
+    let (st, _) = send(
+        app_store(store.clone()),
+        "PUT",
+        &format!("/v1/workspaces/{id}"),
+        Some(doc),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, reread) = send(
+        app_store(store.clone()),
+        "GET",
+        &format!("/v1/workspaces/{id}"),
+        None,
+    )
+    .await;
+    assert_eq!(reread["saved_queries"][0]["flatten"], "all", "{reread}");
+
+    let data = write_nested_people(dir.path());
+    let runs = format!("/v1/workspaces/{id}/runs");
+    let (st, run) = send(
+        app_store(store.clone()),
+        "POST",
+        &runs,
+        Some(serde_json::json!({ "path": data, "flatten": "all", "preview": 5 })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{run}");
+    assert_eq!(run["run"]["flatten"], "all");
+    assert_eq!(column_names(&run), ["id", "user.name", "user.geo.lat"]);
+    let (_, plain) = send(
+        app_store(store.clone()),
+        "POST",
+        &runs,
+        Some(serde_json::json!({ "path": data, "preview": 1 })),
+    )
+    .await;
+    assert!(plain["run"].get("flatten").is_none(), "{plain}");
+
+    let (_, hist) = send(
+        app_store(store.clone()),
+        "GET",
+        &format!("/v1/workspaces/{id}/history"),
+        None,
+    )
+    .await;
+    let recorded: Vec<_> = hist["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["flatten"].clone())
+        .collect();
+    assert!(recorded.contains(&serde_json::json!("all")), "{hist}");
+}
+
+/// A run read at an explicit records path says so in its record, as it does for flattening:
+/// the path decides which rows and columns its SQL sees.
+#[tokio::test]
+async fn runs_record_the_records_path_they_read_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn WorkspaceStore> = Arc::new(LocalStore::at(dir.path()).unwrap());
+    let (_, ws) = send(
+        app_store(store.clone()),
+        "POST",
+        "/v1/workspaces",
+        Some(serde_json::json!({ "name": "paths" })),
+    )
+    .await;
+    let runs = format!("/v1/workspaces/{}/runs", ws["id"].as_str().unwrap());
+    let data = dir.path().join("two.json");
+    std::fs::write(
+        &data,
+        r#"{"users": [{"a": 1}], "groups": [{"b": 2}, {"b": 3}]}"#,
+    )
+    .unwrap();
+    let data = data.to_str().unwrap();
+
+    let (st, run) = send(
+        app_store(store.clone()),
+        "POST",
+        &runs,
+        Some(serde_json::json!({ "path": data, "json_path": "groups", "preview": 5 })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{run}");
+    assert_eq!(
+        run["run"]["json_path"], "/groups",
+        "recorded as the pointer it read"
+    );
+    assert_eq!(column_names(&run), ["b"]);
+    // `""` is a path too — the whole document, unwrapped by nothing — so it is recorded, empty,
+    // not dropped as if the run had none: the app refuses to reopen either kind as detection.
+    let (st, whole) = send(
+        app_store(store.clone()),
+        "POST",
+        &runs,
+        Some(serde_json::json!({ "path": data, "json_path": "", "preview": 1 })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{whole}");
+    assert_eq!(whole["run"]["json_path"], "", "{whole}");
+    assert_eq!(column_names(&whole), ["users", "groups"]);
+    let (_, plain) = send(
+        app_store(store.clone()),
+        "POST",
+        &runs,
+        Some(serde_json::json!({ "path": data, "preview": 1 })),
+    )
+    .await;
+    assert!(plain["run"].get("json_path").is_none(), "{plain}");
+
+    // A saved query keeps the path its SQL was written against — the empty one too, which is a
+    // path (the whole document), not the absence of one.
+    let id = ws["id"].as_str().unwrap();
+    let mut doc = ws.clone();
+    doc["saved_queries"] = serde_json::json!([
+        { "id": "q1", "name": "groups", "sql": "SELECT b FROM t", "json_path": "/groups" },
+        { "id": "q2", "name": "whole", "sql": "SELECT users FROM t", "json_path": "" },
+        { "id": "q3", "name": "detected", "sql": "SELECT * FROM t" }
+    ]);
+    let (st, _) = send(
+        app_store(store.clone()),
+        "PUT",
+        &format!("/v1/workspaces/{id}"),
+        Some(doc),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, reread) = send(
+        app_store(store.clone()),
+        "GET",
+        &format!("/v1/workspaces/{id}"),
+        None,
+    )
+    .await;
+    let saved = &reread["saved_queries"];
+    assert_eq!(saved[0]["json_path"], "/groups", "{reread}");
+    assert_eq!(saved[1]["json_path"], "", "{reread}");
+    assert!(saved[2].get("json_path").is_none(), "{reread}");
+}
+
 #[tokio::test]
 async fn workspace_export_import_round_trip() {
     let dir = tempfile::tempdir().unwrap();
@@ -1073,7 +1233,9 @@ async fn workspace_history_sync_and_raw_result_round_trip() {
 
     // Upload the run's raw Parquet result (a real file, made through the OSS pipeline)…
     let source = lakeleto::Source::resolve(CSV, None).unwrap();
-    let rb = LocalReaderEngine::default().preview(&source, 10).unwrap();
+    let rb = LocalReaderEngine::default()
+        .preview(&RequestContext::detached(), &source, 10)
+        .unwrap();
     let parquet = lakeleto::render::to_parquet(&rb).unwrap();
     let put = Request::builder()
         .method("PUT")
@@ -1276,9 +1438,50 @@ async fn export_renders_every_advertised_format() {
     }
 }
 
+/// A JSON document read whole is one row whose columns are lists of records. Arrow's CSV writer
+/// refuses a nested column, so that view could be read but not exported as CSV or TSV; each nested
+/// cell is written as the JSON the grid shows for it.
+#[tokio::test]
+async fn export_writes_a_nested_column_as_json_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two.json");
+    std::fs::write(
+        &path,
+        r#"{"users":[{"a":1}],"groups":[{"b":2},{"b":3}],"note":"x"}"#,
+    )
+    .unwrap();
+    let p = path.display();
+    for (fmt, want) in [
+        (
+            "csv",
+            "users,groups,note\n\"[{\"\"a\"\":1}]\",\"[{\"\"b\"\":2},{\"\"b\"\":3}]\",x\n",
+        ),
+        (
+            "tsv",
+            "users\tgroups\tnote\n\"[{\"\"a\"\":1}]\"\t\"[{\"\"b\"\":2},{\"\"b\"\":3}]\"\tx\n",
+        ),
+    ] {
+        let r = app()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/export?path={p}&json_path=&fmt={fmt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = r.status();
+        let body =
+            String::from_utf8(to_bytes(r.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        assert_eq!(status, StatusCode::OK, "fmt={fmt}: {body}");
+        assert_eq!(body, want, "fmt={fmt}");
+    }
+}
+
 /// A router with the SQL engine wired, which is what a real `serve --features sql` is. It matters
-/// for filters specifically: `scan_engine` routes any non-plain window — i.e. every filtered scan
-/// — to DataFusion, so the SQL `WHERE` builder, not the Arrow kernel path, answers them.
+/// for filters specifically: `scan_engine` routes any non-plain window over a format DataFusion can
+/// read — i.e. every filtered scan of a CSV/Parquet source — to DataFusion, so the SQL `WHERE`
+/// builder, not the Arrow kernel path, answers them.
 #[cfg(feature = "sql")]
 fn app_sql() -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
@@ -1358,6 +1561,346 @@ async fn the_two_filter_implementations_agree() {
             local["matched_rows"], sql["matched_rows"]
         );
     }
+}
+
+/// `GET` `uri` against `app` — [`get_json`] for a router other than the default one.
+#[cfg(feature = "sql")]
+async fn get_json_from(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+/// A JSON grid in a `sql` build — what every release binary and the Docker image are.
+///
+/// `scan_engine` used to send every sorted or filtered window to DataFusion, which could not
+/// register JSON then, so sorting or filtering *any* column of a `.json`/`.ndjson` file failed
+/// with "the `sql` engine cannot read json sources yet" — in the builds users download, while the
+/// lean build (no SQL engine, so the local reader answered) worked. The default `app()` has no SQL
+/// engine, which is why no test saw it. DataFusion now reads JSON through the local reader, so the
+/// sorted and filtered windows here go through SQL — and both builds must give the same answer.
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn json_grid_sorts_filters_and_exports_with_sql_compiled_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows: Vec<serde_json::Value> = serde_json::from_str(
+        r#"[{"id":1,"name":"Ada","city":"London"},
+            {"id":2,"name":"Grace","city":"New York"},
+            {"id":3,"name":"Alan","city":"London"},
+            {"id":4,"name":"Edsger","city":"Amsterdam"}]"#,
+    )
+    .unwrap();
+    let array = dir.path().join("people.json");
+    std::fs::write(&array, serde_json::to_string(&rows).unwrap()).unwrap();
+    let ndjson = dir.path().join("people.ndjson");
+    let lines: Vec<String> = rows.iter().map(|r| r.to_string()).collect();
+    std::fs::write(&ndjson, lines.join("\n")).unwrap();
+
+    for path in [&array, &ndjson] {
+        let p = path.display();
+        let sort = format!("/v1/rows?path={p}&sort=id&desc=1&limit=2");
+        let filter = format!("/v1/rows?path={p}&filter=city:eq:London");
+
+        let (status, sorted) = get_json_from(app_sql(), &sort).await;
+        assert_eq!(status, StatusCode::OK, "sort {p}: {sorted}");
+        assert_eq!(sorted["rows"][0]["id"], 4, "sort {p}: {sorted}");
+
+        let (status, filtered) = get_json_from(app_sql(), &filter).await;
+        assert_eq!(status, StatusCode::OK, "filter {p}: {filtered}");
+        assert_eq!(filtered["matched_rows"], 2, "filter {p}: {filtered}");
+
+        // A tie (two London rows) comes in file order in both builds.
+        let tied = format!("/v1/rows?path={p}&sort=city");
+        let (status, tied_rows) = get_json_from(app_sql(), &tied).await;
+        assert_eq!(status, StatusCode::OK, "tied {p}: {tied_rows}");
+        let ids: Vec<_> = tied_rows["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, [4, 1, 3, 2], "tied {p}: London's rows in file order");
+
+        // Same rows as the build without a SQL engine.
+        for (uri, sql) in [(&sort, &sorted), (&filter, &filtered), (&tied, &tied_rows)] {
+            let (_, local) = get_json(uri).await;
+            assert_eq!(local["rows"], sql["rows"], "{uri}: the two builds disagree");
+        }
+
+        // `/v1/export` of a filtered view routes the same way.
+        let resp = app_sql()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/export?path={p}&filter=city:eq:London&fmt=csv"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "export {p}");
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            body.lines().filter(|l| !l.trim().is_empty()).count(),
+            3,
+            "export {p}: header + 2 rows, got {body}"
+        );
+    }
+}
+
+/// An unwrapped JSON document says where its rows came from, and nothing else grows the field.
+#[tokio::test]
+async fn schema_reports_the_records_path_it_unwrapped() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api.json");
+    std::fs::write(&path, r#"{"meta":{"n":2},"data":[{"id":1},{"id":2}]}"#).unwrap();
+    let (status, json) = get_json(&format!("/v1/schema?path={}", path.display())).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["records_path"], "/data");
+
+    let (_, csv) = get_json(&format!("/v1/schema?path={CSV}")).await;
+    assert!(csv.get("records_path").is_none(), "{csv}");
+}
+
+/// `?json_path=` picks the records detection would not, on every read route that takes a path.
+#[tokio::test]
+async fn json_path_selects_records_on_schema_and_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two.json");
+    std::fs::write(&path, r#"{"users":[{"a":1}],"groups":[{"b":2},{"b":3}]}"#).unwrap();
+    let p = path.display();
+
+    let (status, schema) = get_json(&format!("/v1/schema?path={p}&json_path=groups")).await;
+    assert_eq!(status, StatusCode::OK, "{schema}");
+    assert_eq!(schema["records_path"], "/groups");
+
+    let (status, rows) =
+        get_json(&format!("/v1/rows?path={p}&json_path=groups&sort=b&desc=1")).await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows["rows"][0]["b"], 3);
+
+    // An empty path is a path — the whole document, unwrapped by nothing — on every route that
+    // reads, not a missing one: the app sends it as `json_path=`.
+    let (status, schema) = get_json(&format!("/v1/schema?path={p}&json_path=")).await;
+    assert_eq!(status, StatusCode::OK, "{schema}");
+    assert!(schema.get("records_path").is_none(), "{schema}");
+    assert_eq!(schema["columns"][0]["name"], "users", "{schema}");
+    for route in ["rows", "stats"] {
+        let (status, body) = get_json(&format!("/v1/{route}?path={p}&json_path=")).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        assert_eq!(body["columns"][1]["name"], "groups", "{route}: {body}");
+    }
+
+    // A path that names nothing is the caller's mistake, said as a 400.
+    let (status, err) = get_json(&format!("/v1/schema?path={p}&json_path=/nope")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+}
+
+/// NDJSON with a nested `user`; row 2 has none.
+fn write_nested_people(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("people.ndjson");
+    std::fs::write(
+        &path,
+        concat!(
+            r#"{"id":1,"user":{"name":"Grace","geo":{"lat":40.7}}}"#,
+            "\n",
+            r#"{"id":2,"user":null}"#,
+            "\n",
+            r#"{"id":3,"user":{"name":"Ada","geo":{"lat":51.5}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn column_names(schema: &serde_json::Value) -> Vec<String> {
+    schema["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn flatten_spreads_struct_columns_on_every_read_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_nested_people(dir.path());
+    let p = path.display();
+
+    // A bare `?flatten` is every level.
+    let (status, schema) = get_json(&format!("/v1/schema?path={p}&flatten")).await;
+    assert_eq!(status, StatusCode::OK, "{schema}");
+    assert_eq!(column_names(&schema), ["id", "user.name", "user.geo.lat"]);
+
+    let (status, rows) = get_json(&format!(
+        "/v1/rows?path={p}&flatten=all&sort=user.geo.lat&desc=1"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows["rows"][0]["user.name"], "Ada");
+
+    let (status, preview) = get_json(&format!("/v1/preview?path={p}&flatten=1&limit=5")).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(column_names(&preview), ["id", "user.name", "user.geo"]);
+
+    let (status, stats) = get_json(&format!(
+        "/v1/stats?path={p}&flatten&filter=user.name:eq:Grace"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{stats}");
+    assert_eq!(stats["row_count"], 1);
+
+    let (status, profile) = get_json(&format!("/v1/profile?path={p}&flatten")).await;
+    assert_eq!(status, StatusCode::OK, "{profile}");
+    assert_eq!(profile["columns"].as_array().unwrap().len(), 3);
+
+    // `none` turns it off, and a value that is neither is the caller's mistake.
+    let (_, schema) = get_json(&format!("/v1/schema?path={p}&flatten=none")).await;
+    assert_eq!(column_names(&schema), ["id", "user"]);
+    let (status, err) = get_json(&format!("/v1/schema?path={p}&flatten=deep")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+}
+
+/// `id` and a `user: {name, geo: {lat}}` struct, as Parquet — a format the SQL engine reads, so a
+/// flattened grid window goes to DataFusion in a `sql` build.
+#[cfg(feature = "sql")]
+fn write_nested_parquet(path: &std::path::Path) {
+    use arrow_array::{
+        Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, StructArray,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    let geo = StructArray::from(vec![(
+        Arc::new(Field::new("lat", DataType::Float64, true)),
+        Arc::new(Float64Array::from(vec![40.7, 51.5, 60.2])) as ArrayRef,
+    )]);
+    let user = StructArray::from(vec![
+        (
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec!["Grace", "Ada", "Linus"])) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("geo", geo.data_type().clone(), true)),
+            Arc::new(geo) as ArrayRef,
+        ),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("user", user.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(user)],
+    )
+    .unwrap();
+    let mut w =
+        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, None)
+            .unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+}
+
+/// A flattened grid over Parquet in a `sql` build sorts and filters through DataFusion — over the
+/// whole file — and must show the rows the local engine would; a query names the fields too.
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn a_flattened_grid_and_query_agree_with_sql_compiled_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("users.parquet");
+    write_nested_parquet(&path);
+    let p = path.display();
+
+    let uri = format!("/v1/rows?path={p}&flatten&sort=user.name&desc=1&filter=user.geo.lat:gt:45");
+    let (status, by_sql) = get_json_from(app_sql(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{by_sql}");
+    let (_, by_local) = get_json(&uri).await;
+    assert_eq!(by_sql["rows"], by_local["rows"]);
+    let ids: Vec<_> = by_sql["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [3, 2], "Linus, then Ada");
+
+    let body = serde_json::json!({
+        "sql": r#"SELECT "user.name" AS name FROM u WHERE "user.geo.lat" < 55 ORDER BY id"#,
+        "tables": [{"name": "u", "path": path, "flatten": "all"}],
+    })
+    .to_string();
+    let resp = app_sql()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/query")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let names: Vec<_> = json["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["Grace", "Ada"]);
+}
+
+/// SQL over a JSON document DataFusion's own reader cannot open — pretty-printed, wrapped in an
+/// envelope with two candidate arrays — registered through the local reader, records path and all.
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn sql_queries_json_the_way_the_grid_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("api.json");
+    std::fs::write(
+        &path,
+        r#"{
+  "meta": {"page": 1},
+  "users": [
+    {"id": 1, "city": "London"},
+    {"id": 2, "city": "Oslo"},
+    {"id": 3, "city": "London"}
+  ],
+  "groups": [{"g": "a"}]
+}"#,
+    )
+    .unwrap();
+    let body = serde_json::json!({
+        "sql": "SELECT city, count(*) AS n FROM t GROUP BY city ORDER BY n DESC, city",
+        "tables": [{"name": "t", "path": path, "json_path": "users"}],
+    })
+    .to_string();
+    let resp = app_sql()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/query")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([{"city": "London", "n": 2}, {"city": "Oslo", "n": 1}])
+    );
 }
 
 #[tokio::test]
@@ -1873,4 +2416,178 @@ async fn a_union_with_mixed_nullability_still_encodes_on_the_arrow_arm() {
             assert!(rb.num_rows() >= 2);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `POST /v1/query` with `stream: true` — the Arrow IPC body written as the engine produces it
+// ---------------------------------------------------------------------------------------------
+
+/// A CSV big enough that DataFusion produces several batches, so the response is a stream of more
+/// than one IPC message rather than a buffer with a stream's content-type.
+#[cfg(feature = "sql")]
+fn big_csv(dir: &std::path::Path) -> String {
+    let path = dir.join("big.csv");
+    let mut body = String::from("id,name\n");
+    for i in 0..30_000 {
+        body.push_str(&format!("{i},row-{i}\n"));
+    }
+    std::fs::write(&path, body).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[cfg(feature = "sql")]
+async fn post_query_stream(
+    body: serde_json::Value,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/query")
+        .header("content-type", "application/json")
+        .header("accept", ARROW_MIME)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app_sql().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (status, headers, bytes.to_vec())
+}
+
+/// The streamed body decodes to the same rows the buffered one returns, and it is a *complete* IPC
+/// stream — the end-of-stream marker is what distinguishes a finished result from an abandoned one,
+/// so `from_arrow_ipc` succeeding is the assertion that matters most here.
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn a_streamed_query_decodes_to_the_same_rows_as_a_buffered_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = big_csv(dir.path());
+
+    let (status, headers, streamed) = post_query_stream(serde_json::json!({
+        "sql": "SELECT id, name FROM t", "file": csv, "limit": 25_000, "stream": true
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("content-type").unwrap(),
+        ARROW_MIME,
+        "a streamed result is still an Arrow IPC stream"
+    );
+
+    let rb = lakeleto::render::from_arrow_ipc(&streamed).expect("a complete IPC stream");
+    assert_eq!(rb.num_rows(), 25_000);
+    assert!(
+        rb.batches.len() > 1,
+        "the point is that it arrives in pieces; got {} batch(es)",
+        rb.batches.len()
+    );
+
+    // Byte-identical to the buffered encoding of the same query, so the flag changes when bytes
+    // arrive and not what they say.
+    let (status, _, buffered) = post_query_stream(serde_json::json!({
+        "sql": "SELECT id, name FROM t", "file": csv, "limit": 25_000
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        streamed, buffered,
+        "streaming must not change the encoding, only its timing"
+    );
+}
+
+/// `capped` cannot be a header on a streaming response — it is not knowable before the first byte —
+/// so the cap itself is sent instead and the client derives the same fact. This pins that the
+/// information is preserved rather than dropped.
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn a_streamed_response_reports_the_cap_in_place_of_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = big_csv(dir.path());
+    let (status, headers, body) = post_query_stream(serde_json::json!({
+        "sql": "SELECT id FROM t", "file": csv, "limit": 100, "stream": true
+    }))
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("x-lakeleto-row-cap").unwrap(),
+        "100",
+        "the client needs the cap to compute `capped` itself"
+    );
+    assert!(
+        headers.get("x-lakeleto-capped").is_none(),
+        "a streaming response must not claim to know something it cannot"
+    );
+
+    // And the cap really bounds the result, not just the header.
+    let rb = lakeleto::render::from_arrow_ipc(&body).unwrap();
+    assert_eq!(rb.num_rows(), 100);
+    // capped, derived the way a client would: rows received == the cap it was told about.
+    assert_eq!(rb.num_rows(), 100);
+}
+
+/// Streaming is refused over JSON rather than silently buffered. The JSON body carries aggregate
+/// counts that do not exist until the last row is read, so honouring the flag there would mean
+/// returning a different document — a wire change wearing a flag's clothing.
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn streaming_is_refused_over_json_rather_than_ignored() {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/query")
+        .header("content-type", "application/json")
+        // No `accept: arrow`.
+        .body(Body::from(
+            serde_json::json!({ "sql": "SELECT 1 AS a", "file": CSV, "stream": true }).to_string(),
+        ))
+        .unwrap();
+    let resp = app_sql().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stream"),
+        "the refusal should name the flag: {body}"
+    );
+}
+
+/// A query that cannot be planned is still a 4xx with a message, because the plan is opened before
+/// the response exists. Once a body has started the status is spent, so this is the boundary worth
+/// pinning: everything knowable up front stays knowable.
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn a_planning_failure_is_still_a_status_code_not_a_truncated_stream() {
+    let (status, _, body) = post_query_stream(serde_json::json!({
+        "sql": "SELECT no_such_column FROM t", "file": CSV, "stream": true
+    }))
+    .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "expected an error status, got {status}"
+    );
+    assert!(
+        lakeleto::render::from_arrow_ipc(&body).is_err(),
+        "an error response must not decode as a result"
+    );
+}
+
+/// An empty result still produces a well-formed stream — schema message, no batches, end-of-stream
+/// marker — rather than an empty body a reader cannot interpret.
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn an_empty_streamed_result_is_still_a_valid_ipc_stream() {
+    let (status, _, body) = post_query_stream(serde_json::json!({
+        "sql": "SELECT * FROM t WHERE 1 = 0", "file": CSV, "stream": true
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rb = lakeleto::render::from_arrow_ipc(&body).expect("a valid, empty IPC stream");
+    assert_eq!(rb.num_rows(), 0);
+    assert!(
+        !rb.schema.fields().is_empty(),
+        "the schema travels even with no rows — a client still needs the columns"
+    );
 }

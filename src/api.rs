@@ -50,6 +50,24 @@
 //! with bytes it did not ask for. There is no `406`: the IPC codec is compiled unconditionally,
 //! so negotiation cannot fail and JSON always answers.
 //!
+//! ### Streaming (`POST /v1/query` with `"stream": true`)
+//!
+//! Over Arrow only, and opt-in. The body is written as the engine produces batches, so a result
+//! larger than the server's memory has an answer and the first bytes leave before the last split is
+//! read. Two things change with it, both because a stream commits to its headers before it knows
+//! its content:
+//!
+//! - `X-Lakeleto-Capped` is replaced by `X-Lakeleto-Row-Cap`. `capped` is `rows >= cap`, and a
+//!   client counting the rows it receives has the first term; the header gives it the second. The
+//!   fact is preserved, it just arrives in the order a stream permits.
+//! - A failure *after* the first byte can only end the stream, because the status line is spent. The
+//!   plan is therefore opened before the response is built, so everything knowable up front —
+//!   syntax, a missing column, a refused mutation — is still a status code with a message.
+//!
+//! It is refused, not silently buffered, over JSON: that body's `num_rows` and `capped` do not exist
+//! until the last row is read, so honouring the flag there would mean returning a different
+//! document.
+//!
 //! That makes Arrow the engine-to-engine codec: `RemoteEngine` (`--features remote`) reads rows
 //! back over HTTP with their Arrow types intact, which a JSON rendering cannot do. Its peer is
 //! whatever speaks this contract — another `lakeleto serve`, or a hosted plane serving part of
@@ -71,12 +89,13 @@ use axum::{
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 
+use crate::context::RequestContext;
 use crate::engine::{
     Capabilities, ColumnSchema, Engine, FilterOp, FilterSpec, NamedSource, RowBatch, ScanResult,
     ScanSpec, SortSpec, TableProfile, TableSchema,
 };
-use crate::error::EngineError;
-use crate::source::{list_dir, DirListing, Format, Source};
+use crate::error::{CancelReason, EngineError};
+use crate::source::{list_dir, DirListing, Flatten, Format, RemoteProbe, Source};
 use crate::workspace::{RunRecord, RunStatus, Workspace, WorkspaceBundle, WorkspaceStore};
 
 /// Export view cap — the most rows `GET /v1/export` will materialize.
@@ -155,6 +174,57 @@ pub struct AppState {
     /// Persistent workspaces + query history + result cache (the "Postman" data plane). Behind the
     /// [`WorkspaceStore`] trait so a synced cloud store drops in later without a route change.
     store: Arc<dyn WorkspaceStore>,
+}
+
+impl AppState {
+    /// The [`RequestContext`] every engine call on this server is made under.
+    ///
+    /// Detached today — `serve` imposes no deadline and has no way to cancel — so behaviour is
+    /// unchanged. It exists as a single function rather than ten `RequestContext::detached()`
+    /// literals at the call sites because that is the difference between one edit and ten when
+    /// the two obvious follow-ups land:
+    ///
+    /// - a `--request-timeout` flag, which becomes `.with_timeout(..)` here;
+    /// - cancel-on-disconnect. The streaming query path already stops work when a client hangs up,
+    ///   but by backpressure rather than through this context: the response channel closes, the
+    ///   Arrow writer fails, and the `RowStream` is dropped along with its plan (see `BodyWriter`).
+    ///   Routing that through a [`CancelToken`](crate::CancelToken) here instead would extend it to
+    ///   the buffered endpoints, which still cannot notice — nothing observes a hangup while the
+    ///   whole response is built before the first byte.
+    ///
+    /// The engines already honour both — the local reader checks per file and per batch, the
+    /// SQL engine runs its query under a watchdog, the remote engine turns a deadline into its
+    /// HTTP timeout — so what is missing is a server-side policy, not engine support.
+    fn ctx(&self) -> RequestContext {
+        RequestContext::detached()
+    }
+
+    /// Resolve a caller-supplied path under this server's identity and probe posture.
+    ///
+    /// The posture is [`RemoteProbe::Ambient`], and the reason is what `serve` is: a local
+    /// explorer the operator ran on their own machine, against their own credentials, bound to
+    /// loopback by default. There is no second principal for a probe to be confused about. With
+    /// `--root` set the question does not arise at all — [`confine_entry`] refuses every
+    /// object-store and database URI before this runs, because `--root` is a local-filesystem
+    /// gate.
+    ///
+    /// It is one function, and named, for the same reason [`AppState::ctx`] is: the posture of a
+    /// multi-tenant server is [`RemoteProbe::VendedOnly`], and if that is ever what this becomes,
+    /// this is the line that changes rather than ten call sites that each looked fine.
+    fn resolve(&self, path: &str, read: &ReadAs) -> Result<Source, ApiError> {
+        let flatten = match read.flatten.as_deref() {
+            Some(value) => Flatten::parse(value)?,
+            None => None,
+        };
+        Ok(Source::resolve_in(
+            path,
+            read.format.as_deref(),
+            &self.ctx(),
+            RemoteProbe::Ambient,
+        )?
+        .with_json_path(read.json_path.as_deref())?
+        .with_flatten(flatten))
+    }
 }
 
 /// Build the router. Exposed (not just `serve`) so it can be driven in tests without a socket.
@@ -563,23 +633,44 @@ pub fn encode_query(s: &str) -> String {
 
 // ---- request / response wire types ----------------------------------------------------
 
+/// How a request asks for its source to be read, beyond where it is — the options every read
+/// endpoint shares. One struct, `#[serde(flatten)]`ed into each request, so a new option is a field
+/// here and a line in [`AppState::resolve`] rather than another argument at every call site.
+///
+/// Every field is a string on purpose: a flattened struct is deserialized from buffered values, and
+/// a query string's buffered values are all text, so a number here would never parse.
+#[derive(Deserialize, Default)]
+struct ReadAs {
+    #[serde(default)]
+    format: Option<String>,
+    /// JSON records path (see `Source::json_path`).
+    #[serde(default)]
+    json_path: Option<String>,
+    /// Struct flattening: `all`, a number of levels, or `none` (see `Source::flatten`).
+    #[serde(default)]
+    flatten: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct SourceQuery {
     path: String,
-    format: Option<String>,
+    #[serde(flatten)]
+    read: ReadAs,
 }
 
 #[derive(Deserialize)]
 struct PreviewQuery {
     path: String,
-    format: Option<String>,
+    #[serde(flatten)]
+    read: ReadAs,
     limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct ProfileQuery {
     path: String,
-    format: Option<String>,
+    #[serde(flatten)]
+    read: ReadAs,
     scan: Option<usize>,
 }
 
@@ -593,14 +684,22 @@ struct QueryBody {
     /// Max rows to return, clamped to [`QUERY_CAP`]; [`QUERY_DEFAULT_LIMIT`] when absent.
     #[serde(default)]
     limit: Option<usize>,
+    /// Stream the result instead of buffering it — see [`query`].
+    ///
+    /// Opt-in rather than the default because it changes the response's shape, not just its
+    /// timing: `x-lakeleto-capped` is replaced by [`H_ROW_CAP`], and a failure that happens after
+    /// the first byte can only end the stream rather than change the status. Existing clients are
+    /// unaffected by a field they do not send.
+    #[serde(default)]
+    stream: bool,
 }
 
 #[derive(Deserialize)]
 struct TableSpec {
     name: String,
     path: String,
-    #[serde(default)]
-    format: Option<String>,
+    #[serde(flatten)]
+    read: ReadAs,
 }
 
 #[derive(Serialize)]
@@ -709,6 +808,14 @@ const H_TOTAL_KNOWN: &str = "x-lakeleto-total-known";
 const H_SCANNED_ROWS: &str = "x-lakeleto-scanned-rows";
 const H_BOUNDED: &str = "x-lakeleto-bounded";
 const H_CAPPED: &str = "x-lakeleto-capped";
+/// The effective row cap, sent on a **streaming** query response in place of [`H_CAPPED`].
+///
+/// `capped` is `num_rows >= cap`, and a streaming response cannot know `num_rows` before its first
+/// byte — headers are long gone by then. But the client can compute it: it counts the rows it
+/// receives, and this header tells it the only other term. So no information is lost, it just
+/// arrives in the order a stream permits. (A client that sent an explicit `limit` already knew the
+/// cap; this is for the one that relied on the server default.)
+const H_ROW_CAP: &str = "x-lakeleto-row-cap";
 
 /// Does this request want Arrow IPC instead of JSON?
 ///
@@ -738,6 +845,12 @@ fn wants_arrow(headers: &HeaderMap) -> bool {
 /// `"true"`/`"false"` — the wire spelling of a sidecar boolean.
 fn hv_bool(b: bool) -> HeaderValue {
     HeaderValue::from_static(if b { "true" } else { "false" })
+}
+
+/// A count as a header value. Infallible for a `usize` — the decimal spelling is always
+/// header-safe — so the `unwrap_or` never fires and does not need a story.
+fn hv_usize(n: usize) -> HeaderValue {
+    HeaderValue::from_str(&n.to_string()).unwrap_or_else(|_| HeaderValue::from_static("0"))
 }
 
 /// One row-returning response body, already encoded.
@@ -813,10 +926,11 @@ async fn schema(
     Query(q): Query<SourceQuery>,
 ) -> Result<Json<TableSchema>, ApiError> {
     confine_entry(&st.root, &q.path)?;
-    let source = Source::resolve(&q.path, q.format.as_deref())?;
+    let source = st.resolve(&q.path, &q.read)?;
     confine_members(&st.root, &source)?;
     let engine = read_engine(&st, &source)?;
-    Ok(Json(blocking(move || engine.schema(&source)).await?))
+    let ctx = st.ctx();
+    Ok(Json(blocking(move || engine.schema(&ctx, &source)).await?))
 }
 
 async fn info(
@@ -824,7 +938,7 @@ async fn info(
     Query(q): Query<SourceQuery>,
 ) -> Result<Json<InfoResponse>, ApiError> {
     confine_entry(&st.root, &q.path)?;
-    let source = Source::resolve(&q.path, q.format.as_deref())?;
+    let source = st.resolve(&q.path, &q.read)?;
     confine_members(&st.root, &source)?;
     // Local files answer from the filesystem; a remote object answers from a `HEAD`. Both are
     // cheap and neither reads data — an unknown size here used to mean "this URI is remote".
@@ -832,7 +946,10 @@ async fn info(
         #[cfg(feature = "object-store")]
         {
             let uri = source.path.to_string_lossy().to_string();
-            blocking(move || Ok(crate::objstore::object_size(&uri))).await?
+            // As whoever the context says, else as the process — the same ambient posture, and the
+            // same reason, as `AppState::resolve`. A `HEAD` is a read; it is performed as somebody.
+            let opts = st.ctx().store_options_or_env().into_owned();
+            blocking(move || Ok(crate::objstore::object_size_with(&uri, &opts))).await?
         }
         #[cfg(not(feature = "object-store"))]
         {
@@ -845,7 +962,8 @@ async fn info(
     let path = source.display();
     let engine = read_engine(&st, &source)?;
     let engine_name = engine.name().to_string();
-    let schema = blocking(move || engine.schema(&source)).await?;
+    let ctx = st.ctx();
+    let schema = blocking(move || engine.schema(&ctx, &source)).await?;
     Ok(Json(InfoResponse {
         path,
         format,
@@ -862,7 +980,7 @@ async fn preview(
     Query(q): Query<PreviewQuery>,
 ) -> Result<Response, ApiError> {
     confine_entry(&st.root, &q.path)?;
-    let source = Source::resolve(&q.path, q.format.as_deref())?;
+    let source = st.resolve(&q.path, &q.read)?;
     confine_members(&st.root, &source)?;
     // Bound a caller-supplied limit above by the same ceiling `POST /v1/query` enforces — otherwise
     // `?limit=999999999` materialises the whole table. Only the upper bound is clamped, so
@@ -870,9 +988,10 @@ async fn preview(
     // (a screenful) is already small and left untouched.
     let limit = q.limit.map(|n| n.min(QUERY_CAP)).unwrap_or(50);
     let engine = read_engine(&st, &source)?;
+    let ctx = st.ctx();
     let arrow = wants_arrow(&headers);
     let payload = blocking(move || {
-        let rb = engine.preview(&source, limit)?;
+        let rb = engine.preview(&ctx, &source, limit)?;
         if arrow {
             // The window here is explicit, so `capped` is always false — but it is still emitted,
             // so an Arrow client reads the same fields off the response as a JSON one.
@@ -891,7 +1010,7 @@ async fn profile(
     Query(q): Query<ProfileQuery>,
 ) -> Result<Json<TableProfile>, ApiError> {
     confine_entry(&st.root, &q.path)?;
-    let source = Source::resolve(&q.path, q.format.as_deref())?;
+    let source = st.resolve(&q.path, &q.read)?;
     confine_members(&st.root, &source)?;
     // A caller-supplied `?scan=` is bounded above by the query ceiling so it can't ask the profiler
     // to walk an unbounded number of rows; the operator-configured default (trusted) is left as-is.
@@ -899,7 +1018,10 @@ async fn profile(
     // `LocalReaderEngine::profile`), so a lower clamp would silently disable it.
     let scan = q.scan.map(|n| n.min(QUERY_CAP)).unwrap_or(st.default_scan);
     let engine = read_engine(&st, &source)?;
-    Ok(Json(blocking(move || engine.profile(&source, scan)).await?))
+    let ctx = st.ctx();
+    Ok(Json(
+        blocking(move || engine.profile(&ctx, &source, scan)).await?,
+    ))
 }
 
 async fn query(
@@ -915,7 +1037,7 @@ async fn query(
     let mut named = Vec::new();
     if let Some(f) = &body.file {
         confine_entry(&st.root, f)?;
-        let source = Source::detect(f)?;
+        let source = st.resolve(f, &ReadAs::default())?;
         confine_members(&st.root, &source)?;
         named.push(NamedSource {
             name: "t".to_string(),
@@ -924,7 +1046,7 @@ async fn query(
     }
     for t in &body.tables {
         confine_entry(&st.root, &t.path)?;
-        let source = Source::resolve(&t.path, t.format.as_deref())?;
+        let source = st.resolve(&t.path, &t.read)?;
         confine_members(&st.root, &source)?;
         named.push(NamedSource {
             name: t.name.clone(),
@@ -952,9 +1074,24 @@ async fn query(
         .limit
         .unwrap_or(QUERY_DEFAULT_LIMIT)
         .clamp(1, QUERY_CAP);
+    let ctx = st.ctx();
     let arrow = wants_arrow(&headers);
+    if body.stream {
+        // Only over Arrow IPC, and refused rather than silently buffered. The JSON body is an
+        // object with aggregate fields (`num_rows`, `capped`) that are not knowable until the end,
+        // so "streaming JSON" would have to be a different document — a wire change disguised as a
+        // flag. The IPC stream format, by contrast, *is* a schema message followed by batch
+        // messages: streaming it is what it was designed for.
+        if !arrow {
+            return Err(ApiError(EngineError::Other(format!(
+                "`stream: true` needs `Accept: {ARROW_STREAM_MIME}` — the JSON body reports \
+                 aggregate counts that do not exist until the last row is read"
+            ))));
+        }
+        return stream_query(engine, ctx, sql, named, cap).await;
+    }
     let payload = blocking(move || {
-        let rb = engine.query_capped(&sql, &named, cap)?;
+        let rb = engine.query_capped(&ctx, &sql, &named, cap)?;
         if arrow {
             // Same conservative rule the JSON body uses: a result that exactly fills the cap
             // reports `capped` even when nothing was actually dropped.
@@ -970,6 +1107,108 @@ async fn query(
     Ok(payload.into_response())
 }
 
+/// A [`std::io::Write`] that hands each chunk to axum's response body.
+///
+/// The Arrow IPC writer is synchronous and the response body is asynchronous, so this is the
+/// join between them: the writer runs on a blocking thread and `blocking_send` applies the
+/// backpressure — a slow client simply makes the next write wait, and the query stops producing
+/// while it does.
+///
+/// **A closed receiver is cancel-on-disconnect, and it arrives for free.** When the client hangs
+/// up, axum drops the body, the channel closes, this returns `BrokenPipe`, the IPC writer fails,
+/// and `stream_query` stops pulling — which drops the `RowStream`, the DataFusion stream and the
+/// physical plan. The gap document lists cancel-on-disconnect as blocked on the streaming seam,
+/// and this is why: nothing could notice a hangup while the whole response was built before the
+/// first byte.
+struct BodyWriter(tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>);
+
+impl std::io::Write for BodyWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .blocking_send(Ok(axum::body::Bytes::copy_from_slice(buf)))
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the client stopped reading this result",
+                )
+            })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `POST /v1/query` with `stream: true` — an Arrow IPC body written as the engine produces it.
+///
+/// The plan is opened **before** the response is built, on a blocking thread, so a syntax error or
+/// a missing column is still a 4xx with a message. Only once that succeeds does a body exist, and
+/// from then on a failure can only end the stream early: the status line is already sent. An Arrow
+/// reader sees a stream with no end-of-stream marker and reports it as truncated, which is the
+/// honest signal available at that point — and the reason planning happens first is to make it the
+/// rare one.
+///
+/// Not gated on `sql`: the engine behind this is whichever one the handler picked, and a backend
+/// that cannot produce incrementally takes the trait's buffered default — the response still
+/// streams out of the buffer, which is a smaller win but not a different contract.
+async fn stream_query(
+    engine: Arc<dyn Engine>,
+    ctx: RequestContext,
+    sql: String,
+    named: Vec<NamedSource>,
+    cap: usize,
+) -> Result<Response, ApiError> {
+    let opened = blocking(move || {
+        let stream = engine.query_stream(&ctx, &sql, &named, Some(cap))?;
+        Ok((stream.schema().clone(), stream))
+    })
+    .await?;
+    let (schema, stream) = opened;
+
+    // Two chunks in flight: enough that the writer is not woken per batch, small enough that a
+    // client that stops reading stops the query rather than buying it a buffer to fill.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(2);
+    tokio::task::spawn_blocking(move || {
+        let mut writer =
+            match arrow_ipc::writer::StreamWriter::try_new(BodyWriter(tx.clone()), schema.as_ref())
+            {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+                    return;
+                }
+            };
+        for batch in stream {
+            let outcome = batch
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .and_then(|b| {
+                    writer
+                        .write(&b)
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                });
+            if let Err(e) = outcome {
+                // Ending the stream is all that is left — the status is long sent. A send failure
+                // here means the client is already gone, which is the same outcome by another road.
+                let _ = tx.blocking_send(Err(e));
+                return;
+            }
+        }
+        // The end-of-stream marker. Its absence is exactly how a reader tells a complete result
+        // from an abandoned one, so it must not be skipped on the happy path.
+        if let Err(e) = writer.finish() {
+            let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
+        }
+    });
+
+    let body = axum::body::Body::from_stream(futures::stream::poll_fn(move |cx| rx.poll_recv(cx)));
+    Response::builder()
+        .header(header::CONTENT_TYPE, ARROW_STREAM_MIME)
+        .header(H_ROW_CAP, hv_usize(cap))
+        .body(body)
+        .map_err(|e| ApiError(EngineError::Other(e.to_string())))
+}
+
 /// `GET /v1/rows` — the grid's windowed scan: filter → sort → `offset`/`limit`.
 async fn rows(
     State(st): State<AppState>,
@@ -978,13 +1217,14 @@ async fn rows(
 ) -> Result<Response, ApiError> {
     let params = parse_scan_params(&q.unwrap_or_default())?;
     confine_entry(&st.root, &params.path)?;
-    let source = Source::resolve(&params.path, params.format.as_deref())?;
+    let source = st.resolve(&params.path, &params.read)?;
     confine_members(&st.root, &source)?;
     let spec = params.spec;
     let engine = scan_engine_for(&st, &source, &spec)?;
+    let ctx = st.ctx();
     let arrow = wants_arrow(&headers);
     let payload = blocking(move || {
-        let res = engine.scan(&source, &spec)?;
+        let res = engine.scan(&ctx, &source, &spec)?;
         if arrow {
             // Every count [`RowsWindow`] carries inline — the virtual scrollbar needs all of
             // them, and the IPC body carries rows only.
@@ -1015,13 +1255,14 @@ async fn stats(
 ) -> Result<Json<TableProfile>, ApiError> {
     let params = parse_scan_params(&q.unwrap_or_default())?;
     confine_entry(&st.root, &params.path)?;
-    let source = Source::resolve(&params.path, params.format.as_deref())?;
+    let source = st.resolve(&params.path, &params.read)?;
     confine_members(&st.root, &source)?;
     let filters = params.spec.filters;
     let scan = st.default_scan;
     let engine = read_engine(&st, &source)?;
+    let ctx = st.ctx();
     Ok(Json(
-        blocking(move || engine.stats(&source, &filters, scan)).await?,
+        blocking(move || engine.stats(&ctx, &source, &filters, scan)).await?,
     ))
 }
 
@@ -1033,13 +1274,14 @@ async fn export(State(st): State<AppState>, RawQuery(q): RawQuery) -> Result<Res
     params.spec.offset = 0;
     params.spec.limit = EXPORT_CAP;
     confine_entry(&st.root, &params.path)?;
-    let source = Source::resolve(&params.path, params.format.as_deref())?;
+    let source = st.resolve(&params.path, &params.read)?;
     confine_members(&st.root, &source)?;
     let spec = params.spec;
     let engine = scan_engine_for(&st, &source, &spec)?;
+    let ctx = st.ctx();
 
     let (body, mime, ext) = blocking(move || {
-        let rb = engine.scan(&source, &spec)?.batch;
+        let rb = engine.scan(&ctx, &source, &spec)?.batch;
         let out: (Vec<u8>, &'static str, &'static str) = match fmt.as_str() {
             "parquet" => (
                 crate::render::to_parquet(&rb)?,
@@ -1105,7 +1347,8 @@ async fn list(
         if st.root.is_some() {
             return Err(out_of_root());
         }
-        let listing = tokio::task::spawn_blocking(move || db_listing(&dir))
+        let ctx = st.ctx();
+        let listing = tokio::task::spawn_blocking(move || db_listing(&ctx, &dir))
             .await
             .map_err(|e| ApiError(EngineError::Other(format!("worker task failed: {e}"))))?
             .map_err(ApiError)?;
@@ -1124,10 +1367,10 @@ async fn list(
 /// List a database's tables as a [`DirListing`] — each table an entry deep-linked `?table=<name>`
 /// so clicking it opens that table as a `Format::Database` source.
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
-fn db_listing(dir: &str) -> Result<DirListing, EngineError> {
+fn db_listing(ctx: &RequestContext, dir: &str) -> Result<DirListing, EngineError> {
     // Strip any existing `?table=…` so we always list the whole database.
     let base = dir.split('?').next().unwrap_or(dir).to_string();
-    let tables = crate::engine::database::list_tables(dir)?;
+    let tables = crate::engine::database::list_tables(ctx, dir)?;
     let entries = tables
         .into_iter()
         .map(|name| {
@@ -1169,8 +1412,8 @@ struct RunRequest {
     sql: Option<String>,
     /// The source to read/query (path or object-store URI).
     path: String,
-    #[serde(default)]
-    format: Option<String>,
+    #[serde(flatten)]
+    read: ReadAs,
     /// Max rows to execute + cache (bounded by `WORKSPACE_RUN_CAP`).
     #[serde(default)]
     limit: Option<usize>,
@@ -1281,7 +1524,7 @@ async fn ws_run(
 ) -> Result<Json<RunResponse>, ApiError> {
     // Confine + resolve the source up front (same gate as the read handlers).
     confine_entry(&st.root, &req.path)?;
-    let source = Source::resolve(&req.path, req.format.as_deref())?;
+    let source = st.resolve(&req.path, &req.read)?;
     confine_members(&st.root, &source)?;
 
     let sql = req.sql.filter(|s| !s.trim().is_empty());
@@ -1301,8 +1544,13 @@ async fn ws_run(
         st.read.clone()
     };
     let store = st.store.clone();
+    let ctx = st.ctx();
     let source_path = source.display();
     let format = Some(source.format.to_string());
+    // How the run read its source, recorded so its SQL can be run again against the rows and
+    // columns it named.
+    let flatten = source.flatten.map(|f| f.as_param());
+    let json_path = source.json_path.clone();
 
     let resp = blocking(move || {
         // 404 a bad workspace id BEFORE any engine work — a run against a workspace that
@@ -1317,9 +1565,9 @@ async fn ws_run(
                 }];
                 // The cap is pushed into the engine (plan-level LIMIT on the SQL engine), so a
                 // `SELECT *` over a huge table never materializes an unbounded result.
-                engine.query_capped(q, &named, cap)
+                engine.query_capped(&ctx, q, &named, cap)
             }
-            None => engine.preview(&source, cap),
+            None => engine.preview(&ctx, &source, cap),
         };
         let duration_ms = started.elapsed().as_millis() as u64;
         let mut rec = RunRecord {
@@ -1333,6 +1581,8 @@ async fn ws_run(
             row_count: None,
             duration_ms,
             cached: false,
+            flatten,
+            json_path,
         };
         match result {
             Ok(rb) => {
@@ -1471,17 +1721,20 @@ fn decode_pairs(qs: &str) -> Result<Vec<(String, String)>, ApiError> {
 
 struct ScanParams {
     path: String,
-    format: Option<String>,
+    read: ReadAs,
     spec: ScanSpec,
     fmt: Option<String>,
 }
 
-/// Parse the shared `path/format/offset/limit/sort/desc/filter/fmt` query params into a
-/// [`ScanSpec`]. `filter` may repeat; each is `column:op:value` (op = eq/ne/lt/le/gt/ge/contains).
+/// Parse the shared `path/format/json_path/flatten/offset/limit/sort/desc/filter/fmt` query params
+/// into a [`ScanSpec`]. `filter` may repeat; each is `column:op:value` (op =
+/// eq/ne/lt/le/gt/ge/contains).
 fn parse_scan_params(qs: &str) -> Result<ScanParams, ApiError> {
     let pairs = decode_pairs(qs)?;
     let mut path = None;
     let mut format = None;
+    let mut json_path = None;
+    let mut flatten = None;
     let mut offset = 0usize;
     let mut limit = 100usize;
     let mut sort = None;
@@ -1494,6 +1747,10 @@ fn parse_scan_params(qs: &str) -> Result<ScanParams, ApiError> {
         match k.as_str() {
             "path" => path = Some(v.clone()),
             "format" if !v.is_empty() => format = Some(v.clone()),
+            // Empty is meaningful here — the whole document — so it is kept, unlike `format`.
+            "json_path" => json_path = Some(v.clone()),
+            // Empty is `all`, as for a bare `?flatten`.
+            "flatten" => flatten = Some(v.clone()),
             "offset" => offset = v.parse().unwrap_or(0),
             "limit" => limit = v.parse().unwrap_or(100),
             "sort" if !v.is_empty() => sort = Some(v.clone()),
@@ -1537,7 +1794,11 @@ fn parse_scan_params(qs: &str) -> Result<ScanParams, ApiError> {
     });
     Ok(ScanParams {
         path,
-        format,
+        read: ReadAs {
+            format,
+            json_path,
+            flatten,
+        },
         spec: ScanSpec {
             offset,
             limit: limit.clamp(1, 10_000),
@@ -1550,13 +1811,32 @@ fn parse_scan_params(qs: &str) -> Result<ScanParams, ApiError> {
 }
 
 /// Pick the engine for a scan: the DataFusion engine (external, unbounded sort/filter) when
-/// it's compiled in and the request actually sorts or filters; otherwise the local reader
-/// (fast plain-window reads with offset pushdown).
-fn scan_engine(st: &AppState, spec: &ScanSpec) -> Arc<dyn Engine> {
+/// it's compiled in, the request actually sorts or filters, **and it can read the source's
+/// format**; otherwise the local reader (fast plain-window reads with offset pushdown, and its own
+/// Arrow-kernel sort/filter over a bounded working set).
+///
+/// The format check keeps a window on an engine that can read it: it once sent every sorted or
+/// filtered window to DataFusion, JSON included, which it could not register then, so a JSON grid
+/// failed on the first click. Falling back costs the planner, never the feature. It asks the
+/// engine's own capabilities rather than a list kept here, because [`router`] accepts any engine
+/// as `sql`. A format SQL reads through the local reader (JSON, Iceberg, Delta) is loaded whole
+/// for each such window: complete over the file, at the cost of holding it in memory.
+fn scan_engine(st: &AppState, source: &Source, spec: &ScanSpec) -> Arc<dyn Engine> {
     match &st.sql {
-        Some(sql) if !spec.is_plain_window() => sql.clone(),
+        Some(sql) if !spec.is_plain_window() && can_read(sql.as_ref(), source.format) => {
+            sql.clone()
+        }
         _ => st.read.clone(),
     }
+}
+
+/// Does `engine` report `format` among the formats it can read?
+fn can_read(engine: &dyn Engine, format: Format) -> bool {
+    engine
+        .capabilities()
+        .formats
+        .iter()
+        .any(|f| f == format.as_str())
 }
 
 /// Route a source to the engine that can read it: the DB engine for a `Format::Database` source,
@@ -1582,7 +1862,7 @@ fn scan_engine_for(
             .clone()
             .ok_or_else(|| ApiError(EngineError::missing_feature("query a database", "sqlite")))
     } else {
-        Ok(scan_engine(st, spec))
+        Ok(scan_engine(st, source, spec))
     }
 }
 
@@ -1670,6 +1950,16 @@ impl IntoResponse for ApiError {
             EngineError::Remote(_) => StatusCode::BAD_GATEWAY,
             EngineError::Forbidden(_) => StatusCode::FORBIDDEN,
             EngineError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            // A deadline is a timeout the server imposed, which is what 408 says.
+            EngineError::Cancelled(CancelReason::Deadline) => StatusCode::REQUEST_TIMEOUT,
+            // 499 is nginx's "client closed request" — non-standard, but it is the status the
+            // ecosystem reads as "nobody is waiting for this any more", which is exactly the
+            // case. Unreachable from `serve` today: nothing here cancels a request, because
+            // detecting a disconnect mid-response needs the streaming seam that does not exist
+            // yet. It is reachable by an embedder holding a `CancelToken`, and by the paid plane.
+            EngineError::Cancelled(CancelReason::Requested) => {
+                StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT)
+            }
             EngineError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
             EngineError::Query(_) | EngineError::Arrow(_) | EngineError::Parquet(_) => {
                 StatusCode::BAD_REQUEST

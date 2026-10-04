@@ -27,11 +27,13 @@
 #[cfg(feature = "serve")]
 pub mod api;
 pub mod cli;
+pub mod context;
 /// The double-click launcher's port/reuse logic (see `bin/lakeleto-desktop.rs`).
 #[cfg(feature = "serve")]
 pub mod desktop;
 pub mod engine;
 pub mod error;
+pub(crate) mod format;
 #[cfg(feature = "iceberg")]
 pub mod iceberg;
 /// PNG/ICO encoding for the installer icon sets (see `examples/gen_icons.rs`).
@@ -45,10 +47,11 @@ pub mod workspace;
 #[cfg(feature = "remote")]
 pub mod workspace_remote;
 
+pub use context::{CancelToken, DbCredentials, RequestContext};
 pub use engine::local::LocalReaderEngine;
 pub use engine::{
-    Capabilities, ColumnProfile, ColumnSchema, Engine, NamedSource, RowBatch, TableProfile,
-    TableSchema,
+    Capabilities, ColumnProfile, ColumnSchema, Engine, NamedSource, RowBatch, RowStream,
+    TableProfile, TableSchema,
 };
-pub use error::{EngineError, Result};
-pub use source::{Format, Source};
+pub use error::{CancelReason, EngineError, Result};
+pub use source::{Codec, Flatten, Format, RemoteProbe, Source};

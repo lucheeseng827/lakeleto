@@ -8,7 +8,9 @@
 //!
 //! Parquet is read with **ranged requests** through [`ParquetObjectReader`] — only the footer
 //! plus the row groups a window touches are fetched — so remote reads stay larger-than-memory
-//! just like the local engine's. CSV, being line-oriented, is fetched whole.
+//! just like the local engine's. JSON and CSV are **streamed**: a request per read, its bytes
+//! decoded as they arrive and the transfer stopped with the read, so they too read as a local file
+//! does.
 //!
 //! # Where credentials come from — the store seam
 //!
@@ -35,13 +37,16 @@
 //! thin wrapper over it.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufRead, Read, Write};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use bytes::{Buf, Bytes};
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredentialProvider};
 use object_store::azure::{AzureConfigKey, AzureCredentialProvider, MicrosoftAzureBuilder};
@@ -49,12 +54,15 @@ use object_store::gcp::{GcpCredentialProvider, GoogleCloudStorageBuilder, Google
 use object_store::path::Path as ObjPath;
 // `ObjectStore` is the core trait (and the trait object type + `list_with_delimiter`);
 // `ObjectStoreExt` provides the ergonomic `get` / `head` / `put` convenience methods.
-use object_store::{ListResult, ObjectStore, ObjectStoreExt, ObjectStoreScheme};
+use object_store::{
+    GetOptions, GetRange, ListResult, ObjectMeta, ObjectStore, ObjectStoreExt, ObjectStoreScheme,
+};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use url::Url;
 
 use crate::error::{EngineError, Result};
+use crate::format::RemoteObject;
 use crate::source::{format_from_extension, DirEntry, DirListing};
 
 /// A shared multi-thread Tokio runtime for the (blocking) object-store calls. Lakeleto's
@@ -494,28 +502,45 @@ pub fn looks_like_iceberg(uri: &str) -> bool {
     looks_like_iceberg_with(uri, &StoreOptions::from_env())
 }
 
-/// [`looks_like_iceberg`] with an explicit store configuration.
+/// [`looks_like_iceberg`] with an explicit store configuration. Any failure is `false`.
 pub fn looks_like_iceberg_with(uri: &str, opts: &StoreOptions) -> bool {
+    looks_like_iceberg_as(uri, opts).unwrap_or(false)
+}
+
+/// [`looks_like_iceberg_with`], separating "this is not an Iceberg table" from "this identity
+/// cannot address this URI at all".
+///
+/// The distinction is the difference between a fact about the *data* and a fact about the
+/// *caller*. A `list` that returns nothing, or is refused, or times out, leaves the format
+/// genuinely unknown, and `Ok(false)` — "nothing here says Iceberg" — is the honest answer; the
+/// caller then asks for an explicit format. But an identity for the wrong family (an S3 provider
+/// handed a `gs://` URI) or a URL that does not parse is not an answer about the table at all. It
+/// is the caller having handed over something unusable, and reporting it as "not an Iceberg table"
+/// would attribute a credential mistake to the data — the same class of lie
+/// [`build_with_credentials`] refuses to tell when it declines to fall back to ambient keys.
+pub fn looks_like_iceberg_as(uri: &str, opts: &StoreOptions) -> Result<bool> {
     // `Source::detect` runs on the serve async thread; calling `block_on` there would panic
     // ("Cannot start a runtime from within a runtime"). Run the probe on a scratch OS thread, which
     // is not a Tokio worker, so `block_on` on our own runtime is legal.
-    let uri = uri.to_string();
+    let uri_owned = uri.to_string();
     let opts = opts.clone();
     std::thread::spawn(move || {
-        let Ok((store, prefix)) = store_for_with(&uri, &opts) else {
-            return false;
-        };
+        let (store, prefix) = store_for_with(&uri_owned, &opts)?;
         let meta = ObjPath::from(format!(
             "{}/metadata",
             prefix.as_ref().trim_end_matches('/')
         ));
-        runtime().block_on(async {
+        Ok(runtime().block_on(async {
             let mut listing = store.list(Some(&meta));
             matches!(listing.next().await, Some(Ok(_)))
-        })
+        }))
     })
     .join()
-    .unwrap_or(false)
+    .unwrap_or_else(|_| {
+        Err(EngineError::Other(format!(
+            "the Iceberg probe for `{uri}` panicked"
+        )))
+    })
 }
 
 /// Mirror an object-store prefix (an Iceberg table directory) to a local temp directory, **once
@@ -763,7 +788,179 @@ async fn parquet_window_async(
     Ok((schema, batches))
 }
 
-/// Fetch a whole remote object into memory (used for CSV, which can't be windowed by row).
+/// One object, as of the version a `HEAD` found: what a reader that streams objects reads
+/// ([`RemoteObject`]), a request per pass, each one pinned to that version.
+pub(crate) struct StoreObject {
+    store: Arc<dyn ObjectStore>,
+    path: ObjPath,
+    uri: String,
+    /// [`StoreOptions::scope_id`] of the options it was looked up with.
+    identity: Arc<str>,
+    meta: ObjectMeta,
+    version: String,
+}
+
+/// The object and its version, and not the store: a store's `Debug` can print the credentials it
+/// signs with (see [`StoreCredentials`]'s), and a plan's debug output names its tables by this.
+impl std::fmt::Debug for StoreObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreObject")
+            .field("uri", &self.uri)
+            .field("identity", &self.identity)
+            .field("size", &self.meta.size)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The object at `uri`, looked up under `opts`: one `HEAD`, for its size and version. Nothing of
+/// its body is read until a reader opens it.
+pub(crate) fn object_with(uri: &str, opts: &StoreOptions) -> Result<StoreObject> {
+    let (store, path) = store_for_with(uri, opts)?;
+    let meta = runtime()
+        .block_on(store.head(&path))
+        .map_err(|e| EngineError::Other(format!("head {uri}: {e}")))?;
+    // The ETag where the store gives one, which every request then asks for by name, and
+    // otherwise the modification time, which each request is held to instead.
+    let version = meta
+        .e_tag
+        .clone()
+        .unwrap_or_else(|| meta.last_modified.to_rfc3339());
+    Ok(StoreObject {
+        store,
+        path,
+        uri: uri.to_string(),
+        identity: Arc::from(opts.scope_id()),
+        meta,
+        version,
+    })
+}
+
+impl StoreObject {
+    /// A request for this version's bytes, or those in `range`: it fails, rather than answer with
+    /// another version's, if the object was replaced since it was looked up.
+    fn request(&self, range: Option<Range<u64>>) -> Result<object_store::GetResult> {
+        let options = GetOptions {
+            range: range.map(GetRange::Bounded),
+            if_match: self.meta.e_tag.clone(),
+            if_unmodified_since: self.meta.e_tag.is_none().then_some(self.meta.last_modified),
+            ..Default::default()
+        };
+        runtime()
+            .block_on(self.store.get_opts(&self.path, options))
+            .map_err(|e| self.failed(e))
+    }
+
+    /// `e` from a request for this object's bytes, in words a reader can act on when it means the
+    /// object was replaced since it was looked up.
+    fn failed(&self, e: object_store::Error) -> EngineError {
+        match e {
+            object_store::Error::Precondition { .. } => EngineError::Query(format!(
+                "`{}` changed while it was being read; reading it again reads the new version",
+                self.uri
+            )),
+            e => EngineError::Other(format!("get {}: {e}", self.uri)),
+        }
+    }
+}
+
+impl RemoteObject for StoreObject {
+    fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    fn size(&self) -> u64 {
+        self.meta.size
+    }
+
+    fn version(&self) -> &str {
+        &self.version
+    }
+
+    fn open(&self, range: Option<Range<u64>>) -> Result<Box<dyn BufRead + Send + '_>> {
+        let got = self.request(range)?;
+        Ok(Box::new(Body {
+            object: self,
+            at: got.range.start,
+            end: got.range.end,
+            chunks: got.into_stream(),
+            chunk: Bytes::new(),
+            arrived: false,
+        }))
+    }
+}
+
+/// An object's bytes as they arrive: each chunk handed on as the store sends it, and the next one
+/// awaited only once the last is used up, so a reader that stops early stops the transfer with it.
+///
+/// A request lasts as long as its reader takes — a pass decoding a large object, or one held up by
+/// a slow consumer of its rows — but the store's client times a request out (`object_store`: after
+/// 30 seconds) and resumes it from where it got to only for so long (3 minutes, 10 times). So a
+/// request that fails once bytes have arrived is made again for what is left, of the same version;
+/// one that fails before any arrive ends the read, since the store is not answering.
+struct Body<'a> {
+    object: &'a StoreObject,
+    chunks: BoxStream<'static, object_store::Result<Bytes>>,
+    chunk: Bytes,
+    /// The offset of the next byte to arrive, and the end of those asked for.
+    at: u64,
+    end: u64,
+    /// Whether a byte has arrived since the last request.
+    arrived: bool,
+}
+
+impl Read for Body<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = {
+            let available = self.fill_buf()?;
+            let n = available.len().min(buf.len());
+            buf[..n].copy_from_slice(&available[..n]);
+            n
+        };
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for Body<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        while self.chunk.is_empty() {
+            match runtime().block_on(self.chunks.next()) {
+                Some(Ok(chunk)) => {
+                    self.at += chunk.len() as u64;
+                    self.arrived |= !chunk.is_empty();
+                    self.chunk = chunk;
+                }
+                Some(Err(_)) if self.arrived && self.at < self.end => {
+                    let rest = self
+                        .object
+                        .request(Some(self.at..self.end))
+                        .map_err(std::io::Error::other)?;
+                    self.chunks = rest.into_stream();
+                    self.arrived = false;
+                }
+                Some(Err(e)) => {
+                    return Err(std::io::Error::other(format!(
+                        "read {}: {e}",
+                        self.object.uri
+                    )));
+                }
+                None => break,
+            }
+        }
+        Ok(&self.chunk)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.chunk.advance(amt);
+    }
+}
+
+/// Fetch a whole remote object into memory, for a reader that cannot read one as it arrives.
 pub fn fetch_all(uri: &str) -> Result<Vec<u8>> {
     fetch_all_with(uri, &StoreOptions::from_env())
 }
@@ -1279,6 +1476,142 @@ mod tests {
         assert_eq!(
             std::fs::read(again.join("data.txt")).unwrap(),
             b"tenant-a bytes"
+        );
+    }
+
+    #[test]
+    fn an_object_streams_its_bytes_or_a_range_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("o.json");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let uri = format!("file://{}", file.display());
+        let object = object_with(&uri, &StoreOptions::empty().with_scope("tenant-a")).unwrap();
+        assert_eq!(object.uri(), uri);
+        assert_eq!(object.size(), 10);
+        // What a reader learns of it is kept under this, so another identity never reads it.
+        assert_eq!(object.identity(), "tenant-a");
+
+        let read = |range| {
+            let mut text = String::new();
+            object
+                .open(range)
+                .unwrap()
+                .read_to_string(&mut text)
+                .unwrap();
+            text
+        };
+        assert_eq!(read(None), "0123456789");
+        assert_eq!(read(Some(2..5)), "234");
+    }
+
+    #[test]
+    fn an_object_is_read_as_the_version_it_was_looked_up_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("o.ndjson");
+        std::fs::write(&file, b"{\"v\": 1}\n").unwrap();
+        let uri = format!("file://{}", file.display());
+        let object = object_with(&uri, &StoreOptions::empty()).unwrap();
+
+        // Replaced since: what was learned of the old version — its schema, where its records
+        // lie — would misread the new one, so a request for the old one fails instead.
+        std::fs::write(&file, b"{\"v\": \"two\"}\n").unwrap();
+        let err = object
+            .open(None)
+            .err()
+            .expect("the version looked up is gone");
+        assert!(
+            err.to_string().contains("changed while it was being read"),
+            "{err}"
+        );
+
+        // Looked up again, it is the new version, and reads.
+        let again = object_with(&uri, &StoreOptions::empty()).unwrap();
+        assert_ne!(again.version(), object.version());
+        let mut text = String::new();
+        again.open(None).unwrap().read_to_string(&mut text).unwrap();
+        assert_eq!(text, "{\"v\": \"two\"}\n");
+    }
+
+    #[test]
+    fn an_object_without_an_etag_is_held_to_its_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("o.ndjson");
+        std::fs::write(&file, b"{\"v\": 1}\n").unwrap();
+        let mut object = object_with(
+            &format!("file://{}", file.display()),
+            &StoreOptions::empty(),
+        )
+        .unwrap();
+        // As a store that names no versions describes it: no ETag to ask for by name.
+        object.meta.e_tag = None;
+        let mut text = String::new();
+        object
+            .open(None)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "{\"v\": 1}\n");
+
+        // Replaced since, and so modified since: the request is refused rather than answered.
+        std::fs::write(&file, b"{\"v\": 2}\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        let err = object
+            .open(None)
+            .err()
+            .expect("modified since it was looked up");
+        assert!(
+            err.to_string().contains("changed while it was being read"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_request_the_store_gave_up_on_is_made_again_for_what_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("o.json");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let object = object_with(
+            &format!("file://{}", file.display()),
+            &StoreOptions::empty(),
+        )
+        .unwrap();
+        // A response as the store's client ends one it timed out: what arrived, then an error.
+        let body = |arrived: &'static [u8]| {
+            let ended = object_store::Error::Generic {
+                store: "test",
+                source: "request timed out".into(),
+            };
+            let chunks = [Ok(Bytes::from_static(arrived)), Err(ended)];
+            Body {
+                object: &object,
+                chunks: futures::stream::iter(chunks).boxed(),
+                chunk: Bytes::new(),
+                at: 0,
+                end: 10,
+                arrived: false,
+            }
+        };
+
+        // Three bytes arrived, so the rest is asked for: from the fourth, not from the start.
+        let mut text = String::new();
+        body(b"012").read_to_string(&mut text).unwrap();
+        assert_eq!(text, "0123456789");
+
+        // None arrived: the store is not answering, and asking again would not change that.
+        let err = body(b"").read_to_string(&mut String::new()).unwrap_err();
+        assert!(err.to_string().contains("request timed out"), "{err}");
+
+        // What is asked for again is the version the read began with, or nothing.
+        std::fs::write(&file, b"0123456789 and more").unwrap();
+        let err = body(b"012").read_to_string(&mut String::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("changed while it was being read"),
+            "{err}"
         );
     }
 

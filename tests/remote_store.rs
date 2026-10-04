@@ -11,6 +11,7 @@ use lakeleto::api::router;
 use lakeleto::engine::Engine;
 use lakeleto::workspace::{new_run_id, now_ms, LocalStore, RunRecord, RunStatus, WorkspaceStore};
 use lakeleto::workspace_remote::RemoteStore;
+use lakeleto::RequestContext;
 use lakeleto::{LocalReaderEngine, Source};
 
 const CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/people.csv");
@@ -41,7 +42,9 @@ async fn remote_store_round_trips_against_a_live_server() {
 
         // Local execution → synced record + cached result bytes.
         let source = Source::resolve(CSV, None).unwrap();
-        let rb = LocalReaderEngine::default().preview(&source, 10).unwrap();
+        let rb = LocalReaderEngine::default()
+            .preview(&RequestContext::detached(), &source, 10)
+            .unwrap();
         let rec = RunRecord {
             id: new_run_id(),
             at_ms: now_ms(),
@@ -53,6 +56,8 @@ async fn remote_store_round_trips_against_a_live_server() {
             row_count: Some(rb.num_rows() as u64),
             duration_ms: 1,
             cached: true,
+            flatten: None,
+            json_path: None,
         };
         rs.append_run(&ws.id, &rec, Some(&rb)).unwrap();
 
@@ -99,7 +104,9 @@ async fn failed_result_upload_never_records_history() {
         let rs = RemoteStore::new(format!("http://{addr}"), None);
         let ws = rs.create("ordering").unwrap();
         let source = Source::resolve(CSV, None).unwrap();
-        let rb = LocalReaderEngine::default().preview(&source, 5).unwrap();
+        let rb = LocalReaderEngine::default()
+            .preview(&RequestContext::detached(), &source, 5)
+            .unwrap();
         let rec = RunRecord {
             id: "run..not-path-safe".into(), // rejected by the server's safe_id on the PUT
             at_ms: now_ms(),
@@ -111,6 +118,8 @@ async fn failed_result_upload_never_records_history() {
             row_count: Some(rb.num_rows() as u64),
             duration_ms: 1,
             cached: true,
+            flatten: None,
+            json_path: None,
         };
         assert!(rs.append_run(&ws.id, &rec, Some(&rb)).is_err());
         // The upload failed first, so the lying history record was never posted.

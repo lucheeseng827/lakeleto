@@ -3,7 +3,7 @@
 // full-pane views composed from the design-system primitives.
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import type { QueryResp, RunRecord, RunResponse, Row, WsConnection } from "./api";
-import { Button, Chip, TextInput, Textarea } from "./components";
+import { Button, cellText, Chip, TextInput, Textarea } from "./components";
 import { type OpenTab } from "./workspace";
 
 /** The `+` "new tab" start page: open a data source, or start a query on a saved connection. */
@@ -37,7 +37,7 @@ export function LauncherView({ connections, onOpenPath, onNewQuery, onBrowse }: 
             <Button variant="primary" disabled={!path.trim()} onClick={open}>Open</Button>
           </div>
           <div style={{ color: "var(--muted)", fontSize: "var(--text-xs)", marginTop: 6 }}>
-            Parquet / CSV / TSV / Iceberg — a local path or an <code>s3://</code> · <code>gs://</code> · <code>az://</code> URI.{" "}
+            Parquet / CSV / TSV / JSON / Iceberg — a local path or an <code>s3://</code> · <code>gs://</code> · <code>az://</code> URI.{" "}
             Or <button style={linkBtn} onClick={onBrowse}>browse files (⌘K)</button>.
           </div>
         </section>
@@ -131,7 +131,7 @@ function sqlLiteral(v: unknown, escapeBackslashes = false): string {
   if (v === null || v === undefined) return "NULL";
   if (typeof v === "number" && Number.isFinite(v)) return String(v);
   if (typeof v === "boolean") return v ? "TRUE" : "FALSE";
-  let s = String(v);
+  let s = cellText(v);
   if (escapeBackslashes) s = s.replace(/\\/g, "\\\\");
   return "'" + s.replace(/'/g, "''") + "'";
 }
@@ -218,7 +218,12 @@ export function RowDetail({ row, table, sourcePath, onClose }: { row: Row | null
               return (
                 <tr key={k}>
                   <td style={{ verticalAlign: "top", padding: "3px 8px 3px 0", color: "var(--muted)", whiteSpace: "nowrap" }}>{k}</td>
-                  <td style={{ padding: "3px 0", color: isNull ? "var(--null)" : "var(--fg)", wordBreak: "break-word" }}>{isNull ? "·" : String(v)}</td>
+                  <td style={{ padding: "3px 0", color: isNull ? "var(--null)" : "var(--fg)", wordBreak: "break-word" }}>
+                    {isNull ? "·" : typeof v === "object"
+                      // A nested value gets room to be read: its JSON, indented.
+                      ? <pre style={{ margin: 0, whiteSpace: "pre-wrap", font: "inherit" }}>{JSON.stringify(v, null, 2)}</pre>
+                      : String(v)}
+                  </td>
                 </tr>
               );
             })}
@@ -232,13 +237,13 @@ export function RowDetail({ row, table, sourcePath, onClose }: { row: Row | null
 // ======================================================================
 // Runner — run a SQL across selected connections, or run every job in a folder
 // ======================================================================
-export interface RunJob { id: string; label: string; path: string; sql: string; }
+export interface RunJob { id: string; label: string; path: string; sql: string; flatten?: boolean; jsonPath?: string | null; }
 interface JobResult { status: "ok" | "error" | "running"; rows?: number; ms?: number; error?: string; run?: RunRecord; }
 export function RunnerModal({ open, title, sharedSql, jobs, exec, onOpenResult, onClose }: {
   open: boolean; title: string;
   sharedSql: string | null;                          // set → editable SQL applied to every job (across-connections); null → each job's own sql (folder)
   jobs: RunJob[];
-  exec: (sql: string, path: string) => Promise<RunResponse>;
+  exec: (sql: string, path: string, flatten?: boolean, jsonPath?: string | null) => Promise<RunResponse>;
   onOpenResult: (run: RunRecord) => void; onClose: () => void;
 }) {
   const [sql, setSql] = useState(sharedSql || "");
@@ -253,7 +258,7 @@ export function RunnerModal({ open, title, sharedSql, jobs, exec, onOpenResult, 
     for (const j of chosen) {
       setResults((r) => ({ ...r, [j.id]: { status: "running" } }));
       try {
-        const resp = await exec(sharedSql != null ? sql : j.sql, j.path);
+        const resp = await exec(sharedSql != null ? sql : j.sql, j.path, j.flatten, j.jsonPath);
         setResults((r) => ({ ...r, [j.id]: { status: "ok", rows: resp.run.row_count ?? resp.num_rows, ms: resp.run.duration_ms, run: resp.run } }));
       } catch (e) { setResults((r) => ({ ...r, [j.id]: { status: "error", error: (e as Error).message } })); }
     }
@@ -338,7 +343,7 @@ function ResultBlock({ title, data, highlight }: { title: string; data: QueryRes
             <tbody>
               {data.rows.map((r, i) => (
                 <tr key={i} style={{ background: highlight?.has(i) ? "var(--sel)" : undefined }}>
-                  {data.columns.map((c) => { const v = r[c.name]; const isNull = v == null; return <td key={c.name} style={{ ...cell, color: isNull ? "var(--null)" : "var(--fg)" }}>{isNull ? "·" : String(v)}</td>; })}
+                  {data.columns.map((c) => { const v = r[c.name]; const isNull = v == null; return <td key={c.name} style={{ ...cell, color: isNull ? "var(--null)" : "var(--fg)" }}>{isNull ? "·" : cellText(v)}</td>; })}
                 </tr>
               ))}
             </tbody>

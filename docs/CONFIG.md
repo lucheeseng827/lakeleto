@@ -17,10 +17,13 @@ Available on every subcommand (clap `global = true`).
 
 | Flag | Env | Default | What it does |
 |---|---|---|---|
-| `-o`, `--output <fmt>` | — | `table` | Output format: `table` \| `json` \| `ndjson` \| `csv`. |
+| `-o`, `--output <fmt>` | — | `table` | Output format: `table` \| `json` \| `ndjson` \| `csv` \| `tsv`. In `csv` and `tsv` a nested value (a list, struct or map) is written into its cell as compact JSON. |
 | `--engine <choice>` | — | `auto` | Which engine reads: `auto` \| `local` \| `sql` \| `remote`. `auto` = local, unless `--remote-url` is set (then remote). |
 | `--remote-url <url>` | `LAKELETO_REMOTE_URL` | unset | A Lakeleto server speaking the `/v1/*` contract — in practice a `lakeleto serve` you run. Setting it implies `--engine remote`. Needs `--features remote`. |
 | `--remote-token <tok>` | `LAKELETO_REMOTE_TOKEN` | unset | Bearer token for the Lakeleto Cloud endpoint. |
+| `--format <name>` | — | inferred | Read the source as this format instead of inferring it (see [Supported inputs](#supported-inputs)); `?format=` on the API. |
+| `--json-path <pointer>` | — | detected | Read a JSON document's rows from this place: a JSON Pointer (`/response/items`) or a top-level member name (`data`); `""` unwraps nothing. `?json_path=` on the API. See [JSON layouts](#json-layouts). |
+| `--flatten[=<levels>]` | — | off | Read struct columns as one column per field, named by its path (`user.geo.lat`); `--flatten` is every level, `--flatten=1` the first only. Any format. `?flatten=` on the API. See [Flattening nested columns](#flattening-nested-columns). |
 
 ## Subcommands
 
@@ -58,17 +61,100 @@ The `serve` subcommand exists only when built with `--features serve`.
 
 Format detection order (`src/source.rs`): **object-store URI → directory shape →
 extension → magic bytes**. Override with `--format` / `?format=` (accepts
-`parquet`/`pq`, `csv`, `tsv`, `json`/`ndjson`/`jsonl`, `iceberg`).
+`parquet`/`pq`, `csv`, `tsv`, `json`/`ndjson`/`jsonl`/`geojson`, `iceberg`).
 
 | Input | How it's recognized | Read by |
 |---|---|---|
 | `.parquet` / `.pq` file | extension, or `PAR1` magic bytes when the extension is unknown | local (default) |
 | `.csv` file | extension | local (default) |
 | `.tsv` file | extension (read tab-delimited); `--format tsv` forces tab for any name | local (default) |
-| `.json` / `.ndjson` / `.jsonl` | extension | local (default) |
+| `.json` / `.ndjson` / `.jsonl` / `.geojson` | extension; the layout comes from the bytes — see [JSON layouts](#json-layouts) | local (default); `sql` through the local reader, streamed — from an object store too |
 | Directory of `.parquet` files | a dir with `.parquet` files (recursive; `foo.parquet/part-*` splits and Hive `key=value` partition subdirs); `_`/`.` sidecars skipped, columns unioned, partition keys become columns | local (default) |
 | Iceberg table | a directory containing a `metadata/` subdir | `--features iceberg` |
 | `s3://` / `gs://` / `az://` URI | scheme (see below); classified by the key's extension (needs explicit `--format` if the name has no known extension) | `--features object-store` |
+| Compressed text: `.csv.gz`, `.ndjson.zst`, `.tsv.bz2`, `.json.xz` | the last extension is the codec (`gz`, `zst`, `bz2`, `xz`), the one before it the format | not yet — refused with an error that names the compression; decompress first |
+
+### JSON layouts
+
+A JSON file is read the same way whatever its extension says; the layout is detected from the
+bytes:
+
+| Layout | Example | Rows |
+|---|---|---|
+| Values separated by whitespace | NDJSON / JSON Lines, `jq` output (pretty objects back to back), one object | one per value |
+| Top-level array | `[{…}, {…}]` | one per element — streamed, so no size limit |
+| One document with a records member | `{"meta": {…}, "data": [{…}, …]}`, a GeoJSON `FeatureCollection` | one per element of that member |
+
+The records member is used when a single top-level object has **exactly one** member holding a
+non-empty array of objects; `lakeleto schema` then prints it (`records: /data`) and `/v1/schema`
+returns it as `records_path`. With no such member, or several, the object is one row. The member
+is found once per file version by reading the document's bytes into memory, without parsing them
+into values — so a document is only unwrapped up to 256 MiB — and its records then stream like a
+top-level array's: a grid window costs the rows up to it, not the document.
+
+`--json-path` / `?json_path=` overrides the detection: `--json-path groups` picks between two
+candidates, `--json-path /response/items` reaches below the top level, and `--json-path ''` reads
+the document as one row. An explicit path applies to a single document only; NDJSON and a missing
+member are errors that say so, and a path on a source that is not JSON is refused rather than
+ignored.
+
+In the web app, a JSON tab's **Records** button shows the same choice — `Records: /data · auto`
+when the reader found the member, the path when one is set, `whole document` for `''` — and sets
+it: type a pointer or a member name, or pick **Whole document** or **Auto**. The path belongs to
+the tab and its SQL, is saved with a saved query, and comes back when the query or a run from
+history is reopened.
+
+Columns come in the order their keys first appear. A column whose values disagree in type
+(`{"v": 1}` then `{"v": "a"}`) is read as text rather than failing. A UTF-8 byte-order mark is
+ignored, and an array cut off before its closing `]` is an error, not a shorter table.
+
+Nested values — objects and arrays, read as `Struct` and `List` columns — are shown in the grid
+as compact JSON (pretty-printed in the row drawer), and sorting or filtering one works on that JSON
+text, so a filter matches what you read. Lists that Arrow can order natively (element by element)
+sort that way. A CSV or TSV export writes the same JSON into the cell.
+
+The schema comes from the first 20,000 values — the same ones on every read, remembered per file
+version — so `schema`, the first grid window and a window far down agree. A value past those that
+disagrees with them (an integer column that turns to text at row 50,000) widens that file's schema
+instead of failing the read; a key that first appears past them is not shown.
+
+SQL (`--features sql`) reads JSON through this same reader rather than DataFusion's own, which
+infers line by line, so every layout, `--json-path`, `--flatten` and the widening above apply in
+SQL exactly as in the grid. A local file is streamed: each query makes its own pass over it and
+holds only the batches in flight, so `LIMIT 10` stops reading early and a count or `GROUP BY` over
+a large file runs in memory set by the query — at the cost of decoding the file again for each
+query. The query's column types are the sampled ones; a value past the sample that does not fit
+them widens the file's schema, and the query is planned again with it. A streamed result that has
+already sent rows cannot be planned again without sending some twice, so it stops with an error
+instead, and the next run reads the value. A sorted or filtered grid window over JSON goes through
+SQL too, complete over the whole file rather than its first 200,000 rows. A JSON file in an object
+store streams the same way, each pass a request of its own that stops where the pass stops.
+
+### Flattening nested columns
+
+`--flatten` / `?flatten=` reads each struct column as one column per field, named by its path:
+`user: {name, geo: {lat}}` becomes `user.name` and `user.geo.lat`, in the struct's place. Those
+columns sort, filter, profile and export like any other, and SQL names them quoted
+(`SELECT "user.name" FROM t`). The grid's **Flatten structs** button (shown when a source has a
+struct column) does the same for a tab, including that tab's SQL.
+
+| Value | Meaning |
+|---|---|
+| `--flatten`, `?flatten`, `all` | every level |
+| a number `n` | the first `n` levels: at `1`, `user.geo` stays a struct |
+| `none`, `0` | off (the default) |
+
+It is a view of the source, not a way of parsing it, so it works for every format with struct
+columns — JSON objects, nested Parquet, Iceberg and Delta — and changes nothing for one without
+(CSV, a database table). A field of a null struct is null. Lists and maps stay whole, because
+spreading one would turn a row into many; an empty struct stays too. Two columns that would share
+a name (a `user.name` column beside a `user` struct with a `name` field) are refused rather than
+one shadowing the other.
+
+The SQL engine flattens with a view over the table, so a sorted or filtered grid window still runs
+over the whole file. A Parquet footer profile (`profile --fast`, `?scan=0`) lists the fields but
+has statistics only for top-level columns — Parquet's statistics API does not reach inside a
+struct, which is also why the struct column itself never had them.
 
 Recognized object-store schemes: `s3` (`s3a`), `gs` (`gcs`), `az` (`azure`, `abfs`,
 `abfss`, `adl`). These are recognized in **every** build — without `--features
@@ -84,9 +170,9 @@ filesystem error. Object-store credentials come only from the environment (see
 | Feature | Turns on | Adds |
 |---|---|---|
 | *(default)* | `LocalReaderEngine` | Parquet + CSV/TSV/JSON reads (schema/head/profile/info/grid). |
-| `sql` | `DataFusionEngine` (+ tokio) | Read-only SQL: the `query` command with `--engine sql`, and `POST /v1/query`. Pushes sort/filter/count into DataFusion. |
+| `sql` | `DataFusionEngine` (+ tokio) | Read-only SQL: the `query` command with `--engine sql`, and `POST /v1/query`. Pushes sort/filter/count into DataFusion. Reads Parquet and CSV/TSV natively; JSON through the local reader, streamed a pass per query; Iceberg and Delta through the local reader, loaded into memory for the query. |
 | `iceberg` | self-contained Iceberg reader (apache-avro) | Read Iceberg tables: current-snapshot Parquet via metadata + Avro manifests, merge-on-read positional + equality deletes, schema evolution, statistics/partition pruning. Reads compressed manifests. |
-| `object-store` | BYO-credential `s3://`/`gs://`/`az://` reads (object_store + url + futures + tokio) | Every read op over a remote URI with *your own* env credentials, zero hosted compute. Ranged Parquet reads (footer + touched row groups); CSV fetched whole. |
+| `object-store` | BYO-credential `s3://`/`gs://`/`az://` reads (object_store + url + futures + tokio) | Every read op over a remote URI with *your own* env credentials, zero hosted compute. Ranged Parquet reads (footer + touched row groups); JSON and CSV streamed, a request per read, and a located JSON records member by its range. |
 | `serve` | `lakeleto serve` / `lakeleto open` (axum + rust-embed + tokio) | The HTTP/JSON `/v1/*` API and the embedded SPA (bundled via rust-embed — air-gapped). Add `sql` too for a working `POST /v1/query`. |
 | `remote` | `RemoteEngine` → the over-HTTP seam (reqwest) | `--engine remote` / `--remote-url`; a client for another `lakeleto serve` (optional). Also enables `--workspace-remote` sync in `serve`. |
 | `duckdb` | *(stub — no code yet)* | Reserved Phase-2 DuckDB backend (C++ toolchain). Currently a no-op feature. |
@@ -118,10 +204,24 @@ IO. Non-API paths fall back to the SPA's `index.html`.
 | `GET` | `/v1/list?dir=` | File browser: subdirs + readable data files (defaults to `--root`, else cwd). |
 | `POST` | `/v1/query` | `{ sql, file?, tables[] }` → `{ columns, rows }`, or Arrow IPC (see below). Needs `sql`. |
 
+Every endpoint that reads a source also takes `json_path=` and `flatten=` (as the `--json-path` and
+`--flatten` flags), and so does each entry of `/v1/query`'s `tables[]`.
+
 Filter ops: `eq ne lt le gt ge contains` (aliases `= != < <= > >= ~`). With `sql`,
 sort/filter/count are pushed into DataFusion (exact, unbounded); without it the local
 reader works over a bounded set (`scan_cap`, default 200k) and the response's `bounded`
-flag marks a partial view.
+flag marks a partial view. Either way a window is the same on every request: unsorted rows come
+in file order, and rows with equal sort keys in file order too, so consecutive pages meet
+exactly. (With `sql`, a CSV or TSV is sorted by key and then by each row's place in the file, in
+one pass. Any other table's sorted window that a tie touches is read a second time to guarantee
+that, which costs a sort by a many-duplicates column about as much as a plain scan of the file. A
+window of any table that reaches past row 50,000 is read in two passes instead, which keep a
+sample of the rows and a band around the window rather than every row before it, so its memory
+stays flat however deep it is. A JSON file is still decoded once, and a JSON, CSV or TSV object in
+a store downloaded once: the first pass keeps the rows it reads in a temporary file, LZ4-compressed
+in the system's temporary directory (`TMPDIR` moves it), for the second to read back — 120 MiB for
+a 256 MB CSV — and the source is read again if that file can't be written. A Parquet object's
+first pass downloads only the columns it sorts and filters by.)
 
 #### Result encoding — `Accept: application/vnd.apache.arrow.stream`
 
@@ -178,7 +278,8 @@ way rather than configured:
 - **The server resolves its own refs.** With `--remote-url` set the CLI does **not** resolve the
   path locally: it forwards the string opaquely and lets the peer decide what it names — a file
   path there, a catalog name, a table id. `?format=` is sent only when you passed `--format`;
-  otherwise the server infers it.
+  otherwise the server infers it. `--json-path` and `--flatten` travel the same way, as query
+  parameters and on each table of a `query`.
 - **A server may impose limits this contract does not name** (how many tables one query may
   register, which paths it will accept at all). Those arrive as an ordinary `4xx` with the
   server's own message.

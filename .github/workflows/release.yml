@@ -48,6 +48,11 @@ permissions: {}
 env:
   BIN: lakeleto
   IMAGE: docker.io/mancube/lakeleto
+  # The image as its build-provenance attestation names it. push-to-registry sends the
+  # attestation to https://<registry>/v2/…, and Docker Hub's registry is index.docker.io:
+  # docker.io redirects to www.docker.com. actions/attest-build-provenance asks for
+  # index.docker.io for this reason. Tags, `docker run` and cosign keep IMAGE.
+  ATTEST_SUBJECT: index.docker.io/mancube/lakeleto
   # Server build profile: HTTP/JSON API + embedded SPA, SQL engine, Iceberg + Delta readers,
   # object-store, plus read-only SQLite/Postgres/MySQL database backends.
   FEATURES: serve,sql,iceberg,object-store,sqlite,postgres,mysql,delta
@@ -221,7 +226,9 @@ jobs:
         shell: bash
         # MSI ProductVersion is numeric: strip the leading v and any -rc.N, or
         # `wix build` rejects it.
-        run: echo "version=$(echo "${TAG#v}" | sed 's/-.*//')" >> "$GITHUB_OUTPUT"
+        run: |
+          v="${TAG#v}"
+          echo "version=${v%%-*}" >> "$GITHUB_OUTPUT"
 
       - name: Build binaries (desktop launcher + CLI)
         shell: bash
@@ -643,7 +650,7 @@ jobs:
       - name: SLSA provenance for the image
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-name: ${{ env.IMAGE }}
+          subject-name: ${{ env.ATTEST_SUBJECT }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
       - name: Update Docker Hub description

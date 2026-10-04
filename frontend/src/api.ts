@@ -43,7 +43,10 @@ export interface Engines {
 }
 export interface Entry { name: string; path: string; kind: "dir" | "file"; size?: number | null; }
 export interface Listing { dir: string; parent?: string | null; entries: Entry[]; }
-export interface SchemaResp { source: string; format: string; engine: string; row_count?: number | null; columns: Column[]; }
+export interface SchemaResp { source: string; format: string; engine: string; row_count?: number | null; columns: Column[];
+  /** Where in a JSON document the rows come from (`/data`): the member the reader detected, or the
+   *  path it was given. Absent when the rows are the file as it is. */
+  records_path?: string | null; }
 export interface InfoResp { path: string; format: string; engine: string; size_bytes?: number | null; row_count?: number | null; columns: number; }
 export interface RowsResp {
   columns: Column[]; offset: number; num_rows: number; matched_rows: number;
@@ -59,7 +62,11 @@ export interface QueryResp { columns: Column[]; num_rows: number; rows: Row[]; }
 // ---- workspace data plane (mirrors src/workspace.rs over /v1/workspaces/*) ----
 export interface WsMeta { id: string; name: string; created_at_ms: number; updated_at_ms: number; connection_count: number; query_count: number; }
 export interface WsConnection { id: string; label: string; path: string; format?: string | null; description?: string | null; pinned?: boolean; }
-export interface WsSavedQuery { id: string; name: string; sql: string; connection_id?: string | null; description?: string | null; folder?: string | null; pinned?: boolean; }
+export interface WsSavedQuery { id: string; name: string; sql: string; connection_id?: string | null; description?: string | null; folder?: string | null; pinned?: boolean;
+  /** The flattening its SQL was written against (`all`) — reopened with it, or its columns are missing. */
+  flatten?: string | null;
+  /** The JSON records path its SQL was written against (`/data`; `""` = the whole document). */
+  json_path?: string | null; }
 export interface WsTab { id: string; kind: string; ref_id: string; view: unknown; }
 export interface WsVariable { key: string; value: string; }
 export interface Workspace {
@@ -70,25 +77,36 @@ export type RunStatus = "ok" | "error";
 export interface RunRecord {
   id: string; at_ms: number; sql?: string | null; source_path: string; format?: string | null;
   status: RunStatus; error?: string | null; row_count?: number | null; duration_ms: number; cached: boolean;
+  /** How the run flattened its source (`all`, or a number of levels), when it did. */
+  flatten?: string | null;
+  /** The JSON records path the run read its source at (`/data`), when it was given one. */
+  json_path?: string | null;
 }
 export interface WorkspaceBundle { bundle_version: number; workspace: Workspace; history: RunRecord[]; }
 export interface RunResponse { run: RunRecord; columns: Column[]; num_rows: number; rows: Row[]; }
 export interface RunReq { sql?: string | null; path: string; format?: string | null; limit?: number; preview?: number;
+  /** `all` (or a number of levels) to read struct columns as one column per field — see `flatten` below. */
+  flatten?: string | null;
+  /** The JSON records path to read the source at (`/data`; `""` = the whole document). Absent: detected. */
+  json_path?: string | null;
   /** Write the full result to the workspace store so the run can be re-opened. Opt-in: a result is
    *  dataset content, and with a remote store configured, caching it sends those rows off the machine. */
   cache?: boolean; }
 export const BUNDLE_VERSION = 1;
 
+// `flatten` reads struct columns as one column per field, named by its path (`user.geo.lat`), so
+// nested data sorts and filters like any other column (`?flatten=all` on the wire). `jsonPath` reads a
+// JSON source's records at a path (`/data`; `""` = the whole document); absent, they are detected.
 export interface Backend {
   engines(): Promise<Engines>;
   list(dir: string): Promise<Listing>;
-  schema(path: string): Promise<SchemaResp>;
+  schema(path: string, flatten?: boolean, jsonPath?: string | null): Promise<SchemaResp>;
   info(path: string): Promise<InfoResp>;
   profile(path: string, scan?: number): Promise<Profile>;
-  rows(o: { path: string; offset?: number; limit?: number; sort?: Sort | null; filters?: Filters; cols?: string[] | null }): Promise<RowsResp>;
-  stats(o: { path: string; filters?: Filters }): Promise<Profile>;
+  rows(o: { path: string; offset?: number; limit?: number; sort?: Sort | null; filters?: Filters; cols?: string[] | null; flatten?: boolean; jsonPath?: string | null }): Promise<RowsResp>;
+  stats(o: { path: string; filters?: Filters; flatten?: boolean; jsonPath?: string | null }): Promise<Profile>;
   query(o: { sql: string; file?: string | null; tables?: string[] }): Promise<QueryResp>;
-  exportUrl(o: { path: string; fmt?: string; sort?: Sort | null; filters?: Filters; cols?: string[] | null }): string | null;
+  exportUrl(o: { path: string; fmt?: string; sort?: Sort | null; filters?: Filters; cols?: string[] | null; flatten?: boolean; jsonPath?: string | null }): string | null;
   // workspace data plane
   wsList(): Promise<WsMeta[]>;
   wsCreate(name: string): Promise<Workspace>;
@@ -109,6 +127,23 @@ export interface Conn { mode: "live" | "sample"; base: string | null; caps: Engi
  *  a cap that only counts connections the form labelled "database" is a cap in name only. */
 export const isDatabaseUri = (p: string): boolean =>
   /^(sqlite|postgres|postgresql|mysql):\/\//i.test((p || "").trim());
+
+/** Is this a JSON source? By its extension, as the server detects one (src/format/json.rs). */
+export const isJsonSource = (p: string): boolean => /\.(json|ndjson|jsonl|geojson)$/i.test((p || "").trim());
+
+/** A records path as the server reads one: a JSON Pointer as it is, a member name as its pointer
+ *  (`groups` → `/groups`, `~` and `/` escaped per RFC 6901), and `""` — the whole document — as it
+ *  is. Mirrors `normalize_json_path` (src/source.rs), so what a tab shows and saves is what the
+ *  server reports back as `records_path`. */
+export const normalizeJsonPath = (p: string): string =>
+  p === "" || p.startsWith("/") ? p : "/" + p.replace(/~/g, "~0").replace(/\//g, "~1");
+
+/** How a read asks for its source: flattened, and/or at a JSON records path. An empty path is sent
+ *  (`json_path=`) — it is the whole document, not the absence of a path. */
+function readAs(p: URLSearchParams, flatten: boolean, jsonPath?: string | null) {
+  if (flatten) p.set("flatten", "all");
+  if (jsonPath != null) p.set("json_path", jsonPath);
+}
 
 export const OP_SYMBOL: Record<string, string> = {
   ge: ">=", le: "<=", ne: "!=", eq: "=", gt: ">", lt: "<",
@@ -183,33 +218,40 @@ export class LakeletoHttpClient implements Backend {
   // Omit `dir` entirely when empty so the server browses its default root — sending `?dir=`
   // (empty value) makes the server confine against an empty path and 403 under `--root`.
   list(dir: string) { return this.get<Listing>("/v1/list" + (dir ? "?dir=" + encodeURIComponent(dir) : "")); }
-  schema(path: string) { return this.get<SchemaResp>("/v1/schema?path=" + encodeURIComponent(path)); }
+  schema(path: string, flatten = false, jsonPath: string | null = null) {
+    const p = new URLSearchParams({ path });
+    readAs(p, flatten, jsonPath);
+    return this.get<SchemaResp>("/v1/schema?" + p);
+  }
   info(path: string) { return this.get<InfoResp>("/v1/info?path=" + encodeURIComponent(path)); }
   profile(path: string, scan?: number) {
     const p = new URLSearchParams({ path });
     if (scan != null) p.set("scan", String(scan));
     return this.get<Profile>("/v1/profile?" + p);
   }
-  rows({ path, offset = 0, limit = 100, sort = null, filters = {}, cols = null }: Parameters<Backend["rows"]>[0]) {
+  rows({ path, offset = 0, limit = 100, sort = null, filters = {}, cols = null, flatten = false, jsonPath = null }: Parameters<Backend["rows"]>[0]) {
     const p = new URLSearchParams({ path, offset: String(offset), limit: String(limit) });
     if (sort) { p.set("sort", sort.col); p.set("desc", sort.desc ? "1" : "0"); }
     for (const f of filterSpecs(filters)) p.append("filter", f);
     if (cols && cols.length) p.set("cols", cols.join(","));
+    readAs(p, flatten, jsonPath);
     return this.get<RowsResp>("/v1/rows?" + p);
   }
-  stats({ path, filters = {} }: Parameters<Backend["stats"]>[0]) {
+  stats({ path, filters = {}, flatten = false, jsonPath = null }: Parameters<Backend["stats"]>[0]) {
     const p = new URLSearchParams({ path });
     for (const f of filterSpecs(filters)) p.append("filter", f);
+    readAs(p, flatten, jsonPath);
     return this.get<Profile>("/v1/stats?" + p);
   }
   query({ sql, file = null, tables = [] }: Parameters<Backend["query"]>[0]) {
     return this.post<QueryResp>("/v1/query", { sql, file, tables });
   }
-  exportUrl({ path, fmt = "csv", sort = null, filters = {}, cols = null }: Parameters<Backend["exportUrl"]>[0]) {
+  exportUrl({ path, fmt = "csv", sort = null, filters = {}, cols = null, flatten = false, jsonPath = null }: Parameters<Backend["exportUrl"]>[0]) {
     const p = new URLSearchParams({ path, fmt });
     if (sort) { p.set("sort", sort.col); p.set("desc", sort.desc ? "1" : "0"); }
     for (const f of filterSpecs(filters)) p.append("filter", f);
     if (cols && cols.length) p.set("cols", cols.join(","));
+    readAs(p, flatten, jsonPath);
     if (this.token) p.set("token", this.token);
     return this.base + "/v1/export?" + p;
   }
@@ -403,6 +445,8 @@ const metaOf = (ws: Workspace): WsMeta => ({
   connection_count: ws.connections.length, query_count: ws.saved_queries.length,
 });
 
+// The sample tables have no struct columns and no JSON, so `flatten` and `jsonPath` change nothing
+// here — which is also what the server answers for a flat source. Runs still record them.
 export class LakeletoMockBackend implements Backend {
   engines() {
     return delay<Engines>({
@@ -500,7 +544,7 @@ export class LakeletoMockBackend implements Backend {
       } else { const g = await this.rows({ path: req.path, offset: 0, limit: cap }); full = { columns: g.columns, num_rows: g.num_rows, rows: g.rows }; }
     } catch (e) { error = (e as Error).message; }
     const rec: RunRecord = {
-      id: mockId("run"), at_ms: Date.now(), sql: sql || null, source_path: req.path, format,
+      id: mockId("run"), at_ms: Date.now(), sql: sql || null, source_path: req.path, format, flatten: req.flatten || null, json_path: req.json_path ?? null,
       status: error ? "error" : "ok", error, row_count: error ? null : full!.num_rows,
       // Mirror the server: `cached` reports what was actually stored, not what was asked for.
       duration_ms: Date.now() - started, cached: !error && req.cache === true,

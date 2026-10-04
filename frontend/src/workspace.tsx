@@ -36,6 +36,11 @@ export interface OpenTab {
   filters: Filters;
   sql: string;
   connId: string | null;
+  /** Read struct columns as one column per field (`?flatten=all`), for the grid and the tab's SQL. */
+  flatten?: boolean;
+  /** The JSON records path the tab reads its source at (`/data`; `""` = the whole document), for
+   *  the grid and the tab's SQL. Absent: the reader detects the records, as it does for any file. */
+  jsonPath?: string;
   // transient (never persisted)
   sqlOut?: RunResponse | null;
   sqlErr?: string | null;
@@ -72,10 +77,11 @@ export function agoStr(ms: number): string {
 }
 
 const DEFAULT_SQL = "SELECT * FROM t LIMIT 20";
-export function newDataTab(path: string, o: { connId?: string | null; sub?: SubView; sql?: string; title?: string } = {}): OpenTab {
+export function newDataTab(path: string, o: { connId?: string | null; sub?: SubView; sql?: string; title?: string; flatten?: boolean; jsonPath?: string | null } = {}): OpenTab {
   return {
     id: newTabId(), kind: "data", title: o.title || basename(path), path,
     sub: o.sub || "Grid", sort: null, filters: {}, sql: o.sql || DEFAULT_SQL, connId: o.connId ?? null,
+    flatten: o.flatten || undefined, jsonPath: o.jsonPath ?? undefined,
   };
 }
 
@@ -89,7 +95,7 @@ export function newLauncherTab(): OpenTab {
 }
 
 // ---- persistence: open tabs <-> backend Workspace.tabs (opaque view state) ----
-interface TabView { v: 1; path: string; sub: SubView; sort: Sort | null; filters: Filters; sql: string; title: string; }
+interface TabView { v: 1; path: string; sub: SubView; sort: Sort | null; filters: Filters; sql: string; title: string; flatten?: boolean; jsonPath?: string; }
 
 export function buildDoc(ws: Workspace, tabs: OpenTab[]): Workspace {
   const persistable = tabs.filter((t) => t.kind === "data");
@@ -97,7 +103,7 @@ export function buildDoc(ws: Workspace, tabs: OpenTab[]): Workspace {
     ...ws,
     tabs: persistable.map((t) => ({
       id: t.id, kind: "connection", ref_id: t.connId || "",
-      view: { v: 1, path: t.path, sub: t.sub, sort: t.sort, filters: t.filters, sql: t.sql, title: t.title } satisfies TabView,
+      view: { v: 1, path: t.path, sub: t.sub, sort: t.sort, filters: t.filters, sql: t.sql, title: t.title, flatten: t.flatten || undefined, jsonPath: t.jsonPath } satisfies TabView,
     })),
   };
 }
@@ -110,7 +116,9 @@ export function docToTabs(ws: Workspace): OpenTab[] {
     out.push({
       id: t.id || newTabId(), kind: "data", title: v.title || basename(v.path), path: v.path,
       sub: v.sub || "Grid", sort: v.sort ?? null, filters: v.filters || {}, sql: v.sql || DEFAULT_SQL,
-      connId: t.ref_id || null,
+      connId: t.ref_id || null, flatten: v.flatten === true,
+      // `""` is a path (the whole document), so only a missing one means detected.
+      jsonPath: typeof v.jsonPath === "string" ? v.jsonPath : undefined,
     });
   }
   return out;

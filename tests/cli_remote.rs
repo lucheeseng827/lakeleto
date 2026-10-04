@@ -75,6 +75,8 @@ fn head_cli(path: &str, remote_url: Option<String>, format: Option<&str>) -> Cli
         remote_url,
         remote_token: None,
         format: format.map(str::to_string),
+        json_path: None,
+        flatten: None,
         cmd: Cmd::Head {
             path: path.into(),
             rows: 3,
@@ -136,6 +138,52 @@ fn an_explicit_format_still_travels_as_the_override_it_is() {
         request.contains("format=csv"),
         "an explicit --format is the one thing the client does know: {request}"
     );
+}
+
+#[test]
+fn an_explicit_json_path_travels_with_the_request() {
+    let (addr, rx) = one_shot_server();
+    let mut cli = head_cli(OPAQUE_REF, Some(format!("http://{addr}")), None);
+    cli.json_path = Some("data".to_string());
+    let _ = lakeleto::cli::run(cli);
+    let request = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("request");
+    // A bare member name is sent as the pointer it means (`/data`, URL-encoded).
+    assert!(request.contains("json_path=%2Fdata"), "{request}");
+}
+
+#[test]
+fn a_flatten_depth_travels_with_the_request() {
+    let (addr, rx) = one_shot_server();
+    let mut cli = head_cli(OPAQUE_REF, Some(format!("http://{addr}")), None);
+    cli.flatten = Some("2".to_string());
+    let _ = lakeleto::cli::run(cli);
+    let request = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("request");
+    assert!(request.contains("flatten=2"), "{request}");
+}
+
+#[test]
+fn a_bad_flatten_value_is_refused_before_anything_is_sent() {
+    let mut cli = head_cli(OPAQUE_REF, Some("http://127.0.0.1:9".to_string()), None);
+    cli.flatten = Some("deep".to_string());
+    let err = lakeleto::cli::run(cli).expect_err("a bad --flatten is a client-side error");
+    assert!(err.to_string().contains("flatten takes"), "{err}");
+}
+
+#[test]
+fn flatten_takes_its_value_only_after_an_equals_sign() {
+    use clap::Parser;
+    // Bare, before the path: the path stays the path, and flattening is every level.
+    let cli = Cli::try_parse_from(["lakeleto", "head", "--flatten", "data.json"]).unwrap();
+    assert_eq!(cli.flatten.as_deref(), Some("all"));
+    assert!(matches!(&cli.cmd, Cmd::Head { path, .. } if path.to_str() == Some("data.json")));
+    let cli = Cli::try_parse_from(["lakeleto", "head", "data.json", "--flatten=1"]).unwrap();
+    assert_eq!(cli.flatten.as_deref(), Some("1"));
+    let cli = Cli::try_parse_from(["lakeleto", "head", "data.json"]).unwrap();
+    assert_eq!(cli.flatten, None);
 }
 
 #[test]

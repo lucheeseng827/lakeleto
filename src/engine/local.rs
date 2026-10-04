@@ -1,4 +1,5 @@
-//! The default engine: a pure-Rust reader over Parquet and CSV (arrow + parquet).
+//! The default engine: a pure-Rust reader — Parquet (files, datasets, Iceberg, Delta) itself, and
+//! every other format through the `crate::format` registry (arrow + parquet).
 //!
 //! No C++ toolchain, no async runtime, no server — this is what makes `cargo build`
 //! lean and what a first-run user hits when they point Lakeleto at a file. It answers
@@ -6,7 +7,6 @@
 //! `query()` falls through to the trait default (a helpful "use --features sql" error).
 
 use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchReader, StringArray};
@@ -17,12 +17,15 @@ use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 
+use super::flatten::{flatten_rows, flatten_schema};
 use super::{
     apply_scan, build_table_schema, filter_batches, profile_columns, project_rows,
     truncate_batches, window_batches, Capabilities, ColumnProfile, Engine, FilterSpec, RowBatch,
     ScanResult, ScanSpec, TableProfile, TableSchema,
 };
+use crate::context::RequestContext;
 use crate::error::{EngineError, Result};
+use crate::format::{self, FileSchema, FormatReader, Input, ReadOptions, RemoteObject};
 use crate::source::{Format, Source};
 
 /// Read Parquet/CSV locally with the Arrow reader stack.
@@ -33,18 +36,20 @@ pub struct LocalReaderEngine {
     pub batch_size: usize,
     /// Max rows read into memory for a sort/filter grid scan (bounded working set).
     pub scan_cap: usize,
-    /// How this engine's object-store reads are configured.
+    /// The identity this engine's object-store reads fall back to when the *call* names none.
     ///
-    /// Only one read here is remote — the Iceberg mirror in [`Self::iceberg_plan`] — but that one
-    /// is enough to matter: without this field it called the environment-reading
-    /// `materialize_prefix`, so an engine built for one identity mirrored the table as whatever
-    /// principal the process happened to carry. Same reasoning as
-    /// [`crate::engine::sql::DataFusionEngine::store_options`]: a field rather than an [`Engine`]
-    /// trait parameter, because the trait is object-safe and shared by every backend and must not
-    /// grow a cloud-specific argument. Defaults to the process environment, which is what every
-    /// existing caller gets.
+    /// Identity is per-caller, so it travels on the [`RequestContext`] and not here — see
+    /// [`crate::context`] for the rule. What survives on the engine is a **default**, for the
+    /// single-identity case that has no caller to ask: a CLI invocation reads as the process, and
+    /// [`Default`] therefore sets `Some(from_env())`, which is what every existing caller gets.
+    ///
+    /// `None` means *no ambient default*, and is not the same as "the environment". It makes an
+    /// object-store read with no identity in the context a [`EngineError::Forbidden`] rather than
+    /// a read performed as the host — the posture a multi-tenant plane needs, where losing a
+    /// vended credential must fail the read instead of quietly succeeding as the plane. See
+    /// [`Self::without_ambient_identity`].
     #[cfg(feature = "object-store")]
-    store_options: crate::objstore::StoreOptions,
+    default_store_options: Option<crate::objstore::StoreOptions>,
 }
 
 impl Default for LocalReaderEngine {
@@ -54,21 +59,59 @@ impl Default for LocalReaderEngine {
             batch_size: 8192,
             scan_cap: 200_000,
             #[cfg(feature = "object-store")]
-            store_options: crate::objstore::StoreOptions::from_env(),
+            default_store_options: Some(crate::objstore::StoreOptions::from_env()),
         }
     }
 }
 
 impl LocalReaderEngine {
-    /// This engine, reading object storage as `opts` says rather than as the environment says.
+    /// This engine, defaulting to `opts` rather than to the environment when a call names no
+    /// identity of its own.
     ///
-    /// The counterpart of [`crate::engine::sql::DataFusionEngine::with_store_options`]; the SQL
-    /// engine hands its own options down when it falls back to this reader, so a single query
-    /// cannot read half its tables as one principal and half as another.
+    /// Prefer [`RequestContext::with_store_options`] for a per-caller identity: that is what lets
+    /// one engine serve many tenants. This sets the *fallback*, and is still the right call for a
+    /// process that reads as exactly one principal for its whole life.
     #[cfg(feature = "object-store")]
     pub fn with_store_options(mut self, opts: crate::objstore::StoreOptions) -> Self {
-        self.store_options = opts;
+        self.default_store_options = Some(opts);
         self
+    }
+
+    /// This engine with **no** ambient identity: an object-store read is served only if the
+    /// [`RequestContext`] carries one, and refused with [`EngineError::Forbidden`] otherwise.
+    ///
+    /// What a shared, multi-tenant engine wants. The alternative — defaulting to the environment —
+    /// turns any bug that drops a tenant's vended credential into a successful read performed as
+    /// the host, which is the one outcome a credential seam exists to prevent. A loud 403 on a
+    /// path that should never be taken is cheap; a silent read as the wrong principal is not.
+    #[cfg(feature = "object-store")]
+    pub fn without_ambient_identity(mut self) -> Self {
+        self.default_store_options = None;
+        self
+    }
+
+    /// The identity a remote read of `uri` runs under: the call's, else this engine's default,
+    /// else a refusal.
+    ///
+    /// One function so the precedence is stated once. Called at the point of a remote read rather
+    /// than up front, so a local read through an engine with no default is unaffected — a plane
+    /// with a `--compute-local-root` still works with no credential vendor configured at all.
+    #[cfg(feature = "object-store")]
+    fn identity<'a>(
+        &'a self,
+        ctx: &'a RequestContext,
+        uri: &str,
+    ) -> Result<&'a crate::objstore::StoreOptions> {
+        if let Some(opts) = ctx.store_options() {
+            return Ok(opts);
+        }
+        self.default_store_options.as_ref().ok_or_else(|| {
+            EngineError::Forbidden(format!(
+                "no credential identity for object-store read of `{uri}`: the request context \
+                 carried none and this engine has no ambient default. Refusing rather than \
+                 reading as the host process"
+            ))
+        })
     }
 }
 
@@ -77,21 +120,103 @@ impl LocalReaderEngine {
     /// table (`s3://…`) is first mirrored to a local temp dir (once per process) and planned
     /// against the mirror, with the absolute object URIs in its metadata remapped to the mirror.
     #[cfg(feature = "iceberg")]
-    fn iceberg_plan(&self, source: &Source) -> Result<crate::iceberg::TablePlan> {
+    fn iceberg_plan(
+        &self,
+        #[cfg_attr(not(feature = "object-store"), allow(unused_variables))] ctx: &RequestContext,
+        source: &Source,
+    ) -> Result<crate::iceberg::TablePlan> {
         #[cfg(feature = "object-store")]
         if source.is_remote() {
             let uri = source.path.to_string_lossy();
-            let local =
-                crate::objstore::materialize_prefix_with(uri.as_ref(), &self.store_options)?;
+            let local = crate::objstore::materialize_prefix_with(
+                uri.as_ref(),
+                self.identity(ctx, uri.as_ref())?,
+            )?;
             return crate::iceberg::plan_object(&local, uri.as_ref());
         }
         crate::iceberg::plan(&source.path)
     }
 
+    /// The exact row count when the format carries one cheaply (a Parquet footer, Iceberg/Delta
+    /// metadata). The registry's formats are text and never do, so they are answered without
+    /// opening the file: on every grid scroll, there is no count to learn from one.
+    fn row_count(&self, ctx: &RequestContext, source: &Source) -> Result<Option<u64>> {
+        if format::reader(source.format).is_some() {
+            return Ok(None);
+        }
+        Ok(self.open_schema(ctx, source)?.1)
+    }
+
+    /// How this engine reads a registry format's file, for `source` — and so how SQL reads one it
+    /// streams, so the two agree on its schema.
+    pub(crate) fn read_options<'a>(&self, source: &'a Source) -> ReadOptions<'a> {
+        ReadOptions {
+            batch_size: self.batch_size,
+            csv_infer_rows: self.csv_infer_max,
+            json_path: source.json_path.as_deref(),
+        }
+    }
+
+    /// Hand a registry format's input to `f`: the file itself, or for an object-store source the
+    /// object, under the call's identity — read as it arrives by a reader that
+    /// [streams objects](FormatReader::streams_objects), so a read stops fetching where it stops
+    /// reading, and otherwise fetched whole. A compressed file is refused here, before a byte is
+    /// read — which is where its decoder will go.
+    fn with_input<T>(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        reader: &dyn FormatReader,
+        f: impl FnOnce(Input<'_>) -> Result<T>,
+    ) -> Result<T> {
+        source.require_uncompressed()?;
+        if source.is_remote() {
+            if reader.streams_objects() {
+                let object = self.remote_object(ctx, source)?;
+                return f(Input::Object(object.as_ref()));
+            }
+            let bytes = self.fetch_remote(ctx, source)?;
+            return f(Input::Bytes(&bytes));
+        }
+        f(Input::File(&source.path))
+    }
+
+    /// A registry format's schema, local or remote.
+    fn file_schema(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        reader: &dyn FormatReader,
+    ) -> Result<FileSchema> {
+        self.with_input(ctx, source, reader, |input| {
+            reader.schema(input, &self.read_options(source))
+        })
+    }
+
+    /// Up to `row_limit` rows of a registry format, local or remote.
+    fn file_rows(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        reader: &dyn FormatReader,
+        row_limit: Option<usize>,
+    ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>)> {
+        self.with_input(ctx, source, reader, |input| {
+            reader.read(ctx, input, &self.read_options(source), row_limit)
+        })
+    }
+
     /// Open just the schema (+ a cheap row count when the format carries one).
-    fn open_schema(&self, source: &Source) -> Result<(SchemaRef, Option<u64>)> {
+    fn open_schema(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+    ) -> Result<(SchemaRef, Option<u64>)> {
+        if let Some(reader) = format::reader(source.format) {
+            return Ok((self.file_schema(ctx, source, reader)?.schema, None));
+        }
         if source.is_remote() && !matches!(source.format, Format::Iceberg) {
-            return self.remote_schema(source);
+            return self.remote_schema(ctx, source);
         }
         if is_parquet_dataset(source) {
             return self.dataset_schema(source);
@@ -106,14 +231,9 @@ impl LocalReaderEngine {
                 let row_count = if rows >= 0 { Some(rows as u64) } else { None };
                 Ok((schema, row_count))
             }
-            Format::Csv | Format::Tsv => Ok((
-                self.infer_csv(&source.path, self.csv_infer_max, source.format.delimiter())?,
-                None,
-            )),
-            Format::Json => Ok((self.json_schema(&source.path)?, None)),
             #[cfg(feature = "iceberg")]
             Format::Iceberg => {
-                let plan = self.iceberg_plan(source)?;
+                let plan = self.iceberg_plan(ctx, source)?;
                 let first = plan
                     .files
                     .first()
@@ -158,98 +278,21 @@ impl LocalReaderEngine {
         }
     }
 
-    /// Infer a CSV/TSV schema over up to `max_rows` rows (`delimiter` from the source format).
-    fn infer_csv(
-        &self,
-        path: &std::path::Path,
-        max_rows: usize,
-        delimiter: u8,
-    ) -> Result<SchemaRef> {
-        let mut rdr = BufReader::new(File::open(path)?);
-        let format = arrow_csv::reader::Format::default()
-            .with_header(true)
-            .with_delimiter(delimiter);
-        let (schema, _) = format
-            .infer_schema(&mut rdr, Some(max_rows))
-            .map_err(EngineError::arrow)?;
-        Ok(Arc::new(schema))
-    }
-
-    /// Infer a `.json`/`.ndjson`/`.jsonl` schema over up to `csv_infer_max` records. A top-level
-    /// array is normalised to newline-delimited JSON first (see [`json_array_to_ndjson`]); NDJSON
-    /// is inferred by streaming.
-    fn json_schema(&self, path: &std::path::Path) -> Result<SchemaRef> {
-        if json_is_array(path)? {
-            let nd = json_array_to_ndjson(path)?;
-            let (schema, _) = arrow_json::reader::infer_json_schema(
-                std::io::Cursor::new(&nd),
-                Some(self.csv_infer_max),
-            )
-            .map_err(EngineError::arrow)?;
-            Ok(Arc::new(schema))
-        } else {
-            let (schema, _) = arrow_json::reader::infer_json_schema(
-                BufReader::new(File::open(path)?),
-                Some(self.csv_infer_max),
-            )
-            .map_err(EngineError::arrow)?;
-            Ok(Arc::new(schema))
-        }
-    }
-
-    /// Read a `.json`/`.ndjson`/`.jsonl` file into Arrow batches, stopping once `row_limit` rows
-    /// are gathered (all rows when `None`). Newline-delimited JSON streams straight through the
-    /// arrow-json reader; a top-level array is parsed and re-emitted as newline-delimited so a
-    /// single reader path serves both shapes. The schema is inferred over at least the read window
-    /// (mirroring the CSV path) so a column that only widens later does not error the fixed reader.
-    fn read_json_batches(
-        &self,
-        path: &std::path::Path,
-        row_limit: Option<usize>,
-    ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
-        let infer_rows = row_limit
-            .map(|n| n.max(self.csv_infer_max))
-            .unwrap_or(self.csv_infer_max);
-        let bs = row_limit
-            .map(|n| n.clamp(1, self.batch_size))
-            .unwrap_or(self.batch_size);
-        if json_is_array(path)? {
-            let nd = json_array_to_ndjson(path)?;
-            let (schema, _) =
-                arrow_json::reader::infer_json_schema(std::io::Cursor::new(&nd), Some(infer_rows))
-                    .map_err(EngineError::arrow)?;
-            let schema = Arc::new(schema);
-            let reader = arrow_json::ReaderBuilder::new(schema.clone())
-                .with_batch_size(bs)
-                .build(std::io::Cursor::new(&nd))
-                .map_err(EngineError::arrow)?;
-            Ok((schema, collect_batches(reader, row_limit)?))
-        } else {
-            let (schema, _) = arrow_json::reader::infer_json_schema(
-                BufReader::new(File::open(path)?),
-                Some(infer_rows),
-            )
-            .map_err(EngineError::arrow)?;
-            let schema = Arc::new(schema);
-            let reader = arrow_json::ReaderBuilder::new(schema.clone())
-                .with_batch_size(bs)
-                .build(BufReader::new(File::open(path)?))
-                .map_err(EngineError::arrow)?;
-            Ok((schema, collect_batches(reader, row_limit)?))
-        }
-    }
-
     /// Read up to `row_limit` rows (all rows when `None`).
     fn read_batches(
         &self,
+        ctx: &RequestContext,
         source: &Source,
         row_limit: Option<usize>,
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>)> {
+        if let Some(reader) = format::reader(source.format) {
+            return self.file_rows(ctx, source, reader, row_limit);
+        }
         if source.is_remote() && !matches!(source.format, Format::Iceberg) {
-            return self.remote_window(source, 0, row_limit.unwrap_or(usize::MAX));
+            return self.remote_window(ctx, source, 0, row_limit.unwrap_or(usize::MAX));
         }
         if is_parquet_dataset(source) {
-            return self.read_dataset_window(source, 0, row_limit.unwrap_or(usize::MAX));
+            return self.read_dataset_window(ctx, source, 0, row_limit.unwrap_or(usize::MAX));
         }
         match source.format {
             Format::Parquet => {
@@ -268,6 +311,7 @@ impl LocalReaderEngine {
                 let mut batches = Vec::new();
                 let mut rows = 0usize;
                 for b in reader {
+                    ctx.check()?;
                     let b = b.map_err(EngineError::arrow)?;
                     rows += b.num_rows();
                     batches.push(b);
@@ -277,62 +321,42 @@ impl LocalReaderEngine {
                 }
                 Ok((schema, batches))
             }
-            Format::Csv | Format::Tsv => {
-                let delim = source.format.delimiter();
-                // Infer over at least the scan window: a column that only widens after
-                // `csv_infer_max` rows would otherwise make the fixed-schema reader error.
-                let infer_rows = row_limit
-                    .map(|n| n.max(self.csv_infer_max))
-                    .unwrap_or(self.csv_infer_max);
-                let schema = self.infer_csv(&source.path, infer_rows, delim)?;
-                let file = File::open(&source.path)?;
-                let bs = row_limit
-                    .map(|n| n.clamp(1, self.batch_size))
-                    .unwrap_or(self.batch_size);
-                let reader = arrow_csv::reader::ReaderBuilder::new(schema.clone())
-                    .with_header(true)
-                    .with_delimiter(delim)
-                    .with_batch_size(bs)
-                    .build(file)
-                    .map_err(EngineError::arrow)?;
-                let mut batches = Vec::new();
-                let mut rows = 0usize;
-                for batch in reader {
-                    let batch = batch.map_err(EngineError::arrow)?;
-                    rows += batch.num_rows();
-                    batches.push(batch);
-                    if row_limit.is_some_and(|n| rows >= n) {
-                        break;
-                    }
-                }
-                Ok((schema, batches))
-            }
-            Format::Json => self.read_json_batches(&source.path, row_limit),
             #[cfg(feature = "iceberg")]
-            Format::Iceberg => self.read_window(source, 0, row_limit.unwrap_or(usize::MAX), None),
+            Format::Iceberg => {
+                self.read_window(ctx, source, 0, row_limit.unwrap_or(usize::MAX), None)
+            }
             #[cfg(feature = "delta")]
-            Format::Delta => self.read_window(source, 0, row_limit.unwrap_or(usize::MAX), None),
+            Format::Delta => {
+                self.read_window(ctx, source, 0, row_limit.unwrap_or(usize::MAX), None)
+            }
             other => Err(EngineError::unsupported_format(other, self.name())),
         }
     }
 
     /// Read a specific `offset..offset+limit` row window. Parquet pushes the offset/limit
-    /// into the reader (row-group skipping); CSV reads sequentially and slices; Iceberg walks
-    /// the current snapshot's data files, skipping whole files by their footer row counts.
-    /// `projection` (column names) is pushed into the Parquet reader so only those columns are
-    /// decoded (the caller still reorders to the requested order); other formats read all columns.
+    /// into the reader (row-group skipping); a registry format reads sequentially and slices;
+    /// Iceberg walks the current snapshot's data files, skipping whole files by their footer row
+    /// counts. `projection` (column names) is pushed into the Parquet reader so only those columns
+    /// are decoded (the caller still reorders to the requested order); other formats read all
+    /// columns.
     fn read_window(
         &self,
+        ctx: &RequestContext,
         source: &Source,
         offset: usize,
         limit: usize,
         projection: Option<&[String]>,
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>)> {
+        if let Some(reader) = format::reader(source.format) {
+            let through = Some(offset.saturating_add(limit));
+            let (schema, batches) = self.file_rows(ctx, source, reader, through)?;
+            return Ok((schema, window_batches(batches, offset, limit)));
+        }
         if source.is_remote() && !matches!(source.format, Format::Iceberg) {
-            return self.remote_window(source, offset, limit);
+            return self.remote_window(ctx, source, offset, limit);
         }
         if is_parquet_dataset(source) {
-            return self.read_dataset_window(source, offset, limit);
+            return self.read_dataset_window(ctx, source, offset, limit);
         }
         match source.format {
             Format::Parquet => {
@@ -359,6 +383,7 @@ impl LocalReaderEngine {
                 let mut batches = Vec::new();
                 let mut rows = 0usize;
                 for b in reader {
+                    ctx.check()?;
                     let b = b.map_err(EngineError::arrow)?;
                     rows += b.num_rows();
                     batches.push(b);
@@ -368,20 +393,10 @@ impl LocalReaderEngine {
                 }
                 Ok((schema, batches))
             }
-            Format::Csv | Format::Tsv => {
-                let (schema, batches) =
-                    self.read_batches(source, Some(offset.saturating_add(limit)))?;
-                Ok((schema, window_batches(batches, offset, limit)))
-            }
-            Format::Json => {
-                let (schema, batches) =
-                    self.read_batches(source, Some(offset.saturating_add(limit)))?;
-                Ok((schema, window_batches(batches, offset, limit)))
-            }
             #[cfg(feature = "iceberg")]
             Format::Iceberg => {
-                let plan = self.iceberg_plan(source)?;
-                self.read_iceberg(source, &plan, offset, limit, None)
+                let plan = self.iceberg_plan(ctx, source)?;
+                self.read_iceberg(ctx, source, &plan, offset, limit, None)
             }
             #[cfg(feature = "delta")]
             Format::Delta => {
@@ -466,6 +481,7 @@ impl LocalReaderEngine {
     /// dataset's union schema (reorder columns, null-fill any the file omits), and accumulate.
     fn read_dataset_window(
         &self,
+        ctx: &RequestContext,
         source: &Source,
         offset: usize,
         limit: usize,
@@ -479,6 +495,9 @@ impl LocalReaderEngine {
             if remaining == 0 {
                 break;
             }
+            // Per file, not per row: a dataset can be thousands of files, and this is the
+            // boundary at which abandoning the read costs nothing already read.
+            ctx.check()?;
             let mut builder = ParquetRecordBatchReaderBuilder::try_new(File::open(f)?)
                 .map_err(EngineError::parquet)?;
             let frows = builder.metadata().file_metadata().num_rows().max(0) as usize;
@@ -497,6 +516,7 @@ impl LocalReaderEngine {
             let parts = crate::source::hive_partitions(f, &source.path);
             let mut got = 0usize;
             for b in reader {
+                ctx.check()?;
                 let b = b.map_err(EngineError::arrow)?;
                 got += b.num_rows();
                 let unified = unify_batch(&b, &layout.data)?;
@@ -518,6 +538,7 @@ impl LocalReaderEngine {
     #[cfg(feature = "iceberg")]
     fn read_iceberg(
         &self,
+        ctx: &RequestContext,
         source: &Source,
         plan: &crate::iceberg::TablePlan,
         offset: usize,
@@ -527,9 +548,9 @@ impl LocalReaderEngine {
         // Deletes shift positions so they take the slower read-from-start path; delete-free
         // tables keep the footer-skip fast path (with row-group skipping when filtered).
         let (base_schema, batches) = if plan.has_deletes() {
-            self.read_iceberg_with_deletes(source, plan, offset, limit)?
+            self.read_iceberg_with_deletes(ctx, source, plan, offset, limit)?
         } else {
-            self.read_iceberg_plain(source, plan, offset, limit, filters)?
+            self.read_iceberg_plain(ctx, source, plan, offset, limit, filters)?
         };
         // Schema evolution: when the metadata declares a current schema, unify every file to it
         // (match by field-id, cast promoted types, null-fill added columns).
@@ -570,9 +591,26 @@ impl LocalReaderEngine {
         let row_count = meta.file_metadata().num_rows().max(0) as u64;
         let row_groups: Vec<_> = meta.row_groups().iter().collect();
 
-        let mut columns = Vec::with_capacity(arrow_schema.fields().len());
+        let shown = flatten_schema(&arrow_schema, source.flatten)?;
+        let mut columns = Vec::with_capacity(shown.fields().len());
         let mut any_stats = false;
-        for field in arrow_schema.fields() {
+        for field in shown.fields() {
+            // Parquet's statistics API reaches top-level columns only, so a flattened struct's
+            // fields get no footer stats — just as the struct column itself never had any.
+            if arrow_schema.column_with_name(field.name()).is_none() {
+                columns.push(ColumnProfile {
+                    name: field.name().clone(),
+                    data_type: format!("{}", field.data_type()),
+                    null_count: 0,
+                    null_fraction: 0.0,
+                    distinct: 0,
+                    distinct_capped: false,
+                    min: None,
+                    max: None,
+                    sample: Vec::new(),
+                });
+                continue;
+            }
             let conv = StatisticsConverter::try_new(field.name(), &arrow_schema, parquet_schema)
                 .map_err(EngineError::parquet)?;
             let nulls = conv
@@ -632,25 +670,27 @@ impl LocalReaderEngine {
     /// Returns `(schema, batches, rows_read)`.
     fn read_working_set(
         &self,
+        ctx: &RequestContext,
         source: &Source,
         filters: &[FilterSpec],
         cap: usize,
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>, usize)> {
         #[cfg(feature = "iceberg")]
         if source.format == Format::Iceberg && !filters.is_empty() {
-            let plan = self.iceberg_plan(source)?;
+            let plan = self.iceberg_plan(ctx, source)?;
             let (pruned, skipped) = crate::iceberg::prune(&plan, filters);
             if skipped > 0 && pruned.files.is_empty() {
                 // Every file pruned out → an empty result under the table's schema (not an error).
                 let schema = self.iceberg_schema_only(&plan)?;
                 return Ok((schema, Vec::new(), 0));
             }
-            let (schema, batches) = self.read_iceberg(source, &pruned, 0, cap, Some(filters))?;
+            let (schema, batches) =
+                self.read_iceberg(ctx, source, &pruned, 0, cap, Some(filters))?;
             let scanned = batches.iter().map(|b| b.num_rows()).sum();
             return Ok((schema, batches, scanned));
         }
         let _ = filters;
-        let (schema, batches) = self.read_window(source, 0, cap, None)?;
+        let (schema, batches) = self.read_window(ctx, source, 0, cap, None)?;
         let scanned = batches.iter().map(|b| b.num_rows()).sum();
         Ok((schema, batches, scanned))
     }
@@ -680,6 +720,7 @@ impl LocalReaderEngine {
     #[cfg(feature = "iceberg")]
     fn read_iceberg_plain(
         &self,
+        ctx: &RequestContext,
         source: &Source,
         plan: &crate::iceberg::TablePlan,
         offset: usize,
@@ -691,6 +732,8 @@ impl LocalReaderEngine {
         let mut to_skip = offset;
         let mut remaining = limit;
         for f in &plan.files {
+            // One check per data file — an Iceberg snapshot can name thousands.
+            ctx.check()?;
             let mut builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&f.path)?)
                 .map_err(EngineError::parquet)?;
             if schema.is_none() {
@@ -750,6 +793,7 @@ impl LocalReaderEngine {
     #[cfg(feature = "iceberg")]
     fn read_iceberg_with_deletes(
         &self,
+        ctx: &RequestContext,
         source: &Source,
         plan: &crate::iceberg::TablePlan,
         offset: usize,
@@ -760,6 +804,8 @@ impl LocalReaderEngine {
         let mut logical: Vec<arrow_array::RecordBatch> = Vec::new();
         let mut got = 0usize;
         for entry in &plan.files {
+            // One check per data file — an Iceberg snapshot can name thousands.
+            ctx.check()?;
             let mut builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&entry.path)?)
                 .map_err(EngineError::parquet)?;
             if schema.is_none() {
@@ -768,11 +814,30 @@ impl LocalReaderEngine {
             if got >= want {
                 continue; // schema captured from the first file; window already covered
             }
-            // Equality deletes apply only to files with a strictly lower sequence number.
+            // An equality delete applies to this file only when BOTH halves of the spec's rule
+            // hold: a strictly higher sequence number (so rows re-inserted after a delete
+            // survive), and a matching partition (so a delete written for one partition does not
+            // reach into another). The second half is `applies_to_partition`, which only skips a
+            // delete when the two partitions are provably different.
             let eq: Vec<&crate::iceberg::EqualityDelete> = plan
                 .equality_deletes
                 .iter()
-                .filter(|d| d.seq > entry.seq)
+                .filter(|d| {
+                    if d.seq <= entry.seq {
+                        return false;
+                    }
+                    // A partition tuple records no spec id, so two of them are only comparable when
+                    // the table has exactly one partition spec. Under spec evolution, same-arity
+                    // tuples may be over different source columns, and "provably different" would
+                    // then skip a delete that should apply — resurfacing deleted rows, which is the
+                    // one direction this reader refuses. An evolved table therefore applies the
+                    // delete, erring the same way `applies_to_partition` already does when it
+                    // cannot prove a difference.
+                    if !plan.single_partition_spec {
+                        return true;
+                    }
+                    d.applies_to_partition(&entry.partition)
+                })
                 .collect();
             builder = builder.with_batch_size(self.batch_size);
             let reader = builder.build().map_err(EngineError::parquet)?;
@@ -800,144 +865,98 @@ impl LocalReaderEngine {
 
     // --- object-store (s3://, gs://, az://) reads ------------------------------------------
     // BYO-credential reads over the same code paths as local files. Parquet is read with
-    // ranged requests (larger-than-memory preserved); CSV is fetched whole. When the binary
+    // ranged requests (larger-than-memory preserved); CSV and JSON stream. When the binary
     // lacks the `object-store` feature these return a targeted "rebuild with the feature"
     // error, so a URI never fails with an opaque filesystem message.
 
+    /// Every read here goes through the `_with` wrapper under the identity
+    /// [`Self::identity`] resolved, never the bare environment-reading one. That is not a
+    /// stylistic preference: the bare wrappers are what this function used to call, so an engine
+    /// built for one identity read plain remote Parquet, CSV and JSON as whatever principal the
+    /// process carried, while only the Iceberg mirror honoured the caller.
     #[cfg(feature = "object-store")]
-    fn remote_schema(&self, source: &Source) -> Result<(SchemaRef, Option<u64>)> {
+    fn remote_schema(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+    ) -> Result<(SchemaRef, Option<u64>)> {
         let uri = source.path.to_string_lossy();
+        let opts = self.identity(ctx, uri.as_ref())?;
         match source.format {
-            Format::Parquet => crate::objstore::parquet_schema(&uri),
-            Format::Csv | Format::Tsv => {
-                let bytes = crate::objstore::fetch_all(&uri)?;
-                let delim = source.format.delimiter();
-                Ok((
-                    self.infer_csv_bytes(&bytes, self.csv_infer_max, delim)?,
-                    None,
-                ))
-            }
-            Format::Json => {
-                let bytes = crate::objstore::fetch_all(&uri)?;
-                Ok((self.json_schema_bytes(&bytes)?, None))
-            }
+            Format::Parquet => crate::objstore::parquet_schema_with(&uri, opts),
             other => Err(EngineError::unsupported_format(other, self.name())),
         }
     }
 
-    /// Infer a JSON schema from an in-memory buffer (remote `.json`/`.ndjson`/`.jsonl`).
+    /// Fetch a whole object under the call's identity — what a registry format's reader that does
+    /// not stream objects reads a remote file from.
     #[cfg(feature = "object-store")]
-    fn json_schema_bytes(&self, bytes: &[u8]) -> Result<SchemaRef> {
-        let nd = json_bytes_to_ndjson(bytes)?;
-        let (schema, _) = arrow_json::reader::infer_json_schema(
-            std::io::Cursor::new(nd.as_ref()),
-            Some(self.csv_infer_max),
-        )
-        .map_err(EngineError::arrow)?;
-        Ok(Arc::new(schema))
+    fn fetch_remote(&self, ctx: &RequestContext, source: &Source) -> Result<Vec<u8>> {
+        let uri = source.path.to_string_lossy();
+        let opts = self.identity(ctx, uri.as_ref())?;
+        crate::objstore::fetch_all_with(&uri, opts)
     }
 
-    /// Read JSON from an in-memory buffer into Arrow batches (remote `.json`/`.ndjson`/`.jsonl`),
-    /// stopping at `row_limit`. Mirrors the local [`read_json_batches`](Self::read_json_batches)
-    /// but over bytes already fetched, since a remote object is fetched whole (it cannot be
-    /// row-windowed at the source, exactly like remote CSV).
+    /// Look an object up under the call's identity, for a reader that streams objects to read
+    /// as its bytes arrive.
     #[cfg(feature = "object-store")]
-    fn read_json_bytes(
+    fn remote_object(
         &self,
-        bytes: &[u8],
-        row_limit: Option<usize>,
-    ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
-        let nd = json_bytes_to_ndjson(bytes)?;
-        let infer_rows = row_limit
-            .map(|n| n.max(self.csv_infer_max))
-            .unwrap_or(self.csv_infer_max);
-        let bs = row_limit
-            .map(|n| n.clamp(1, self.batch_size))
-            .unwrap_or(self.batch_size);
-        let (schema, _) = arrow_json::reader::infer_json_schema(
-            std::io::Cursor::new(nd.as_ref()),
-            Some(infer_rows),
-        )
-        .map_err(EngineError::arrow)?;
-        let schema = Arc::new(schema);
-        let reader = arrow_json::ReaderBuilder::new(schema.clone())
-            .with_batch_size(bs)
-            .build(std::io::Cursor::new(nd.as_ref()))
-            .map_err(EngineError::arrow)?;
-        Ok((schema, collect_batches(reader, row_limit)?))
+        ctx: &RequestContext,
+        source: &Source,
+    ) -> Result<Box<dyn RemoteObject>> {
+        let uri = source.path.to_string_lossy();
+        let opts = self.identity(ctx, uri.as_ref())?;
+        Ok(Box::new(crate::objstore::object_with(&uri, opts)?))
     }
 
     #[cfg(feature = "object-store")]
     fn remote_window(
         &self,
+        ctx: &RequestContext,
         source: &Source,
         offset: usize,
         limit: usize,
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>)> {
         let uri = source.path.to_string_lossy();
+        // Same identity for every format, resolved before the first byte — see `remote_schema`.
+        let opts = self.identity(ctx, uri.as_ref())?;
         match source.format {
             Format::Parquet => {
-                crate::objstore::parquet_window(&uri, offset, limit, self.batch_size)
-            }
-            Format::Csv | Format::Tsv => {
-                // CSV can't be windowed by row remotely: fetch once, then infer + slice locally.
-                let bytes = crate::objstore::fetch_all(&uri)?;
-                let want = offset.saturating_add(limit);
-                let delim = source.format.delimiter();
-                let schema = self.infer_csv_bytes(&bytes, want.max(self.csv_infer_max), delim)?;
-                let bs = limit.clamp(1, self.batch_size);
-                let reader = arrow_csv::reader::ReaderBuilder::new(schema.clone())
-                    .with_header(true)
-                    .with_delimiter(delim)
-                    .with_batch_size(bs)
-                    .build(std::io::Cursor::new(&bytes))
-                    .map_err(EngineError::arrow)?;
-                let mut batches = Vec::new();
-                let mut rows = 0usize;
-                for batch in reader {
-                    let batch = batch.map_err(EngineError::arrow)?;
-                    rows += batch.num_rows();
-                    batches.push(batch);
-                    if rows >= want {
-                        break;
-                    }
-                }
-                Ok((schema, window_batches(batches, offset, limit)))
-            }
-            Format::Json => {
-                // Like remote CSV: fetch once, read + slice locally (no remote row-windowing).
-                let bytes = crate::objstore::fetch_all(&uri)?;
-                let want = offset.saturating_add(limit);
-                let (schema, batches) = self.read_json_bytes(&bytes, Some(want))?;
-                Ok((schema, window_batches(batches, offset, limit)))
+                crate::objstore::parquet_window_with(&uri, offset, limit, self.batch_size, opts)
             }
             other => Err(EngineError::unsupported_format(other, self.name())),
         }
     }
 
-    /// Infer a CSV/TSV schema over up to `max_rows` rows of an in-memory buffer (remote CSV).
-    /// `delimiter` keys off the object's extension (tab for `.tsv`) so remote `.tsv` splits the
-    /// same as local `.tsv`.
-    #[cfg(feature = "object-store")]
-    fn infer_csv_bytes(&self, bytes: &[u8], max_rows: usize, delimiter: u8) -> Result<SchemaRef> {
-        let mut rdr = std::io::Cursor::new(bytes);
-        let format = arrow_csv::reader::Format::default()
-            .with_header(true)
-            .with_delimiter(delimiter);
-        let (schema, _) = format
-            .infer_schema(&mut rdr, Some(max_rows))
-            .map_err(EngineError::arrow)?;
-        Ok(Arc::new(schema))
+    #[cfg(not(feature = "object-store"))]
+    fn remote_schema(
+        &self,
+        _ctx: &RequestContext,
+        source: &Source,
+    ) -> Result<(SchemaRef, Option<u64>)> {
+        Err(remote_unavailable(source))
     }
 
     #[cfg(not(feature = "object-store"))]
-    fn remote_schema(&self, source: &Source) -> Result<(SchemaRef, Option<u64>)> {
+    fn fetch_remote(&self, _ctx: &RequestContext, source: &Source) -> Result<Vec<u8>> {
+        Err(remote_unavailable(source))
+    }
+
+    /// Without the `object-store` feature there is no store to look an object up in.
+    #[cfg(not(feature = "object-store"))]
+    fn remote_object(
+        &self,
+        _ctx: &RequestContext,
+        source: &Source,
+    ) -> Result<Box<dyn RemoteObject>> {
         Err(remote_unavailable(source))
     }
 
     #[cfg(not(feature = "object-store"))]
     fn remote_window(
         &self,
+        _ctx: &RequestContext,
         source: &Source,
         _offset: usize,
         _limit: usize,
@@ -949,97 +968,6 @@ impl LocalReaderEngine {
 /// Is this source a directory of Parquet files (a multi-file dataset) rather than a single file?
 fn is_parquet_dataset(source: &Source) -> bool {
     source.format == Format::Parquet && !source.is_remote() && source.path.is_dir()
-}
-
-/// Whether a JSON file's first non-whitespace byte is `[` — a top-level array, as opposed to
-/// newline-delimited JSON (`.ndjson`/`.jsonl`, or a `.json` written one record per line). The two
-/// shapes are read by different paths, so the reader peeks a single byte to pick one.
-fn json_is_array(path: &std::path::Path) -> Result<bool> {
-    use std::io::Read;
-    let mut r = BufReader::new(File::open(path)?);
-    let mut b = [0u8; 1];
-    while r.read(&mut b)? == 1 {
-        if !b[0].is_ascii_whitespace() {
-            return Ok(b[0] == b'[');
-        }
-    }
-    // Empty (or all-whitespace) file: no records — treat as newline-delimited (zero rows).
-    Ok(false)
-}
-
-/// Upper bound on the size of a top-level JSON **array** the reader will buffer. A bracketed array
-/// cannot be line-streamed, so it is parsed into memory in full before the caller's row window
-/// applies; without a ceiling a large `.json` array would let a single `preview?limit=50` request
-/// exhaust server memory. Arrays above this size are rejected before any allocation. Newline-
-/// delimited JSON has no such limit — it streams and is bounded by the row window directly.
-const JSON_ARRAY_MAX_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Parse a top-level JSON **array** file and re-emit it as newline-delimited JSON (one array
-/// element per line), so the newline-delimited arrow-json reader can consume it. A bracketed array
-/// cannot be line-streamed, so it is read into memory in full — the same shape `duckdb`/`pandas`
-/// take for a JSON array. The file's size is checked against [`JSON_ARRAY_MAX_BYTES`] *before* it is
-/// read, so an oversized array is rejected without ever allocating it.
-fn json_array_to_ndjson(path: &std::path::Path) -> Result<Vec<u8>> {
-    let len = std::fs::metadata(path)?.len();
-    if len > JSON_ARRAY_MAX_BYTES {
-        return Err(json_array_too_large(len));
-    }
-    Ok(json_bytes_to_ndjson(&std::fs::read(path)?)?.into_owned())
-}
-
-/// Normalise raw JSON bytes to newline-delimited JSON: a top-level `[...]` array is parsed and
-/// re-emitted one element per line (owned); anything already newline-delimited is returned
-/// borrowed, unchanged. Shared by the local array path and the remote reader, which both hold the
-/// bytes in memory (a bracketed array cannot be line-streamed). An array larger than
-/// [`JSON_ARRAY_MAX_BYTES`] is rejected before the parse, so it is never deserialised.
-fn json_bytes_to_ndjson(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>> {
-    let is_array = bytes
-        .iter()
-        .find(|b| !b.is_ascii_whitespace())
-        .is_some_and(|b| *b == b'[');
-    if !is_array {
-        return Ok(std::borrow::Cow::Borrowed(bytes));
-    }
-    if bytes.len() as u64 > JSON_ARRAY_MAX_BYTES {
-        return Err(json_array_too_large(bytes.len() as u64));
-    }
-    let values: Vec<serde_json::Value> = serde_json::from_slice(bytes)
-        .map_err(|e| EngineError::Query(format!("invalid JSON array: {e}")))?;
-    let mut out = Vec::new();
-    for v in &values {
-        serde_json::to_writer(&mut out, v).map_err(|e| EngineError::Other(e.to_string()))?;
-        out.push(b'\n');
-    }
-    Ok(std::borrow::Cow::Owned(out))
-}
-
-/// The error returned when a top-level JSON array exceeds [`JSON_ARRAY_MAX_BYTES`]. Names the limit
-/// and points at the newline-delimited alternative, which streams instead of buffering.
-fn json_array_too_large(len: u64) -> EngineError {
-    EngineError::Query(format!(
-        "JSON array is {len} bytes, over the {JSON_ARRAY_MAX_BYTES}-byte limit for a bracketed \
-         array; convert it to newline-delimited JSON (one record per line) to read it in a bounded \
-         stream"
-    ))
-}
-
-/// Drain an Arrow-batch iterator into a vec, stopping once `row_limit` rows are gathered (all rows
-/// when `None`). Shared by the JSON reader's two source shapes (file stream vs. in-memory buffer).
-fn collect_batches<I>(iter: I, row_limit: Option<usize>) -> Result<Vec<RecordBatch>>
-where
-    I: IntoIterator<Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>>,
-{
-    let mut batches = Vec::new();
-    let mut rows = 0usize;
-    for b in iter {
-        let b = b.map_err(EngineError::arrow)?;
-        rows += b.num_rows();
-        batches.push(b);
-        if row_limit.is_some_and(|n| rows >= n) {
-            break;
-        }
-    }
-    Ok(batches)
 }
 
 /// The physical layout of a multi-file Parquet dataset: `data` columns (the union of file schemas)
@@ -1194,31 +1122,52 @@ impl Engine for LocalReaderEngine {
             sql: false,
             profile: true,
             remote: false,
+            // Overrides both: `scan` at the Arrow-kernel windowed read below, and `stats`,
+            // which filters before profiling rather than taking the filter-dropping default.
+            scan: true,
+            filtered_stats: true,
         }
     }
 
-    fn schema(&self, source: &Source) -> Result<TableSchema> {
-        let (schema, row_count) = self.open_schema(source)?;
+    fn schema(&self, ctx: &RequestContext, source: &Source) -> Result<TableSchema> {
+        ctx.check()?;
+        if let Some(reader) = format::reader(source.format) {
+            // Say where the rows came from when the reader chose it, so an unwrapped
+            // `{"data": [...]}` is never silent.
+            let file = self.file_schema(ctx, source, reader)?;
+            let schema = flatten_schema(&file.schema, source.flatten)?;
+            let mut ts = build_table_schema(source, self.name(), None, &schema);
+            ts.records_path = file.records_path;
+            return Ok(ts);
+        }
+        let (schema, row_count) = self.open_schema(ctx, source)?;
+        let schema = flatten_schema(&schema, source.flatten)?;
         Ok(build_table_schema(source, self.name(), row_count, &schema))
     }
 
-    fn preview(&self, source: &Source, limit: usize) -> Result<RowBatch> {
-        let (schema, batches) = self.read_batches(source, Some(limit))?;
-        Ok(RowBatch {
-            schema,
-            batches: truncate_batches(batches, limit),
-        })
+    fn preview(&self, ctx: &RequestContext, source: &Source, limit: usize) -> Result<RowBatch> {
+        let (schema, batches) = self.read_batches(ctx, source, Some(limit))?;
+        let (schema, batches) =
+            flatten_rows(schema, truncate_batches(batches, limit), source.flatten)?;
+        Ok(RowBatch { schema, batches })
     }
 
-    fn profile(&self, source: &Source, scan_limit: usize) -> Result<TableProfile> {
+    fn profile(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        scan_limit: usize,
+    ) -> Result<TableProfile> {
+        ctx.check()?;
         // `scan_limit == 0` selects the near-instant footer-statistics path (Parquet only):
         // exact whole-file row count / null counts / min / max, no row scan (distinct + samples
         // are then not computed).
         if scan_limit == 0 {
             return self.profile_from_footer(source);
         }
-        let row_count = self.open_schema(source)?.1;
-        let (schema, batches) = self.read_batches(source, Some(scan_limit))?;
+        let row_count = self.row_count(ctx, source)?;
+        let (schema, batches) = self.read_batches(ctx, source, Some(scan_limit))?;
+        let (schema, batches) = flatten_rows(schema, batches, source.flatten)?;
         let scanned_rows = batches.iter().map(|b| b.num_rows() as u64).sum();
         let columns = profile_columns(&schema, &batches);
         Ok(TableProfile {
@@ -1230,15 +1179,19 @@ impl Engine for LocalReaderEngine {
         })
     }
 
-    fn scan(&self, source: &Source, spec: &ScanSpec) -> Result<ScanResult> {
+    fn scan(&self, ctx: &RequestContext, source: &Source, spec: &ScanSpec) -> Result<ScanResult> {
+        ctx.check()?;
         let proj = spec.projection.as_deref();
         if spec.is_plain_window() {
             // Fast path: read exactly the requested row window (offset + column projection
             // pushed into the Parquet reader), then reorder to the requested column order.
-            let (schema, batches) = self.read_window(source, spec.offset, spec.limit, proj)?;
+            // A flattened column's name is its Parquet leaf path (`user.geo.lat`), which is what
+            // the reader's projection matches on, so pushing it down still selects that column.
+            let (schema, batches) = self.read_window(ctx, source, spec.offset, spec.limit, proj)?;
+            let (schema, batches) = flatten_rows(schema, batches, source.flatten)?;
             let returned: usize = batches.iter().map(|b| b.num_rows()).sum();
             // Parquet carries an exact total in its footer; CSV does not (cheaply).
-            let total = self.open_schema(source)?.1.map(|n| n as usize);
+            let total = self.row_count(ctx, source)?.map(|n| n as usize);
             Ok(ScanResult {
                 batch: project_rows(RowBatch { schema, batches }, proj)?,
                 matched_rows: total.unwrap_or(spec.offset + returned),
@@ -1251,7 +1204,8 @@ impl Engine for LocalReaderEngine {
             // Sort/filter: read a bounded working set (Iceberg prunes non-matching files first),
             // then run Arrow kernels over it.
             let (schema, batches, scanned) =
-                self.read_working_set(source, &spec.filters, self.scan_cap)?;
+                self.read_working_set(ctx, source, &spec.filters, self.scan_cap)?;
+            let (schema, batches) = flatten_rows(schema, batches, source.flatten)?;
             let bounded = scanned >= self.scan_cap;
             let (window, matched) = apply_scan(&schema, &batches, spec)?;
             Ok(ScanResult {
@@ -1267,12 +1221,15 @@ impl Engine for LocalReaderEngine {
 
     fn stats(
         &self,
+        ctx: &RequestContext,
         source: &Source,
         filters: &[FilterSpec],
         scan_limit: usize,
     ) -> Result<TableProfile> {
+        ctx.check()?;
         // Profile the *filtered* view over a bounded working set (Iceberg prunes files first).
-        let (schema, batches, scanned) = self.read_working_set(source, filters, scan_limit)?;
+        let (schema, batches, scanned) = self.read_working_set(ctx, source, filters, scan_limit)?;
+        let (schema, batches) = flatten_rows(schema, batches, source.flatten)?;
         let scanned_rows = scanned as u64;
         let (fschema, fbatches) = filter_batches(&schema, &batches, filters)?;
         let columns = profile_columns(&fschema, &fbatches);
@@ -1287,16 +1244,148 @@ impl Engine for LocalReaderEngine {
     }
 }
 
+/// The credential seam, from the engine's side.
+///
+/// Every assertion here is offline and credential-free. `objstore` refuses a provider whose family
+/// does not match the URI's scheme *before* it builds a store — a deliberate choice, because
+/// silently dropping the mismatched provider would resolve the read against ambient credentials
+/// and succeed as the wrong principal. That refusal is what makes "which identity did this read
+/// actually use?" observable with no network and no AWS account: an `s3://` read that comes back
+/// mentioning GCS can only have gone through options carrying a GCS provider.
 #[cfg(all(test, feature = "object-store"))]
-mod objstore_csv_tests {
-    use super::LocalReaderEngine;
+mod identity_tests {
+    use super::*;
+    use crate::objstore::{StoreCredentials, StoreOptions};
 
+    fn gcs_creds() -> StoreCredentials {
+        let provider: object_store::gcp::GcpCredentialProvider = std::sync::Arc::new(
+            object_store::StaticCredentialProvider::new(object_store::gcp::GcpCredential {
+                bearer: "not-a-real-token".to_string(),
+            }),
+        );
+        StoreCredentials::Gcs(provider)
+    }
+
+    /// Options that are unmistakable in an error and usable nowhere: a GCS provider aimed at an
+    /// `s3://` URI.
+    fn tagged_identity() -> StoreOptions {
+        StoreOptions::empty()
+            .with_scope("tenant-a")
+            .with_credentials(gcs_creds())
+    }
+
+    fn s3(format: Format) -> Source {
+        let name = match format {
+            Format::Parquet => "t.parquet",
+            Format::Csv => "t.csv",
+            Format::Json => "t.json",
+            _ => unreachable!("only the three remote-readable formats are exercised here"),
+        };
+        Source::with_format(format!("s3://bucket/{name}"), format)
+    }
+
+    /// The bypass this change closed, asserted at every call site that had it.
+    ///
+    /// `LocalReaderEngine` held store options but handed them only to the Iceberg mirror; plain
+    /// remote Parquet, CSV and JSON went through the environment-reading wrappers, so an engine
+    /// built for one identity read them as whatever principal the process carried. Nothing live
+    /// reached it — the only caller that set non-ambient options routed Iceberg — which is what
+    /// made it a trap rather than an incident, and what would have made it silent when a caller
+    /// finally arrived.
+    ///
+    /// Each assertion below fails if its call site goes back to the bare wrapper: the engine's own
+    /// default here is the environment, so ignoring the context would attempt a real S3 request
+    /// instead of refusing with a family mismatch.
     #[test]
-    fn infer_csv_bytes_honors_tab_delimiter() {
-        let e = LocalReaderEngine::default();
-        let tsv = b"a\tb\tc\n1\t2\t3\n";
-        // Tab delimiter → three columns; the same bytes as comma collapse to one.
-        assert_eq!(e.infer_csv_bytes(tsv, 10, b'\t').unwrap().fields().len(), 3);
-        assert_eq!(e.infer_csv_bytes(tsv, 10, b',').unwrap().fields().len(), 1);
+    fn a_calls_identity_reaches_every_plain_remote_read() {
+        let engine = LocalReaderEngine::default(); // default identity: the environment
+        let ctx = RequestContext::detached().with_store_options(tagged_identity());
+
+        for format in [Format::Parquet, Format::Csv, Format::Json] {
+            let source = s3(format);
+
+            // `remote_schema` — parquet_schema_with / fetch_all_with
+            let err = engine.schema(&ctx, &source).unwrap_err();
+            assert!(
+                err.to_string().contains("GCS"),
+                "schema({format:?}) did not read under the call's identity: {err}"
+            );
+
+            // `remote_window` — parquet_window_with / fetch_all_with
+            let err = engine
+                .preview(&ctx, &source, 10)
+                .err()
+                .expect("a preview under a mismatched identity must not succeed");
+            assert!(
+                err.to_string().contains("GCS"),
+                "preview({format:?}) did not read under the call's identity: {err}"
+            );
+        }
+    }
+
+    /// The precedence rule, stated once in `identity` and asserted here.
+    #[test]
+    fn the_calls_identity_wins_over_the_engines_default() {
+        let engine = LocalReaderEngine::default()
+            .with_store_options(StoreOptions::empty().with_scope("engine-default"));
+        assert_eq!(
+            engine
+                .identity(&RequestContext::detached(), "s3://b/t")
+                .unwrap()
+                .scope_id(),
+            "engine-default"
+        );
+
+        let ctx = RequestContext::detached()
+            .with_store_options(StoreOptions::empty().with_scope("tenant-a"));
+        assert_eq!(
+            engine.identity(&ctx, "s3://b/t").unwrap().scope_id(),
+            "tenant-a"
+        );
+    }
+
+    /// An engine built for many tenants refuses a remote read it has no identity for, rather than
+    /// performing it as the host. A dropped credential has to fail loudly — succeeding as the
+    /// plane is the single outcome the seam exists to prevent — so this is a `Forbidden` (403),
+    /// the same answer the plane's own credential gate gives when it cannot vend.
+    #[test]
+    fn without_an_ambient_identity_an_unattributed_remote_read_is_refused() {
+        let engine = LocalReaderEngine::default().without_ambient_identity();
+        let source = s3(Format::Parquet);
+
+        let err = engine
+            .schema(&RequestContext::detached(), &source)
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Forbidden(_)),
+            "expected a refusal, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("s3://bucket/t.parquet"),
+            "the refusal should name the read it refused: {err}"
+        );
+
+        // The same engine and the same URI, once the call brings an identity: now it gets as far
+        // as resolving the store, which is how we know the refusal was about the identity and not
+        // about the engine being unable to read s3:// at all.
+        let ctx = RequestContext::detached().with_store_options(tagged_identity());
+        let err = engine.schema(&ctx, &source).unwrap_err();
+        assert!(err.to_string().contains("GCS"), "{err}");
+    }
+
+    /// A local path needs no identity, so an engine with no ambient default still reads one.
+    /// Otherwise a plane configured with `--compute-local-root` and no credential vendor would
+    /// refuse work that never touches an object store.
+    #[test]
+    fn a_local_read_needs_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.csv");
+        std::fs::write(&path, b"a,b\n1,2\n").unwrap();
+        let source = Source::with_format(path, Format::Csv);
+        let engine = LocalReaderEngine::default().without_ambient_identity();
+        let schema = engine
+            .schema(&RequestContext::detached(), &source)
+            .expect("a local read must not need a credential identity");
+        assert_eq!(schema.columns.len(), 2);
     }
 }

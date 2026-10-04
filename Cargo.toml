@@ -9,7 +9,7 @@ panic = "unwind"
 
 [package]
 name = "lakeleto"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Lakeleto — instant local lakehouse-table explorer (\"the Postman of lakehouse tables\"): reads Parquet + CSV (and Iceberg tables with --features iceberg), all behind one pluggable Engine trait; a DuckDB backend and a hosted Lakeleto Cloud are on the roadmap. MVP: schema / head / profile / grid."
@@ -72,7 +72,12 @@ pkg-fmt = "zip"
 clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` keeps a JSON object's keys in the order they appear, which is what gives a
+# JSON source its columns in file order rather than alphabetical order. It swaps
+# `serde_json::Map` to `indexmap`, already in the tree via `arrow-json`, so it adds no crate.
+# `raw_value` lets the JSON reader locate a document's records member as a byte range instead of
+# parsing the document into values; it is a feature of the crate, not another one.
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 bytes = "1"                                          # in-memory Parquet windows (workspace result sync); already in-tree via arrow/parquet
 unicode-width = "0.2"                                # terminal display width for aligned tables (CJK/emoji)
 
@@ -100,6 +105,7 @@ parquet = { version = "58", default-features = false, features = ["arrow", "snap
 
 # --- optional engine backends + server (all OFF by default; heavy compiles stay opt-in) --
 datafusion = { version = "54", optional = true }     # `sql` — full SQL engine over the same trait
+async-trait = { version = "0.1", optional = true }   # `sql` — DataFusion's async `TableProvider`
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"], optional = true }  # `remote` — Lakeleto Cloud seam
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }  # `sql`/`serve` — async runtime
 axum = { version = "0.8", optional = true }          # `serve` — the HTTP/JSON backend the SPA + Lakeleto Cloud speak
@@ -128,12 +134,32 @@ winit = { version = "0.30", optional = true }
 
 [features]
 default = []
-sql = ["dep:datafusion", "dep:tokio"]
+# `tokio/time` + `tokio/macros` are for the cancellation watchdog in `engine::sql::guarded`
+# (a `select!` between the query and a poll timer). Both are pure-Rust, dependency-free
+# tokio features — no new crate enters the tree, and the default build still has no tokio.
+# `dep:futures` is for `StreamExt::next` on DataFusion's `SendableRecordBatchStream` — the
+# streaming query path (`Engine::query_stream`) pulls one batch at a time instead of collecting.
+# `futures` is already in the tree via datafusion itself, so this adds no crate to the build; it
+# only makes it nameable here. (It was previously reachable only through `object-store`, which is
+# why a `--features sql` build could not see it.)
+# `dep:async-trait` implements DataFusion's `TableProvider` for a CSV table whose rows carry their
+# place in the file (`engine::sql::positioned`). DataFusion already builds it, so no crate is added.
+sql = [
+  "dep:datafusion",
+  "dep:tokio",
+  "dep:futures",
+  "dep:async-trait",
+  "tokio/time",
+  "tokio/macros",
+]
 remote = ["dep:reqwest"]
 # `serve` exposes the Engine trait as an HTTP/JSON API (`lakeleto serve`) + the embedded SPA shell
 # (`lakeleto open`) — the same contract the localhost UI and the RemoteEngine/Lakeleto-Cloud client
 # both speak. Add `sql` too (`--features serve,sql`) for a working `POST /v1/query`.
-serve = ["dep:axum", "dep:rust-embed", "dep:serde_urlencoded", "dep:tokio", "tokio/net", "tokio/macros", "tokio/signal"]
+# `tokio/sync` + `dep:futures` are for the streaming query response: the Arrow IPC body is written
+# on a blocking thread and handed to axum through an mpsc channel adapted into a `Stream`. Neither
+# adds a crate — `futures` is already in the tree via datafusion/object_store.
+serve = ["dep:axum", "dep:rust-embed", "dep:serde_urlencoded", "dep:tokio", "dep:futures", "tokio/net", "tokio/macros", "tokio/signal", "tokio/sync"]
 # self-contained Iceberg reader (metadata + Avro manifests → Parquet data files, incl. positional
 # merge-on-read deletes). snappy/zstandard let it read compressed manifests (snap/zstd are already
 # in the tree via parquet, so no new heavy deps); deflate is built into apache-avro.

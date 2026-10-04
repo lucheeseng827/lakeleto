@@ -47,6 +47,8 @@ use std::collections::HashMap;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+use std::time::Instant;
 
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
@@ -67,6 +69,7 @@ use super::{
     build_table_schema, profile_columns, truncate_batches, Capabilities, Engine, FilterOp,
     FilterSpec, NamedSource, RowBatch, ScanResult, ScanSpec, TableProfile, TableSchema,
 };
+use crate::context::{DbCredentials, RequestContext};
 use crate::error::{EngineError, Result};
 use crate::source::Source;
 
@@ -104,6 +107,59 @@ fn pools() -> &'static Mutex<HashMap<String, SqlitePool>> {
     POOLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How many authenticated pools each credential-bearing cache keeps.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+const MAX_CACHED_POOLS: usize = 8;
+
+/// Fetch `key`'s pool from `cache`, building it on a miss and evicting the least-recently-used
+/// entry first when the cache is full.
+///
+/// **Why the key is the whole URL, credential included.** A pooled connection stays authenticated
+/// with the credentials it was opened with, so keying on anything less — the host, the username —
+/// would hand a caller a pool authenticated as somebody else, or one still holding a secret that
+/// has since rotated. Correct keying is not negotiable here.
+///
+/// **Why that then needs a bound.** Correct keying makes the key space as large as the credential
+/// space, and since credentials now arrive per request through [`RequestContext`], rotating them
+/// would otherwise retain a fresh pool — up to four live connections — for every value ever seen.
+/// Before credentials moved into the context the URL came only from the source, so the key space
+/// was bounded by the number of distinct sources and an unbounded map was harmless; it is the move
+/// to per-request credentials that made this a leak.
+///
+/// Eviction closes the pool it drops, so the connections are handed back rather than left for the
+/// server's idle timeout to reap.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+fn cached_pool<DB, F>(
+    cache: &mut HashMap<String, (sqlx::Pool<DB>, Instant)>,
+    key: &str,
+    build: F,
+) -> Result<sqlx::Pool<DB>>
+where
+    DB: sqlx::Database,
+    F: FnOnce() -> Result<sqlx::Pool<DB>>,
+{
+    if let Some((pool, last_used)) = cache.get_mut(key) {
+        *last_used = Instant::now();
+        return Ok(pool.clone());
+    }
+    // Build before evicting: a failed connection attempt should not cost a live pool.
+    let pool = build()?;
+    while cache.len() >= MAX_CACHED_POOLS {
+        let Some(victim) = cache
+            .iter()
+            .min_by_key(|(_, (_, last_used))| *last_used)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        if let Some((evicted, _)) = cache.remove(&victim) {
+            runtime().block_on(evicted.close());
+        }
+    }
+    cache.insert(key.to_string(), (pool.clone(), Instant::now()));
+    Ok(pool)
+}
+
 /// Open (or reuse) a **read-only** SQLite pool for `conn_url`.
 ///
 /// The pool is opened with `read_only(true)` so even a query that slips past [`ensure_read_only`]
@@ -119,7 +175,10 @@ fn get_pool(conn_url: &str) -> Result<SqlitePool> {
     }
     let opts = SqliteConnectOptions::from_str(conn_url)
         .map_err(|e| {
-            EngineError::Query(format!("invalid sqlite connection url `{conn_url}`: {e}"))
+            EngineError::Query(format!(
+                "invalid sqlite connection url `{}`: {e}",
+                safe(conn_url)
+            ))
         })?
         .read_only(true)
         .immutable(false);
@@ -131,7 +190,10 @@ fn get_pool(conn_url: &str) -> Result<SqlitePool> {
                 .await
         })
         .map_err(|e| {
-            EngineError::Query(format!("could not open sqlite database `{conn_url}`: {e}"))
+            EngineError::Query(format!(
+                "could not open sqlite database `{}`: {e}",
+                safe(conn_url)
+            ))
         })?;
     guard.insert(conn_url.to_string(), pool.clone());
     Ok(pool)
@@ -219,8 +281,8 @@ const BEGIN_READ_ONLY: &str = "START TRANSACTION READ ONLY";
 /// depth on top of that, not the only line. `max_connections` is kept small: the engine is an
 /// interactive explorer, not a fan-out service.
 #[cfg(feature = "postgres")]
-fn pg_pools() -> &'static Mutex<HashMap<String, PgPool>> {
-    static POOLS: OnceLock<Mutex<HashMap<String, PgPool>>> = OnceLock::new();
+fn pg_pools() -> &'static Mutex<HashMap<String, (PgPool, Instant)>> {
+    static POOLS: OnceLock<Mutex<HashMap<String, (PgPool, Instant)>>> = OnceLock::new();
     POOLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -236,30 +298,32 @@ fn get_pg_pool(conn_url: &str) -> Result<PgPool> {
     let mut guard = pg_pools()
         .lock()
         .map_err(|e| EngineError::Other(format!("database pool cache poisoned: {e}")))?;
-    if let Some(pool) = guard.get(conn_url) {
-        return Ok(pool.clone());
-    }
-    let opts = PgConnectOptions::from_str(conn_url)
-        .map_err(|e| {
-            EngineError::Query(format!("invalid postgres connection url `{conn_url}`: {e}"))
-        })?
-        // Startup `options` are applied by the server before the first query runs, so every
-        // statement on every connection from this pool is read-only at the source.
-        .options([("default_transaction_read_only", "on")]);
-    let pool = runtime()
-        .block_on(async {
-            PgPoolOptions::new()
-                .max_connections(4)
-                .connect_with(opts)
-                .await
-        })
-        .map_err(|e| {
-            EngineError::Query(format!(
-                "could not open postgres database `{conn_url}`: {e}"
-            ))
-        })?;
-    guard.insert(conn_url.to_string(), pool.clone());
-    Ok(pool)
+    cached_pool(&mut guard, conn_url, || {
+        let opts = PgConnectOptions::from_str(conn_url)
+            .map_err(|e| {
+                EngineError::Query(format!(
+                    "invalid postgres connection url `{}`: {e}",
+                    safe(conn_url)
+                ))
+            })?
+            // Startup `options` are applied by the server before the first query runs, so every
+            // statement on every connection from this pool is read-only at the source.
+            .options([("default_transaction_read_only", "on")]);
+        let pool = runtime()
+            .block_on(async {
+                PgPoolOptions::new()
+                    .max_connections(4)
+                    .connect_with(opts)
+                    .await
+            })
+            .map_err(|e| {
+                EngineError::Query(format!(
+                    "could not open postgres database `{}`: {e}",
+                    safe(conn_url)
+                ))
+            })?;
+        Ok(pool)
+    })
 }
 
 /// Run a query on a Postgres `pool` and collect every row.
@@ -342,8 +406,8 @@ fn pg_fetch_capped(pool: &PgPool, sql: &str, params: &[Bound], cap: usize) -> Re
 /// MySQL, like Postgres, has no portable "read-only pool" option, so read-only is enforced on the
 /// query path by [`ensure_read_only`].
 #[cfg(feature = "mysql")]
-fn mysql_pools() -> &'static Mutex<HashMap<String, MySqlPool>> {
-    static POOLS: OnceLock<Mutex<HashMap<String, MySqlPool>>> = OnceLock::new();
+fn mysql_pools() -> &'static Mutex<HashMap<String, (MySqlPool, Instant)>> {
+    static POOLS: OnceLock<Mutex<HashMap<String, (MySqlPool, Instant)>>> = OnceLock::new();
     POOLS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -354,21 +418,22 @@ fn get_mysql_pool(conn_url: &str) -> Result<MySqlPool> {
     let mut guard = mysql_pools()
         .lock()
         .map_err(|e| EngineError::Other(format!("database pool cache poisoned: {e}")))?;
-    if let Some(pool) = guard.get(conn_url) {
-        return Ok(pool.clone());
-    }
-    let pool = runtime()
-        .block_on(async {
-            MySqlPoolOptions::new()
-                .max_connections(4)
-                .connect(conn_url)
-                .await
-        })
-        .map_err(|e| {
-            EngineError::Query(format!("could not open mysql database `{conn_url}`: {e}"))
-        })?;
-    guard.insert(conn_url.to_string(), pool.clone());
-    Ok(pool)
+    cached_pool(&mut guard, conn_url, || {
+        let pool = runtime()
+            .block_on(async {
+                MySqlPoolOptions::new()
+                    .max_connections(4)
+                    .connect(conn_url)
+                    .await
+            })
+            .map_err(|e| {
+                EngineError::Query(format!(
+                    "could not open mysql database `{}`: {e}",
+                    safe(conn_url)
+                ))
+            })?;
+        Ok(pool)
+    })
 }
 
 /// Run a query on a MySQL `pool` and collect every row.
@@ -484,14 +549,121 @@ struct DbUri {
 ///
 /// Examples: `sqlite:///C:/data/app.db?table=orders`, `postgres://u:p@host/db?table=orders`,
 /// `mysql://u:p@host/db` (no table → whole-db).
+/// A connection URL with its password replaced by `***`, for anything a person will read.
+///
+/// Every `format!` in this module that names a URL goes through this. A database URL *is* the
+/// credential — see [`DbCredentials`] — so an error message quoting one verbatim publishes a
+/// password into an API response body, a log line, or a saved run record. Nothing here needs the
+/// secret to be useful: the host, the database and the account are what identify the failure.
+fn safe(conn_url: &str) -> std::borrow::Cow<'_, str> {
+    // Every string reaching this module is a connection URI or an attempt at one, which is what
+    // lets it redact the schemeless slip that `redact_uri_password` deliberately will not: a
+    // mistyped `alice:hunter2@db/orders` with the `://` forgotten still reaches the "that is not a
+    // database URI" message, still carrying a password. The general function cannot tell that shape
+    // from an opaque catalog ref (`table:sales.orders@v3`) and must not mangle one; here there is no
+    // such thing to confuse it with.
+    if !conn_url.contains("://") {
+        if let Some(at) = conn_url.find('@') {
+            if let Some(colon) = conn_url[..at].find(':') {
+                return std::borrow::Cow::Owned(format!(
+                    "{}:***{}",
+                    &conn_url[..colon],
+                    &conn_url[at..]
+                ));
+            }
+        }
+    }
+    crate::source::redact_uri_password(conn_url)
+}
+
+/// Percent-encode one userinfo component (RFC 3986 `userinfo`, minus `:` which separates the two
+/// halves). Hand-rolled because the `url` crate rides on the optional `object-store` feature and a
+/// `--features sqlite` build must not have to pull it in to connect safely.
+fn encode_userinfo(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Replace a connection URL's userinfo with `creds`, inserting it when the URL has none.
+///
+/// Override, not merge: a URL's own `user:pass` is discarded wholesale rather than having only the
+/// half `creds` names replaced. Mixing a vended username with a URL's password would connect as a
+/// principal neither the operator nor the caller named — the same rule, and the same reason, as
+/// [`RequestContext::with_store_options`](crate::RequestContext::with_store_options).
+fn with_userinfo(conn_url: &str, creds: &DbCredentials) -> String {
+    let Some(scheme_end) = conn_url.find("://") else {
+        return conn_url.to_string();
+    };
+    let rest_at = scheme_end + 3;
+    let rest = &conn_url[rest_at..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // Drop any existing userinfo, then splice the new one in front of the host.
+    let host_start = match rest[..authority_end].find('@') {
+        Some(at) => at + 1,
+        None => 0,
+    };
+    let mut out = String::with_capacity(conn_url.len() + 32);
+    out.push_str(&conn_url[..rest_at]);
+    if let Some(user) = creds.username() {
+        out.push_str(&encode_userinfo(user));
+        if let Some(pass) = creds.password() {
+            out.push(':');
+            out.push_str(&encode_userinfo(pass));
+        }
+        out.push('@');
+    }
+    out.push_str(&rest[host_start..]);
+    out
+}
+
+/// Parse a database URI and resolve the identity it will connect as.
+///
+/// Resolution mirrors the object-store seam exactly: **the call's credentials, else the URI's own
+/// userinfo.** There is no third fallback and deliberately no ambient one — a database engine has
+/// no environment-default account to reach for, so "neither" means the URI connects as whatever it
+/// says, which for SQLite is a file path and no account at all.
+///
+/// SQLite is skipped: `sqlite:///var/data/app.db` has no authority to put userinfo in, and
+/// splicing one would corrupt the path. A plane that vends one identity per tenant and runs a
+/// tenant's local SQLite file should not have to special-case that at the call site, so it is
+/// handled here — the same shape as a local filesystem path needing no object-store credential.
+fn parse_db_uri_as(raw: &str, creds: Option<&DbCredentials>) -> Result<DbUri> {
+    let mut uri = parse_db_uri(raw)?;
+    // A `match` rather than `matches!`, which does not accept `#[cfg]` on a pattern. Exhaustive
+    // over exactly the dialects this build compiled in.
+    let has_authority = match uri.dialect {
+        #[cfg(feature = "sqlite")]
+        Dialect::Sqlite => false,
+        #[cfg(feature = "postgres")]
+        Dialect::Postgres => true,
+        #[cfg(feature = "mysql")]
+        Dialect::MySql => true,
+    };
+    if let Some(creds) = creds.filter(|c| !c.is_empty()) {
+        if has_authority {
+            uri.conn_url = with_userinfo(&uri.conn_url, creds);
+        }
+    }
+    Ok(uri)
+}
+
 fn parse_db_uri(raw: &str) -> Result<DbUri> {
     let scheme = raw
         .split_once("://")
         .map(|(s, _)| s.to_ascii_lowercase())
         .ok_or_else(|| {
             EngineError::Query(format!(
-                "`{raw}` is not a database connection URI (expected e.g. \
-                 `sqlite:///path/to.db?table=orders`)"
+                "`{}` is not a database connection URI (expected e.g. \
+                 `sqlite:///path/to.db?table=orders`)",
+                safe(raw)
             ))
         })?;
 
@@ -557,15 +729,16 @@ fn dialect_not_built(scheme: &str, feature: &str) -> EngineError {
 
 /// The URI string backing a [`Source`] (a DB source stores its connection URI in `path`).
 fn source_uri(source: &Source) -> String {
-    source.path.to_string_lossy().to_string()
+    source.uri()
 }
 
 /// Require that `uri` names a concrete table (schema/preview/scan/profile all read one table).
 fn require_table(uri: &DbUri, raw: &str) -> Result<String> {
     uri.table.clone().ok_or_else(|| {
+        let safe_raw = safe(raw);
         EngineError::Query(format!(
-            "the database URI `{raw}` names a whole database, not a table — append \
-             `?table=<name>` (e.g. `{raw}?table=orders`); the /v1/list endpoint enumerates \
+            "the database URI `{safe_raw}` names a whole database, not a table — append \
+             `?table=<name>` (e.g. `{safe_raw}?table=orders`); the /v1/list endpoint enumerates \
              available tables"
         ))
     })
@@ -661,8 +834,11 @@ fn count_scalar(uri: &DbUri, sql: &str, params: &[Bound]) -> Result<usize> {
 /// Takes the **raw source path string** (a database URI, with or without a `?table=`); the api.rs
 /// `/v1/list` handler calls this to enumerate tables for a whole-database source. Returns the table
 /// names in alphabetical order.
-pub fn list_tables(url_path: &str) -> Result<Vec<String>> {
-    let uri = parse_db_uri(url_path)?;
+///
+/// Takes a context for the same reason the `Engine` methods do: enumerating a database's tables is
+/// a read, and it happens as somebody.
+pub fn list_tables(ctx: &RequestContext, url_path: &str) -> Result<Vec<String>> {
+    let uri = parse_db_uri_as(url_path, ctx.database_credentials())?;
     match uri.dialect {
         #[cfg(feature = "sqlite")]
         Dialect::Sqlite => {
@@ -755,20 +931,39 @@ impl Engine for DatabaseEngine {
             sql: true,
             profile: true,
             remote: false,
+            // `scan` is overridden below and pushes the filters, sort, projection and
+            // LIMIT/OFFSET into the server's own SQL. `stats` is not overridden, so it takes
+            // the default that drops the filters and profiles an unfiltered prefix instead.
+            scan: true,
+            filtered_stats: false,
         }
     }
 
-    fn schema(&self, source: &Source) -> Result<TableSchema> {
+    fn schema(&self, ctx: &RequestContext, source: &Source) -> Result<TableSchema> {
+        // Pre-flight only. sqlx's `fetch_all` is one opaque await inside the shared
+        // runtime's `block_on`, so a context that fires mid-query is not observed until it
+        // returns — unlike the local reader, which checks per file and per batch. Bounding
+        // the statement itself needs either the watchdog the SQL engine uses or a
+        // per-dialect server-side statement timeout; both are follow-ups, and claiming
+        // cancellation here without them would be claiming something that is not true.
+        ctx.check()?;
         let raw = source_uri(source);
-        let uri = parse_db_uri(&raw)?;
+        let uri = parse_db_uri_as(&raw, ctx.database_credentials())?;
         let table = require_table(&uri, &raw)?;
         let arrow_schema = schema_of(&uri, &table)?;
         Ok(build_table_schema(source, self.name(), None, &arrow_schema))
     }
 
-    fn preview(&self, source: &Source, limit: usize) -> Result<RowBatch> {
+    fn preview(&self, ctx: &RequestContext, source: &Source, limit: usize) -> Result<RowBatch> {
+        // Pre-flight only. sqlx's `fetch_all` is one opaque await inside the shared
+        // runtime's `block_on`, so a context that fires mid-query is not observed until it
+        // returns — unlike the local reader, which checks per file and per batch. Bounding
+        // the statement itself needs either the watchdog the SQL engine uses or a
+        // per-dialect server-side statement timeout; both are follow-ups, and claiming
+        // cancellation here without them would be claiming something that is not true.
+        ctx.check()?;
         let raw = source_uri(source);
-        let uri = parse_db_uri(&raw)?;
+        let uri = parse_db_uri_as(&raw, ctx.database_credentials())?;
         let table = require_table(&uri, &raw)?;
         let syntax = engine_syntax(uri.dialect);
         let sql = format!(
@@ -784,9 +979,21 @@ impl Engine for DatabaseEngine {
         Ok(rb)
     }
 
-    fn profile(&self, source: &Source, scan_limit: usize) -> Result<TableProfile> {
+    fn profile(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        scan_limit: usize,
+    ) -> Result<TableProfile> {
+        // Pre-flight only. sqlx's `fetch_all` is one opaque await inside the shared
+        // runtime's `block_on`, so a context that fires mid-query is not observed until it
+        // returns — unlike the local reader, which checks per file and per batch. Bounding
+        // the statement itself needs either the watchdog the SQL engine uses or a
+        // per-dialect server-side statement timeout; both are follow-ups, and claiming
+        // cancellation here without them would be claiming something that is not true.
+        ctx.check()?;
         let raw = source_uri(source);
-        let uri = parse_db_uri(&raw)?;
+        let uri = parse_db_uri_as(&raw, ctx.database_credentials())?;
         let table = require_table(&uri, &raw)?;
         let syntax = engine_syntax(uri.dialect);
         let sql = format!(
@@ -808,7 +1015,14 @@ impl Engine for DatabaseEngine {
     /// Run raw SQL against the database of the **first** table's source URI. The database engine
     /// ignores `tables` *registration* — the server already owns its tables, so the SQL references
     /// them by name directly; the sources only tell us which database to open.
-    fn query(&self, sql: &str, tables: &[NamedSource]) -> Result<RowBatch> {
+    fn query(&self, ctx: &RequestContext, sql: &str, tables: &[NamedSource]) -> Result<RowBatch> {
+        // Pre-flight only. sqlx's `fetch_all` is one opaque await inside the shared
+        // runtime's `block_on`, so a context that fires mid-query is not observed until it
+        // returns — unlike the local reader, which checks per file and per batch. Bounding
+        // the statement itself needs either the watchdog the SQL engine uses or a
+        // per-dialect server-side statement timeout; both are follow-ups, and claiming
+        // cancellation here without them would be claiming something that is not true.
+        ctx.check()?;
         // Lakeleto is an *explorer*: user SQL must never mutate. Reject anything that isn't a read.
         ensure_read_only(sql)?;
         let first = tables.first().ok_or_else(|| {
@@ -819,7 +1033,7 @@ impl Engine for DatabaseEngine {
             )
         })?;
         let raw = source_uri(&first.source);
-        let uri = parse_db_uri(&raw)?;
+        let uri = parse_db_uri_as(&raw, ctx.database_credentials())?;
         fetch_batch(&uri, sql, &[])
     }
 
@@ -829,7 +1043,20 @@ impl Engine for DatabaseEngine {
     /// implied: the database still *executes* the full query (bounding that would mean rewriting
     /// the user's SQL, which breaks on dialect corners), but neither this process's memory nor —
     /// past the driver's buffer — the connection carries more than `cap` rows.
-    fn query_capped(&self, sql: &str, tables: &[NamedSource], cap: usize) -> Result<RowBatch> {
+    fn query_capped(
+        &self,
+        ctx: &RequestContext,
+        sql: &str,
+        tables: &[NamedSource],
+        cap: usize,
+    ) -> Result<RowBatch> {
+        // Pre-flight only. sqlx's `fetch_all` is one opaque await inside the shared
+        // runtime's `block_on`, so a context that fires mid-query is not observed until it
+        // returns — unlike the local reader, which checks per file and per batch. Bounding
+        // the statement itself needs either the watchdog the SQL engine uses or a
+        // per-dialect server-side statement timeout; both are follow-ups, and claiming
+        // cancellation here without them would be claiming something that is not true.
+        ctx.check()?;
         ensure_read_only(sql)?;
         let first = tables.first().ok_or_else(|| {
             EngineError::Query(
@@ -839,7 +1066,7 @@ impl Engine for DatabaseEngine {
             )
         })?;
         let raw = source_uri(&first.source);
-        let uri = parse_db_uri(&raw)?;
+        let uri = parse_db_uri_as(&raw, ctx.database_credentials())?;
         let rb = match uri.dialect {
             #[cfg(feature = "sqlite")]
             Dialect::Sqlite => {
@@ -867,9 +1094,16 @@ impl Engine for DatabaseEngine {
     /// Grid scan with filter/sort/projection/window pushed into SQL, plus a `count(*)` for the
     /// exact match total. Unlike the local engine this is not bounded by a working set, so
     /// sort/filter over a large table is complete.
-    fn scan(&self, source: &Source, spec: &ScanSpec) -> Result<ScanResult> {
+    fn scan(&self, ctx: &RequestContext, source: &Source, spec: &ScanSpec) -> Result<ScanResult> {
+        // Pre-flight only. sqlx's `fetch_all` is one opaque await inside the shared
+        // runtime's `block_on`, so a context that fires mid-query is not observed until it
+        // returns — unlike the local reader, which checks per file and per batch. Bounding
+        // the statement itself needs either the watchdog the SQL engine uses or a
+        // per-dialect server-side statement timeout; both are follow-ups, and claiming
+        // cancellation here without them would be claiming something that is not true.
+        ctx.check()?;
         let raw = source_uri(source);
-        let uri = parse_db_uri(&raw)?;
+        let uri = parse_db_uri_as(&raw, ctx.database_credentials())?;
         let table = require_table(&uri, &raw)?;
         let syntax = engine_syntax(uri.dialect);
         let ident = quote_ident(syntax, &table);
@@ -2107,6 +2341,12 @@ mod tests {
     use crate::source::{Format, Source};
     use std::path::Path;
 
+    /// The context these tests read under: no deadline, no canceller, no vended identity — so a
+    /// SQLite fixture connects as the file it names, which is the whole of its access control.
+    fn ctx() -> RequestContext {
+        RequestContext::detached()
+    }
+
     /// Build the sqlx-friendly connection URL for a file path (forward slashes; `sqlite:///`).
     /// Windows: `C:\a\b.db` → `sqlite:///C:/a/b.db`. Unix: `/tmp/x.db` → `sqlite:///tmp/x.db`.
     fn conn_url(path: &Path) -> String {
@@ -2160,14 +2400,14 @@ mod tests {
     #[test]
     fn list_tables_returns_user_tables() {
         let (_dir, src) = fixture();
-        let tables = list_tables(&source_uri(&src)).expect("list tables");
+        let tables = list_tables(&ctx(), &source_uri(&src)).expect("list tables");
         assert_eq!(tables, vec!["t".to_string()]);
     }
 
     #[test]
     fn schema_has_four_columns() {
         let (_dir, src) = fixture();
-        let schema = DatabaseEngine::new().schema(&src).expect("schema");
+        let schema = DatabaseEngine::new().schema(&ctx(), &src).expect("schema");
         assert_eq!(schema.columns.len(), 4, "schema: {schema:?}");
         let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "name", "amt", "ok"]);
@@ -2178,14 +2418,14 @@ mod tests {
         let (_dir, src) = fixture();
         let eng = DatabaseEngine::new();
 
-        let rb = eng.preview(&src, 100).expect("preview");
+        let rb = eng.preview(&ctx(), &src, 100).expect("preview");
         assert_eq!(rb.num_rows(), 3);
 
         let spec = ScanSpec {
             limit: 100,
             ..ScanSpec::default()
         };
-        let res = eng.scan(&src, &spec).expect("scan");
+        let res = eng.scan(&ctx(), &src, &spec).expect("scan");
         assert_eq!(res.batch.num_rows(), 3);
         assert_eq!(res.matched_rows, 3);
         assert!(res.total_known);
@@ -2205,7 +2445,7 @@ mod tests {
             ..ScanSpec::default()
         };
         let res = DatabaseEngine::new()
-            .scan(&src, &spec)
+            .scan(&ctx(), &src, &spec)
             .expect("filtered scan");
         assert_eq!(res.matched_rows, 1);
         assert_eq!(res.batch.num_rows(), 1);
@@ -2228,7 +2468,9 @@ mod tests {
                 }],
                 ..ScanSpec::default()
             };
-            eng.scan(&src, &spec).expect("numeric scan").matched_rows
+            eng.scan(&ctx(), &src, &spec)
+                .expect("numeric scan")
+                .matched_rows
         };
         assert_eq!(
             scan(FilterOp::Gt, "10"),
@@ -2249,7 +2491,12 @@ mod tests {
             }],
             ..ScanSpec::default()
         };
-        assert_eq!(eng.scan(&src, &by_id).expect("id scan").matched_rows, 1);
+        assert_eq!(
+            eng.scan(&ctx(), &src, &by_id)
+                .expect("id scan")
+                .matched_rows,
+            1
+        );
 
         // A non-numeric value against a numeric column falls back to text compare — no error, no
         // match (matching the in-memory engine, which also drops to text here).
@@ -2263,7 +2510,9 @@ mod tests {
             ..ScanSpec::default()
         };
         assert_eq!(
-            eng.scan(&src, &nonnum).expect("nonnum scan").matched_rows,
+            eng.scan(&ctx(), &src, &nonnum)
+                .expect("nonnum scan")
+                .matched_rows,
             0
         );
     }
@@ -2303,7 +2552,7 @@ mod tests {
             ..ScanSpec::default()
         };
         let res = DatabaseEngine::new()
-            .scan(&src, &spec)
+            .scan(&ctx(), &src, &spec)
             .expect("big-int scan");
         assert_eq!(
             res.matched_rows, 1,
@@ -2316,6 +2565,7 @@ mod tests {
         let (_dir, src) = fixture();
         let rb = DatabaseEngine::new()
             .query(
+                &ctx(),
                 "SELECT count(*) AS c FROM t",
                 &[NamedSource {
                     name: "t".into(),
@@ -2383,7 +2633,7 @@ mod tests {
             ..ScanSpec::default()
         };
         let res = eng
-            .scan(&src, &inject)
+            .scan(&ctx(), &src, &inject)
             .expect("scan with injection payload");
         assert_eq!(
             res.matched_rows, 0,
@@ -2403,7 +2653,7 @@ mod tests {
             ..ScanSpec::default()
         };
         let res = eng
-            .scan(&src, &backslash)
+            .scan(&ctx(), &src, &backslash)
             .expect("scan with backslash payload");
         assert_eq!(res.matched_rows, 0);
 
@@ -2417,7 +2667,7 @@ mod tests {
             }],
             ..ScanSpec::default()
         };
-        let res = eng.scan(&src, &exact).expect("scan exact");
+        let res = eng.scan(&ctx(), &src, &exact).expect("scan exact");
         assert_eq!(res.matched_rows, 1);
         assert_eq!(res.batch.num_rows(), 1);
     }
@@ -2430,5 +2680,196 @@ mod tests {
     fn postgres_uri_is_not_built() {
         let err = parse_db_uri("postgres://localhost/db?table=t").unwrap_err();
         assert!(matches!(err, EngineError::Query(_)), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// `with_userinfo` replaces, never merges — a vended username plus a URL's leftover password
+    /// would connect as a principal nobody named.
+    #[test]
+    fn vended_credentials_replace_the_urls_own_userinfo_wholesale() {
+        let creds = DbCredentials::new("alice", "hunter2");
+        assert_eq!(
+            with_userinfo("postgres://bob:oldpass@db:5432/orders", &creds),
+            "postgres://alice:hunter2@db:5432/orders"
+        );
+        // Inserted when the URL has none — the shape a catalog entry should have.
+        assert_eq!(
+            with_userinfo("postgres://db:5432/orders", &creds),
+            "postgres://alice:hunter2@db:5432/orders"
+        );
+        // A username with no password (peer/IAM auth).
+        assert_eq!(
+            with_userinfo("postgres://db/orders", &DbCredentials::user_only("alice")),
+            "postgres://alice@db/orders"
+        );
+        // The query string is not part of the authority and must survive untouched.
+        assert_eq!(
+            with_userinfo("postgres://bob@db/orders?sslmode=require", &creds),
+            "postgres://alice:hunter2@db/orders?sslmode=require"
+        );
+    }
+
+    /// A password with URI-significant characters has to survive being spliced in, or the engine
+    /// connects as something other than what was vended — or fails to parse the URL at all.
+    #[test]
+    fn credentials_are_percent_encoded_when_spliced_in() {
+        let creds = DbCredentials::new("user@corp", "p@ss:w/rd?#");
+        let out = with_userinfo("postgres://db/orders", &creds);
+        assert_eq!(
+            out, "postgres://user%40corp:p%40ss%3Aw%2Frd%3F%23@db/orders",
+            "an unencoded @ or / would re-split the authority and change the host"
+        );
+        // Still exactly one authority separator, which is the property that actually matters.
+        assert_eq!(out.matches('@').count(), 1);
+    }
+
+    /// The cross-tenant hazard in this module, and the reason the credential is resolved *into*
+    /// `conn_url` rather than applied at connect time.
+    ///
+    /// The connection pools are process-wide `static` maps keyed by connection URL. Had the vended
+    /// identity been applied after the key was taken, two tenants sharing a host and database —
+    /// the normal shape of a multi-tenant Postgres — would have collided on one key, and the
+    /// second would have been served the first's pooled connections. That is the same
+    /// "one engine, two tenants" failure that kept `engine_for` alive, in a cache instead.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn two_identities_against_one_database_do_not_share_a_pool_key() {
+        let raw = "postgres://db.internal/orders?table=events";
+        let a = parse_db_uri_as(raw, Some(&DbCredentials::new("tenant_a", "secret_a"))).unwrap();
+        let b = parse_db_uri_as(raw, Some(&DbCredentials::new("tenant_b", "secret_b"))).unwrap();
+        assert_ne!(
+            a.conn_url, b.conn_url,
+            "the pool cache is keyed on conn_url, so equal keys here means tenant B reusing \
+             tenant A's authenticated connections"
+        );
+        assert_eq!(a.table.as_deref(), Some("events"));
+        assert_eq!(b.table.as_deref(), Some("events"));
+    }
+
+    /// No call credentials: the URI connects as whatever it says. The CLI's case, and the only one
+    /// that worked before the context carried an identity.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn without_call_credentials_the_uri_keeps_its_own() {
+        let raw = "postgres://alice:hunter2@db/orders?table=t";
+        let plain = parse_db_uri(raw).unwrap();
+        assert_eq!(parse_db_uri_as(raw, None).unwrap().conn_url, plain.conn_url);
+        // An empty credential set is "the caller said nothing", not "connect anonymously".
+        assert_eq!(
+            parse_db_uri_as(raw, Some(&DbCredentials::default()))
+                .unwrap()
+                .conn_url,
+            plain.conn_url
+        );
+    }
+
+    /// SQLite has no authority to put userinfo in, so a plane vending one identity per tenant can
+    /// still run a tenant's local SQLite file without special-casing it at the call site.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_ignores_vended_credentials_rather_than_corrupting_its_path() {
+        let raw = "sqlite:///var/data/app.db?table=t";
+        let uri = parse_db_uri_as(raw, Some(&DbCredentials::new("alice", "hunter2"))).unwrap();
+        assert_eq!(uri.conn_url, "sqlite:///var/data/app.db");
+        assert!(!uri.conn_url.contains("alice"));
+    }
+
+    /// Every message in this module that names a URL goes through `safe`. A database URL *is* the
+    /// credential, so one that quotes it verbatim publishes a password into a response body.
+    #[test]
+    fn error_messages_never_quote_a_password() {
+        let leaky = "postgres://alice:hunter2@db/orders";
+        // `require_table` is the message a whole-database URI produces, and it echoes the URI twice.
+        let uri = DbUri {
+            conn_url: leaky.to_string(),
+            table: None,
+            dialect: any_dialect(),
+        };
+        let err = require_table(&uri, leaky).unwrap_err().to_string();
+        assert!(!err.contains("hunter2"), "leaked: {err}");
+        assert!(err.contains("alice:***@db/orders"), "unhelpful: {err}");
+
+        // And the "not a database URI" message, whose input is the raw path.
+        let err = parse_db_uri("alice:hunter2@db/orders")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("hunter2"), "leaked: {err}");
+    }
+
+    /// Whichever driver this build compiled in — the assertion above is about message hygiene, not
+    /// about a dialect.
+    fn any_dialect() -> Dialect {
+        #[cfg(feature = "sqlite")]
+        return Dialect::Sqlite;
+        #[cfg(all(not(feature = "sqlite"), feature = "postgres"))]
+        return Dialect::Postgres;
+        #[cfg(all(not(feature = "sqlite"), not(feature = "postgres")))]
+        return Dialect::MySql;
+    }
+}
+
+#[cfg(all(test, feature = "postgres"))]
+mod pool_cache_tests {
+    use super::*;
+
+    /// A lazily-created pool: `connect_lazy` parses the URL and opens nothing, so the bound can be
+    /// tested without a live server — which is the whole reason this test can exist at all.
+    ///
+    /// It still needs a Tokio context, because the pool spawns its maintenance task on
+    /// construction. `runtime()` is the same leaked static every other call in this module uses,
+    /// so entering it here keeps the test on the production runtime rather than a private one.
+    fn lazy(url: &str) -> PgPool {
+        let _guard = runtime().enter();
+        PgPoolOptions::new()
+            .connect_lazy(url)
+            .expect("a syntactically valid url must build a lazy pool")
+    }
+
+    /// The cache must not grow with the credential space.
+    ///
+    /// This is the regression that moving credentials into `RequestContext` introduced: the key is
+    /// the whole connection URL, so a rotating secret mints a new key every time. Twenty distinct
+    /// credentials must leave eight pools, not twenty.
+    #[test]
+    fn rotating_credentials_cannot_grow_the_pool_cache_without_bound() {
+        let mut cache: HashMap<String, (PgPool, Instant)> = HashMap::new();
+        for i in 0..20 {
+            let url = format!("postgres://app:secret{i}@127.0.0.1:1/sales");
+            cached_pool(&mut cache, &url, || Ok(lazy(&url))).expect("build must succeed");
+        }
+        assert_eq!(
+            cache.len(),
+            MAX_CACHED_POOLS,
+            "twenty rotating credentials must not retain twenty authenticated pools"
+        );
+    }
+
+    /// Eviction has to drop the *least recently used* entry, not an arbitrary one: the pool a
+    /// caller keeps asking for is the one worth keeping.
+    #[test]
+    fn the_survivor_is_the_one_still_being_used() {
+        let mut cache: HashMap<String, (PgPool, Instant)> = HashMap::new();
+        let kept = "postgres://app:kept@127.0.0.1:1/sales".to_string();
+        cached_pool(&mut cache, &kept, || Ok(lazy(&kept))).unwrap();
+
+        for i in 0..MAX_CACHED_POOLS * 2 {
+            // Touch the original between every insert, so it is never the coldest entry.
+            cached_pool(&mut cache, &kept, || {
+                panic!("must hit the cache, not rebuild")
+            })
+            .unwrap();
+            let url = format!("postgres://app:rotating{i}@127.0.0.1:1/sales");
+            cached_pool(&mut cache, &url, || Ok(lazy(&url))).unwrap();
+        }
+
+        assert!(
+            cache.contains_key(&kept),
+            "the continuously used pool must survive eviction"
+        );
+        assert_eq!(cache.len(), MAX_CACHED_POOLS);
     }
 }

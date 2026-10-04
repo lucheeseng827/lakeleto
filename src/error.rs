@@ -9,6 +9,30 @@ use thiserror::Error;
 
 use crate::source::Format;
 
+/// Why a call stopped early. Carried by [`EngineError::Cancelled`].
+///
+/// The two are kept apart because they need different answers. A deadline means *this budget*
+/// was too small — retrying with a bigger one is reasonable. An explicit cancellation means
+/// somebody decided the answer was no longer wanted, and retrying it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// The context's deadline passed.
+    Deadline,
+    /// A holder of the context's `CancelToken` asked the work to stop.
+    Requested,
+}
+
+impl std::fmt::Display for CancelReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CancelReason::Deadline => {
+                f.write_str("cancelled: the deadline for this request passed")
+            }
+            CancelReason::Requested => f.write_str("cancelled: the request was cancelled"),
+        }
+    }
+}
+
 /// Everything an engine can go wrong with.
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -47,6 +71,15 @@ pub enum EngineError {
     /// A response (e.g. a `/v1/export` body) exceeded its size cap.
     #[error("too large: {0}")]
     TooLarge(String),
+
+    /// The call stopped before finishing because its [`RequestContext`](crate::RequestContext)
+    /// said to — a deadline passed, or someone asked.
+    ///
+    /// Distinct from every other variant because nothing went *wrong*: the work was correct and
+    /// incomplete. A caller that retries an `Io` error should not retry this one without first
+    /// changing the budget, and a caller counting failures should not count it as one.
+    #[error("{0}")]
+    Cancelled(CancelReason),
 
     #[error("{0}")]
     Other(String),

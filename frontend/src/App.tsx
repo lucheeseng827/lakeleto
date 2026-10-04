@@ -5,7 +5,7 @@
 // export/import. Open tabs + grid state persist through the store, so a reload restores the
 // workbench. Falls back to an offline localStorage store + sample tables when no server answers.
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { connectLakeleto, isDatabaseUri, type Backend, type Conn, type Row, type RunRecord, type Workspace, type WorkspaceBundle, type WsConnection, type WsMeta, type WsSavedQuery } from "./api";
+import { connectLakeleto, isDatabaseUri, isJsonSource, type Backend, type Conn, type Row, type RunRecord, type Workspace, type WorkspaceBundle, type WsConnection, type WsMeta, type WsSavedQuery } from "./api";
 import { Banner, Button, Chip } from "./components";
 import { TableView } from "./TableView";
 import { buildDoc, docToTabs, HistoryPanel, newDataTab, newLauncherTab, newTabId, resolveVars, ResultView, Sidebar, TabStrip, WorkspaceBar, basename, type OpenTab } from "./workspace";
@@ -108,10 +108,14 @@ export function App() {
   // tables instead of opening it as a table (which would error). Guarded HERE so every caller
   // (sidebar click, workspace auto-open, a persisted tab, the launcher) is covered.
   const isWholeDbUri = (p: string) => /^(sqlite|postgres|postgresql|mysql):\/\//i.test(p) && !/[?&]table=/.test(p);
-  const openPath = (path: string, opts: { connId?: string | null; title?: string } = {}) => {
+  const openPath = (path: string, opts: { connId?: string | null; title?: string; flatten?: boolean; jsonPath?: string | null } = {}) => {
     setErr(null);
     if (isWholeDbUri(path)) { openDir(path); return; }
-    const existing = tabs.find((t) => t.kind === "data" && t.path === path);
+    // A caller that asks for a way of reading (a reopened run) gets a tab that reads that way. Left
+    // out, either matches any tab; `jsonPath: null` asks for records detected, not given.
+    const existing = tabs.find((t) => t.kind === "data" && t.path === path
+      && (opts.flatten === undefined || !!t.flatten === opts.flatten)
+      && (opts.jsonPath === undefined || (t.jsonPath ?? null) === opts.jsonPath));
     if (existing) { setActiveId(existing.id); if (opts.connId) patchTab(existing.id, { connId: opts.connId }); }
     else addTab(newDataTab(path, opts));
     loadListingFor(path);
@@ -206,7 +210,7 @@ export function App() {
     if (!backend || !wsId || !t) return;
     patchTab(tabId, { sqlBusy: true, sqlErr: null });
     try {
-      const resp = await backend.wsRun(wsId, { sql: resolve(sql), path: resolve(t.path), preview: 200, cache: cacheResults });
+      const resp = await backend.wsRun(wsId, { sql: resolve(sql), path: resolve(t.path), preview: 200, cache: cacheResults, flatten: t.flatten ? "all" : null, json_path: t.jsonPath ?? null });
       patchTab(tabId, { sqlOut: resp, sqlErr: null, sqlBusy: false });
     } catch (e) { patchTab(tabId, { sqlErr: (e as Error).message, sqlOut: null, sqlBusy: false }); }
     loadHistory(wsId);
@@ -214,7 +218,11 @@ export function App() {
 
   const openRunResultTab = (r: RunRecord) => {
     if (!backend || !wsId) return;
-    if (!r.cached) { if (r.sql) addTab(newDataTab(r.source_path, { sub: "SQL", sql: r.sql, title: basename(r.source_path) })); else openPath(r.source_path); return; }
+    // Reopened as it ran — a query over flattened columns cannot find them unflattened, nor one
+    // over a records path its rows under detection (`""`, the whole document, is a path too).
+    const flatten = !!r.flatten;
+    const jsonPath = r.json_path ?? null;
+    if (!r.cached) { if (r.sql) addTab(newDataTab(r.source_path, { sub: "SQL", sql: r.sql, title: basename(r.source_path), flatten, jsonPath })); else openPath(r.source_path, { flatten, jsonPath }); return; }
     const t: OpenTab = { id: newTabId(), kind: "result", title: "result · " + basename(r.source_path), path: r.source_path, sub: "Grid", sort: null, filters: {}, sql: "", connId: null, runId: r.id, run: r, result: null };
     addTab(t);
     backend.wsRunResult(wsId, r.id, 0, 500).then((res) => patchTab(t.id, { result: res })).catch((e) => patchTab(t.id, { resultErr: (e as Error).message }));
@@ -235,22 +243,26 @@ export function App() {
   };
 
   // ---- runner (run across connections / run a folder) ----
-  const execRun = async (sql: string, path: string) => {
+  const execRun = async (sql: string, path: string, flatten?: boolean, jsonPath?: string | null) => {
     if (!backend || !wsId) throw new Error("no workspace");
-    const resp = await backend.wsRun(wsId, { sql: resolve(sql), path: resolve(path), preview: 200, cache: cacheResults });
+    const resp = await backend.wsRun(wsId, { sql: resolve(sql), path: resolve(path), preview: 200, cache: cacheResults, flatten: flatten ? "all" : null, json_path: jsonPath ?? null });
     loadHistory(wsId);
     return resp;
   };
   const runAcross = () => {
     if (!active || active.kind !== "data" || !ws) return;
     if (!ws.connections.length) { setErr("Add a connection first to run across sources."); return; }
-    setRunner({ open: true, title: "Run across connections", sharedSql: active.sql, jobs: ws.connections.map((c) => ({ id: c.id, label: c.label, path: c.path, sql: active.sql })) });
+    setRunner({ open: true, title: "Run across connections", sharedSql: active.sql, jobs: ws.connections.map((c) => ({
+      id: c.id, label: c.label, path: c.path, sql: active.sql, flatten: active.flatten,
+      // A records path means something to a JSON source only; another source reads as it is.
+      jsonPath: isJsonSource(resolve(c.path)) ? active.jsonPath : undefined,
+    })) });
   };
   const runFolder = (folder: string) => {
     if (!ws) return;
     const jobs: RunJob[] = ws.saved_queries.filter((q) => q.folder === folder).map((q) => {
       const c = q.connection_id ? ws.connections.find((x) => x.id === q.connection_id) : null;
-      return { id: q.id, label: q.name, path: c?.path || active?.path || ws.connections[0]?.path || "", sql: q.sql };
+      return { id: q.id, label: q.name, path: c?.path || active?.path || ws.connections[0]?.path || "", sql: q.sql, flatten: !!q.flatten, jsonPath: q.json_path ?? undefined };
     }).filter((j) => j.path);
     if (!jobs.length) { setErr("No runnable queries in this folder — bind them to a connection."); return; }
     setRunner({ open: true, title: `Run folder: ${folder}`, sharedSql: null, jobs });
@@ -282,7 +294,7 @@ export function App() {
     const c = q.connection_id && ws ? ws.connections.find((x) => x.id === q.connection_id) : null;
     const path = c?.path || active?.path || ws?.connections[0]?.path;
     if (!path) { setErr("This query has no source — open a source first."); return; }
-    addTab(newDataTab(path, { sub: "SQL", sql: q.sql, title: q.name, connId: c?.id ?? null }));
+    addTab(newDataTab(path, { sub: "SQL", sql: q.sql, title: q.name, connId: c?.id ?? null, flatten: !!q.flatten, jsonPath: q.json_path ?? undefined }));
   };
   const saveQuery = () => {
     if (!active || active.kind !== "data" || !ws) return;
@@ -291,7 +303,7 @@ export function App() {
     const s = raw.trim(); const slash = s.lastIndexOf("/");
     const folder = slash > 0 ? s.slice(0, slash).trim() : null;
     const name = slash > 0 ? s.slice(slash + 1).trim() || s : s;
-    const q: WsSavedQuery = { id: "q-" + newTabId(), name, sql: active.sql, connection_id: active.connId, folder };
+    const q: WsSavedQuery = { id: "q-" + newTabId(), name, sql: active.sql, connection_id: active.connId, folder, flatten: active.flatten ? "all" : null, json_path: active.jsonPath ?? null };
     setWs({ ...ws, saved_queries: [...ws.saved_queries, q] });
   };
 
@@ -437,7 +449,7 @@ export function App() {
               onBrowse={() => setPaletteOpen(true)} />
           ) : active.kind === "compare" ? <CompareView tab={active} />
             : active.kind === "result" ? <ResultView tab={active} onOpenRow={(row) => setDetailRow({ row, path: active.path || undefined })} />
-              : <TableView backend={conn.backend} conn={conn} tab={active} onPatch={(p) => patchTab(active.id, p)} onRunSql={(sql) => runSql(active.id, sql)} sqlAvailable={sqlAvailable} resolve={resolve} onOpenRow={(row) => setDetailRow({ row, path: active.path })} />
+              : <TableView key={active.id} backend={conn.backend} conn={conn} tab={active} onPatch={(p) => patchTab(active.id, p)} onRunSql={(sql) => runSql(active.id, sql)} sqlAvailable={sqlAvailable} resolve={resolve} onOpenRow={(row) => setDetailRow({ row, path: active.path })} />
         ) : (
           <main style={{ flex: "1 1 auto", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)", flexDirection: "column", gap: 10 }}>
             <div>No open tabs.</div>

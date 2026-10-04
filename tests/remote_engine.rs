@@ -24,6 +24,7 @@ use lakeleto::api::router;
 use lakeleto::engine::remote::RemoteEngine;
 use lakeleto::engine::Engine;
 use lakeleto::workspace::{LocalStore, WorkspaceStore};
+use lakeleto::RequestContext;
 use lakeleto::{LocalReaderEngine, NamedSource, Source};
 
 /// 2^53 + 1 — the smallest integer an IEEE-754 double cannot represent. Any client that routes
@@ -115,7 +116,9 @@ async fn preview_round_trips_arrow_types_over_http() {
     tokio::task::spawn_blocking(move || {
         let engine = RemoteEngine::new(format!("http://{addr}"), None);
         let source = Source::resolve(&path, None).unwrap();
-        let rb = engine.preview(&source, 10).unwrap();
+        let rb = engine
+            .preview(&RequestContext::detached(), &source, 10)
+            .unwrap();
 
         // The schema survives the wire whole — same fields, same types, same order. A JSON
         // round-trip would hand back five strings-and-numbers with types re-inferred.
@@ -157,7 +160,9 @@ async fn preview_preserves_an_integer_a_json_number_would_round() {
     tokio::task::spawn_blocking(move || {
         let engine = RemoteEngine::new(format!("http://{addr}"), None);
         let source = Source::resolve(&path, None).unwrap();
-        let rb = engine.preview(&source, 10).unwrap();
+        let rb = engine
+            .preview(&RequestContext::detached(), &source, 10)
+            .unwrap();
         let ids = rb.batches[0]
             .column(0)
             .as_any()
@@ -183,7 +188,9 @@ async fn a_zero_row_window_still_carries_its_columns() {
     tokio::task::spawn_blocking(move || {
         let engine = RemoteEngine::new(format!("http://{addr}"), None);
         let source = Source::resolve(&path, None).unwrap();
-        let rb = engine.preview(&source, 0).unwrap();
+        let rb = engine
+            .preview(&RequestContext::detached(), &source, 0)
+            .unwrap();
         assert_eq!(rb.num_rows(), 0);
         assert!(rb.is_empty());
         assert_eq!(rb.schema.fields().len(), 5);
@@ -214,7 +221,7 @@ async fn query_against_a_server_without_sql_reports_the_missing_feature() {
             name: "t".to_string(),
             source,
         }];
-        let msg = match engine.query("SELECT 1", &tables) {
+        let msg = match engine.query(&RequestContext::detached(), "SELECT 1", &tables) {
             // `RowBatch` is not `Debug` (it is raw Arrow), so unwrap the error by hand.
             Err(e) => e.to_string(),
             Ok(rb) => panic!(
@@ -252,7 +259,11 @@ async fn query_and_query_capped_return_typed_rows() {
         }];
 
         let rb = engine
-            .query("SELECT id, name FROM t ORDER BY id DESC", &tables)
+            .query(
+                &RequestContext::detached(),
+                "SELECT id, name FROM t ORDER BY id DESC",
+                &tables,
+            )
             .unwrap();
         assert_eq!(rb.num_rows(), 3);
         assert_eq!(rb.schema.fields().len(), 2);
@@ -265,11 +276,104 @@ async fn query_and_query_capped_return_typed_rows() {
 
         // The cap is pushed into the request, so the server plans with it.
         let capped = engine
-            .query_capped("SELECT id FROM t ORDER BY id DESC", &tables, 1)
+            .query_capped(
+                &RequestContext::detached(),
+                "SELECT id FROM t ORDER BY id DESC",
+                &tables,
+                1,
+            )
             .unwrap();
         assert_eq!(capped.num_rows(), 1);
         // ...and the column shape is unchanged by capping.
         assert_eq!(capped.schema.fields().len(), 1);
+    })
+    .await
+    .unwrap();
+}
+
+/// A source's read options travel with it — on the metadata and row calls as query parameters,
+/// and inside `POST /v1/query`'s table list — so the peer reads it as the caller asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flattened_source_is_read_flattened_by_the_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("people.ndjson");
+    std::fs::write(
+        &path,
+        "{\"id\":1,\"user\":{\"name\":\"Grace\"}}\n{\"id\":2,\"user\":{\"name\":\"Ada\"}}\n",
+    )
+    .unwrap();
+    let addr = serve(None).await;
+
+    tokio::task::spawn_blocking(move || {
+        let engine = RemoteEngine::new(format!("http://{addr}"), None);
+        let source = Source::resolve(&path, None)
+            .unwrap()
+            .with_flatten(Some(lakeleto::Flatten::All));
+        let ctx = RequestContext::detached();
+        let schema = engine.schema(&ctx, &source).unwrap();
+        let cols: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cols, ["id", "user.name"]);
+        let rb = engine.preview(&ctx, &source, 10).unwrap();
+        let names = rb.batches[0]
+            .column_by_name("user.name")
+            .expect("the peer flattened the rows too")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        assert_eq!(names.value(1), "Ada");
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_tables_read_options_reach_the_peer() {
+    use arrow_array::StructArray;
+    use lakeleto::engine::sql::DataFusionEngine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("users.parquet");
+    let user = StructArray::from(vec![(
+        Arc::new(Field::new("name", DataType::Utf8, true)),
+        Arc::new(StringArray::from(vec!["Grace", "Ada"])) as ArrayRef,
+    )]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("user", user.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(user)],
+    )
+    .unwrap();
+    let mut w =
+        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None)
+            .unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let sql: Arc<dyn Engine> = Arc::new(DataFusionEngine::new());
+    let addr = serve(Some(sql)).await;
+
+    tokio::task::spawn_blocking(move || {
+        let engine = RemoteEngine::new(format!("http://{addr}"), None);
+        let source = Source::resolve(&path, None)
+            .unwrap()
+            .with_flatten(Some(lakeleto::Flatten::All));
+        // `"user.name"` only exists if the peer registered the table flattened.
+        let rb = engine
+            .query(
+                &RequestContext::detached(),
+                r#"SELECT "user.name" FROM t ORDER BY id DESC"#,
+                &[NamedSource {
+                    name: "t".to_string(),
+                    source,
+                }],
+            )
+            .unwrap();
+        assert_eq!(rb.num_rows(), 2);
+        assert_eq!(rb.schema.field(0).name(), "user.name");
     })
     .await
     .unwrap();
@@ -292,7 +396,10 @@ async fn a_rejected_token_surfaces_the_servers_own_message_on_metadata_calls_too
         let engine = RemoteEngine::new(format!("http://{addr}"), Some("the-wrong-token".into()));
         let source = Source::resolve(&path, None).unwrap();
 
-        let err = engine.schema(&source).unwrap_err().to_string();
+        let err = engine
+            .schema(&RequestContext::detached(), &source)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("unauthorized"),
             "the server's message, not a bare status: {err}"
@@ -307,7 +414,10 @@ async fn a_rejected_token_surfaces_the_servers_own_message_on_metadata_calls_too
         );
 
         // `profile` is the other `get_json` caller — it must not have its own error path.
-        let err = engine.profile(&source, 100).unwrap_err().to_string();
+        let err = engine
+            .profile(&RequestContext::detached(), &source, 100)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unauthorized"), "{err}");
         assert!(err.contains("/v1/profile"), "{err}");
     })
@@ -328,7 +438,7 @@ async fn a_response_that_declares_more_than_the_cap_is_refused_before_it_is_read
         // 64 bytes is far under any real Arrow stream; the point is the cap, not the number.
         let engine = RemoteEngine::new(format!("http://{addr}"), None).with_max_response_bytes(64);
         let source = Source::resolve(&path, None).unwrap();
-        let err = match engine.preview(&source, 10) {
+        let err = match engine.preview(&RequestContext::detached(), &source, 10) {
             Err(e) => e.to_string(),
             Ok(rb) => panic!("buffered an over-cap body ({} rows)", rb.num_rows()),
         };
@@ -400,7 +510,7 @@ fn a_chunked_response_cannot_run_past_the_byte_cap() {
 
     let engine = RemoteEngine::new(format!("http://{addr}"), None).with_max_response_bytes(2048);
     let source = Source::resolve(&path, None).unwrap();
-    let err = match engine.preview(&source, 10) {
+    let err = match engine.preview(&RequestContext::detached(), &source, 10) {
         Err(e) => e.to_string(),
         Ok(rb) => panic!(
             "buffered an unbounded chunked body ({} rows)",
@@ -413,4 +523,66 @@ fn a_chunked_response_cannot_run_past_the_byte_cap() {
         !err.contains("declares"),
         "with no Content-Length the read bound is what must fire: {err}"
     );
+}
+
+/// A database source must be refused before any of it reaches the wire.
+///
+/// `RemoteEngine` sends `source.uri()` verbatim, because the peer is what resolves the string. For
+/// a database source that URI *is* the connection string, password included, so transmitting it
+/// would hand the credential to another server and write it into that server's request log. The
+/// engine used to only document that; now it refuses.
+///
+/// The endpoint here is deliberately a closed port. If the guard did not fire, the call would fail
+/// trying to connect — so `Forbidden` rather than a transport error is what proves nothing was
+/// sent, which is the property worth testing. Asserting on the message alone could not distinguish
+/// "refused before sending" from "sent, then rejected".
+#[test]
+fn a_database_source_is_refused_before_it_can_reach_a_peer() {
+    // Port 1 on loopback: reserved, and nothing this test controls is listening.
+    let engine = RemoteEngine::new("http://127.0.0.1:1", None);
+    const URI: &str = "postgres://app:hunter2@db.internal:5432/sales?table=orders";
+
+    let explicit = Source::with_format(URI, lakeleto::Format::Database);
+    // The same URI with no format at all: still unresolved, so a format-only check would let this
+    // one through and the scheme test is what catches it.
+    let inferred = Source::unresolved(URI, None).unwrap();
+
+    for source in [&explicit, &inferred] {
+        let mut failures = vec![engine
+            .schema(&RequestContext::detached(), source)
+            .expect_err("schema must refuse a database source")];
+        // `RowBatch` has no `Debug`, so unlike `schema` above these two cannot use `expect_err`
+        // (it has to format the `Ok` value) and go through `.err().expect(..)` instead.
+        failures.push(
+            engine
+                .preview(&RequestContext::detached(), source, 10)
+                .err()
+                .expect("preview must refuse a database source"),
+        );
+        failures.push(
+            engine
+                .query(
+                    &RequestContext::detached(),
+                    "select 1",
+                    &[NamedSource {
+                        name: "t".into(),
+                        source: source.clone(),
+                    }],
+                )
+                .err()
+                .expect("query must refuse a database source"),
+        );
+
+        for err in failures {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("will not read a database source"),
+                "expected the guard to refuse before connecting, got: {msg}"
+            );
+            assert!(
+                !msg.contains("hunter2"),
+                "the refusal must not quote the credential it is protecting: {msg}"
+            );
+        }
+    }
 }

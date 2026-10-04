@@ -250,7 +250,16 @@ Details worth knowing:
   (`azure://` / `abfs[s]://` / `adl://`).
 - **Ranged reads:** remote **Parquet** is read with range requests — only the
   footer plus the row groups a window touches — so it stays larger-than-memory
-  just like local files. Remote **CSV** is fetched whole.
+  just like local files.
+- **Streamed JSON and CSV:** remote **JSON** and **CSV** are read as they
+  arrive. A grid window or a SQL pass over JSON requests the object and stops
+  the transfer where it stops reading; a JSON records member (`/data`) is
+  fetched by its byte range once located; a CSV read is one request, its schema
+  inferred from the rows it reads; and every request asks for the version (ETag)
+  the read began with, so an object replaced mid-read fails that read rather
+  than mixing two versions. A long read — a large object, or a query result read
+  slowly — that outlasts the store's request timeout carries on from where it
+  stopped.
 - **S3-compatible stores:** set `AWS_ENDPOINT=https://…` for MinIO, R2, etc.
 - **Env-only:** credentials are read from the environment and nowhere else; they
   are never written to disk or a config file.

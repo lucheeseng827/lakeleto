@@ -202,12 +202,18 @@ export function FileBrowser({ cwd, parent, entries = [], onOpenDir, onOpenFile, 
   );
 }
 
+/* ---------- cell text (every place a cell becomes a string) ---------- */
+/** A cell as text: compact JSON for a nested value — a struct arrives as an object and a list as an
+ *  array — so it shows its contents instead of `[object Object]`; `""` for null. */
+export const cellText = (v: unknown): string =>
+  v === null || v === undefined ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+
 /* ---------- shared row search (SQL results + cached results) ---------- */
 /** Case-insensitive substring match across all cell values; empty query returns rows as-is. */
 export const filterRows = (rows: Row[], q: string): Row[] => {
   const t = q.trim().toLowerCase();
   if (!t) return rows;
-  return rows.filter((r) => Object.values(r).some((v) => v != null && String(v).toLowerCase().includes(t)));
+  return rows.filter((r) => Object.values(r).some((v) => v != null && cellText(v).toLowerCase().includes(t)));
 };
 
 /* ---------- StatTable (Schema / Profile / SQL results) ---------- */
@@ -237,7 +243,7 @@ export function StatTable({ columns = [], rows = [], onRowClick, style }: { colu
               const isNull = v === null || v === undefined;
               return (
                 <td key={c.key} style={{ ...cell, color: isNull ? "var(--null)" : (c.type ? "var(--muted)" : "var(--fg)"), fontSize: c.type ? "var(--text-sm)" : undefined }}>
-                  {isNull ? "·" : String(v)}
+                  {isNull ? "·" : cellText(v)}
                 </td>
               );
             })}
@@ -249,18 +255,23 @@ export function StatTable({ columns = [], rows = [], onRowClick, style }: { colu
 }
 
 /* ---------- DataGrid (the centerpiece) ---------- */
-const colWidth = (name: string) => Math.min(320, Math.max(90, name.length * 9 + 30));
+/** Nested values arrive as JSON (see `cellText`), which needs room to be read; scalars size to
+ *  their header. */
+const NESTED = /^(Struct|List|LargeList|FixedSizeList|ListView|LargeListView|Map)\(/;
+const colWidth = (c: Column) => NESTED.test(c.data_type || "")
+  ? Math.min(420, Math.max(260, c.name.length * 9 + 30))
+  : Math.min(320, Math.max(90, c.name.length * 9 + 30));
 export function DataGrid({ columns = [], rows = [], sort = null, onSort, filters = {}, onFilter, showFilters = true, footer, style }: {
   columns?: Column[]; rows?: Row[]; sort?: Sort | null; onSort?: (c: string) => void;
   filters?: Filters; onFilter?: (c: string, v: string) => void; showFilters?: boolean; footer?: ReactNode; style?: CSSProperties;
 }) {
   const [copied, setCopied] = useState<string | null>(null);
   const [hoverRow, setHoverRow] = useState<number | null>(null);
-  const width = (c: Column) => colWidth(c.name);
+  const width = (c: Column) => colWidth(c);
   const totalWidth = columns.reduce((a, c) => a + width(c), 0);
 
   const copyCell = (key: string, v: unknown) => {
-    navigator.clipboard?.writeText(v == null ? "" : String(v)).catch(() => { /* ignore */ });
+    navigator.clipboard?.writeText(cellText(v)).catch(() => { /* ignore */ });
     setCopied(key); setTimeout(() => setCopied((k) => (k === key ? null : k)), 500);
   };
 
@@ -329,7 +340,7 @@ export function DataGrid({ columns = [], rows = [], sort = null, onSort, filters
                     outline: isCopied ? "2px solid var(--accent)" : "none", outlineOffset: "-2px",
                     background: isCopied ? "var(--sel)" : undefined,
                   }}>
-                  {isNull ? "·" : String(v)}
+                  {isNull ? "·" : cellText(v)}
                 </div>
               );
             })}
