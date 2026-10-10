@@ -1,0 +1,534 @@
+/* ==========================================================================
+   Lakeleto — "Registered Blocks"
+   A woodblock colour-registration system: a keyblock line is printed first and
+   every pigment field registers inside it against kento notches.
+
+   Rendition note: the world's reference render is warm-paper-dominant. That is
+   this world's softest rendition and the one every generator ships for it, so
+   this build works from the same system's saturated end — aizuri-e, the
+   indigo-dominant tradition. The indigo pigment field is the GROUND. Paper is
+   the reserve: it appears only where a block is actually printed.
+
+   Self-contained: fonts are vendored, textures are inline SVG. No network.
+   ========================================================================== */
+
+/* ---------- Vendored faces (see fonts/LICENSES.md) ---------- */
+@font-face {
+  font-family: "Shippori Mincho";
+  src: url("fonts/shippori-mincho-latin-400.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215;
+}
+@font-face {
+  font-family: "Shippori Mincho";
+  src: url("fonts/shippori-mincho-latin-800.woff2") format("woff2");
+  font-weight: 800; font-style: normal; font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("fonts/jetbrains-mono-latin-400.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("fonts/jetbrains-mono-latin-600.woff2") format("woff2");
+  font-weight: 600; font-style: normal; font-display: swap;
+}
+
+/* ---------- Reset ---------- */
+*, *::before, *::after { box-sizing: border-box; }
+* { margin: 0; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body { min-height: 100vh; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+img, svg, video { display: block; max-width: 100%; height: auto; }
+a { color: inherit; text-decoration: none; }
+button, input, select, textarea { font: inherit; color: inherit; }
+ul, ol { padding: 0; }
+
+/* ==========================================================================
+   Pigments — the block's real inks
+   ========================================================================== */
+:root {
+  /* Ink */
+  --keyline:    #14161a;   /* the keyblock line: printed first, never moves */
+  --indigo-deep:#12283f;   /* the pigment field — the page ground */
+  --indigo:     #1e3a5f;
+  --indigo-mid: #2c4f7c;
+  --indigo-fade:#8fa7b7;   /* fade-indigo: secondary text ON the field */
+  --safflower:  #d14a3a;   /* fills and rules only: 3.39:1 on indigo, non-text */
+  --safflower-ink:#b23a2c; /* darkened so paper text on it clears 4.5:1 */
+  --safflower-lt:#f2b7a1;  /* small safflower TEXT on the indigo field: 8.6:1 */
+  --clove:      #5a3e2b;   /* secondary text ON paper */
+  --paper:      #f2e6ce;   /* RESERVE — the unprinted sheet */
+  --paper-2:    #e8d9bd;   /* a second pull, slightly heavier */
+
+  /* Type */
+  --display: "Shippori Mincho", Georgia, "Times New Roman", serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Geometry */
+  --notch: 10px;           /* the kento chamfer, on every printed edge */
+  --rule: 2px;             /* keyblock line weight */
+  --maxw: 1180px;
+  --ease: cubic-bezier(.16, 1, .3, 1);   /* exponential ease-out */
+}
+
+/* Paper fibre and pigment grain, generated not fetched. */
+:root {
+  --fibre: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='f'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23f)' opacity='.32'/%3E%3C/svg%3E");
+  --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.6 .04' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23g)' opacity='.22'/%3E%3C/svg%3E");
+}
+
+body {
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--paper);
+  background-color: var(--indigo-deep);
+  background-image: var(--grain);
+  background-size: 180px 180px;
+}
+
+:focus-visible { outline: 3px solid var(--safflower); outline-offset: 3px; }
+
+/* ==========================================================================
+   The printed block — keyblock line first, pigment registered inside it
+   ========================================================================== */
+.block {
+  --fill: var(--paper);
+  position: relative;
+  background: var(--keyline);
+  padding: var(--rule);
+  clip-path: polygon(
+    var(--notch) 0, calc(100% - var(--notch)) 0, 100% var(--notch),
+    100% calc(100% - var(--notch)), calc(100% - var(--notch)) 100%,
+    var(--notch) 100%, 0 calc(100% - var(--notch)), 0 var(--notch)
+  );
+}
+.block > .ink {
+  background: var(--fill);
+  clip-path: polygon(
+    var(--notch) 0, calc(100% - var(--notch)) 0, 100% var(--notch),
+    100% calc(100% - var(--notch)), calc(100% - var(--notch)) 100%,
+    var(--notch) 100%, 0 calc(100% - var(--notch)), 0 var(--notch)
+  );
+  height: 100%;
+}
+/* Paper sheets carry fibre; ink-filled blocks carry grain. */
+.block > .ink.sheet {
+  background-image: var(--fibre);
+  background-size: 140px 140px;
+  color: var(--keyline);
+}
+/* The unprinted state: keyline only, no pigment. Used to mean "not yet known". */
+.block.keyline-only { background: transparent; padding: 0; }
+.block.keyline-only > .ink {
+  background: transparent;
+  border: var(--rule) solid var(--indigo-fade);
+  clip-path: none;
+  color: var(--indigo-fade);
+}
+/* On paper the fade-indigo outline sits at 2.03:1 and all but disappears, taking
+   the "not yet printed" idea with it. Clove is the paper-context uncut line. */
+.field--sheet .block.keyline-only > .ink { border-color: var(--clove); color: var(--clove); }
+.field--sheet .block.keyline-only h3 { color: var(--clove); }
+
+/* ==========================================================================
+   Layout
+   ========================================================================== */
+.wrap { width: 100%; max-width: var(--maxw); margin-inline: auto; padding-inline: 28px; }
+@media (max-width: 640px) { .wrap { padding-inline: 18px; } }
+
+.field { padding: 92px 0; }            /* on the indigo ground */
+.field--tight { padding: 60px 0; }
+.field--sheet {                         /* a full-width paper pull */
+  background-color: var(--paper);
+  background-image: var(--fibre);
+  background-size: 140px 140px;
+  color: var(--keyline);
+  padding: 92px 0;
+  position: relative;
+}
+/* bokashi: the printed gradient edge where one field meets the next */
+.field--sheet::before,
+.field--sheet::after {
+  content: ""; position: absolute; left: 0; right: 0; height: 46px; pointer-events: none;
+}
+.field--sheet::before { top: 0; background: linear-gradient(var(--paper-2), transparent); }
+.field--sheet::after { bottom: 0; background: linear-gradient(transparent, var(--paper-2)); }
+
+.skip-link {
+  position: absolute; left: -9999px; top: 10px; z-index: 100;
+  background: var(--safflower-ink); color: var(--paper); padding: 12px 20px; font-weight: 700;
+}
+.skip-link:focus { left: 18px; }
+
+/* ==========================================================================
+   Type
+   ========================================================================== */
+h1, h2, h3 { font-family: var(--display); font-weight: 800; line-height: 1.06; letter-spacing: -.022em; }
+.display-1 { font-size: clamp(2.6rem, 6.4vw, 5.4rem); text-wrap: balance; }
+.display-2 { font-size: clamp(2rem, 4.2vw, 3.3rem); text-wrap: balance; max-width: 22ch; }
+h3 { font-size: 1.24rem; letter-spacing: -.012em; }
+
+/* Measure in rem, not ch: `ch` is the width of "0" and overshoots badly in a
+   proportional sans, and on .section-head it resolved against the parent's 16px
+   while capping a 20px lede, squeezing it to ~50 characters. */
+p { max-width: 40rem; }
+.lede { font-size: clamp(1.06rem, 1.7vw, 1.28rem); line-height: 1.55; max-width: 38rem; }
+.field .lede { color: var(--indigo-fade); }
+.field--sheet .lede { color: var(--clove); }
+.dim { color: var(--indigo-fade); }
+.field--sheet .dim { color: var(--clove); }
+
+/* A cartouche label: the world's own furniture, replacing the banned eyebrow.
+   It is a title slug carved into the block edge, not a coloured mini-heading. */
+.cartouche {
+  display: inline-block; font-family: var(--mono); font-size: .68rem; font-weight: 600;
+  letter-spacing: .22em; text-transform: uppercase;
+  border: 1px solid currentColor; padding: 5px 11px 4px;
+  color: var(--safflower);
+}
+.field--sheet .cartouche { color: var(--safflower-ink); }
+
+/* Vertical cartouche — the form of an edo title slug, set with real English content.
+   No decorative CJK: putting glyphs a reader cannot read on a product page is costume. */
+.cartouche-v {
+  writing-mode: vertical-rl; text-orientation: mixed;
+  font-family: var(--mono); font-size: .7rem; font-weight: 600;
+  letter-spacing: .3em; text-transform: uppercase;
+  border: 1px solid var(--safflower); color: var(--safflower-lt);
+  padding: 14px 5px; align-self: start;
+}
+@media (max-width: 900px) { .cartouche-v { display: none; } }
+
+.section-head { max-width: 46rem; margin-bottom: 46px; }
+.section-head p { margin-top: 18px; }
+
+/* The sticky masthead is 66px; without this every in-page link parks its target
+   underneath it, and #download hides its own buttons. */
+[id] { scroll-margin-top: 92px; }
+
+/* ==========================================================================
+   Seals — the publisher/censor cluster, carrying real product facts
+   ========================================================================== */
+.seals { display: flex; flex-wrap: wrap; gap: 12px; }
+.seal {
+  font-family: var(--mono); font-size: .64rem; font-weight: 600;
+  letter-spacing: .12em; text-transform: uppercase;
+  /* Seals carry the page's proof points, so they are TEXT and take the light
+     safflower on the field (8.6:1); the rule keeps the saturated ink. */
+  color: var(--safflower-lt); border: 3px double var(--safflower);
+  padding: 9px 12px; text-align: center; line-height: 1.25;
+  transform: rotate(-1.2deg);
+}
+.seal:nth-child(2n) { transform: rotate(1.4deg); }
+.seal:nth-child(3n) { transform: rotate(-.5deg); }
+.field--sheet .seal { color: var(--safflower-ink); border-color: var(--safflower-ink); }
+
+/* ==========================================================================
+   Controls — the notched block, cut once and reused
+   ========================================================================== */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+  font-family: var(--mono); font-size: .82rem; font-weight: 600;
+  letter-spacing: .12em; text-transform: uppercase;
+  padding: 15px 26px; cursor: pointer; border: none;
+  background: var(--keyline);
+  clip-path: polygon(
+    var(--notch) 0, calc(100% - var(--notch)) 0, 100% var(--notch),
+    100% calc(100% - var(--notch)), calc(100% - var(--notch)) 100%,
+    var(--notch) 100%, 0 calc(100% - var(--notch)), 0 var(--notch)
+  );
+  position: relative; color: var(--paper);
+  transition: background .18s var(--ease), color .18s var(--ease), transform .12s var(--ease);
+}
+.btn-primary { background: var(--safflower-ink); color: var(--paper); }
+.btn-primary:hover { background: var(--keyline); color: var(--paper); }
+.btn-primary:active { transform: translateY(1px); }
+.btn-quiet {
+  background: transparent; color: var(--paper);
+  box-shadow: inset 0 0 0 2px var(--indigo-fade); clip-path: none;
+}
+.btn-quiet:hover { box-shadow: inset 0 0 0 2px var(--paper); }
+/* On the paper sheet the quiet button's field inverts: a keyline-on-paper
+   outline, since a paper-coloured rule on paper is invisible. */
+.field--sheet .btn-quiet { color: var(--keyline); box-shadow: inset 0 0 0 2px var(--clove); }
+.field--sheet .btn-quiet:hover { box-shadow: inset 0 0 0 2px var(--keyline); }
+
+/* ==========================================================================
+   Masthead
+   ========================================================================== */
+.masthead {
+  position: sticky; top: 0; z-index: 50;
+  background: var(--indigo-deep);
+  border-bottom: var(--rule) solid var(--keyline);
+}
+.masthead .wrap { display: flex; align-items: center; gap: 22px; height: 66px; }
+.brand { display: inline-flex; align-items: center; gap: 11px; }
+.brand svg { width: 30px; height: 30px; flex: none; }
+.brand span {
+  font-family: var(--display); font-weight: 800; font-size: 1.22rem;
+  letter-spacing: -.02em; color: var(--paper);
+}
+.nav-spacer { flex: 1; }
+.nav { display: flex; gap: 4px; list-style: none; }
+.nav a {
+  display: flex; align-items: center; min-height: 44px; padding: 8px 12px;
+  font-family: var(--mono); font-size: .72rem; font-weight: 600;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--indigo-fade);
+  transition: color .16s var(--ease), background .16s var(--ease);
+}
+.nav a:hover { color: var(--paper); background: var(--indigo); }
+/* Duplicates the header button, so it only appears once that button is hidden. */
+.nav-cta { display: none; }
+@media (max-width: 940px) { .nav-cta { display: block; } .nav-cta a { color: var(--safflower-lt); } }
+.nav-toggle {
+  display: none; background: transparent; border: 2px solid var(--indigo-fade);
+  color: var(--paper); width: 40px; height: 40px; cursor: pointer;
+  align-items: center; justify-content: center;
+}
+@media (max-width: 940px) {
+  .nav-toggle { display: inline-flex; }
+  .nav {
+    position: absolute; top: 66px; left: 0; right: 0; flex-direction: column; gap: 0;
+    background: var(--indigo-deep); border-bottom: var(--rule) solid var(--keyline);
+    padding: 10px 28px 18px; display: none;
+  }
+  .nav.open { display: flex; }
+  .masthead .btn { display: none; }
+}
+
+/* ==========================================================================
+   Hero
+   ========================================================================== */
+.hero { padding: 76px 0 84px; }
+.hero-grid { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 30px; }
+@media (max-width: 900px) { .hero-grid { grid-template-columns: minmax(0, 1fr); } }
+.hero h1 { color: var(--paper); text-wrap: balance; }
+.hero .lede { margin-top: 24px; }
+.hero-seals { margin-top: 30px; }
+
+/* ==========================================================================
+   The registration demo — the page's one authored motion moment.
+   DEFAULT STATE IS FULLY PRINTED. app.js adds .replay to run the pull;
+   nothing is hidden from a reader without JS.
+   ========================================================================== */
+.press { margin-top: 44px; }
+.press-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  font-family: var(--mono); font-size: .68rem; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--keyline); padding: 12px 16px; border-bottom: var(--rule) solid var(--keyline);
+  flex-wrap: wrap;
+}
+.press-path { font-weight: 600; }
+.pulls { display: flex; gap: 6px; }
+.pull-tag {
+  border: 1px solid currentColor; padding: 3px 8px; font-size: .62rem;
+  color: var(--clove); opacity: .45;
+}
+.pull-tag.on { opacity: 1; color: var(--safflower-ink); border-color: var(--safflower-ink); }
+
+/* The sheet's chamfer makes a clipped column look like a finished edge, so the
+   scrollable edge is faded to show there is more table to the right. */
+.press-scroll {
+  overflow-x: auto;
+  mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 34px), transparent 100%);
+}
+.press-scroll:not(:hover) { scrollbar-width: thin; }
+.press-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: .82rem; }
+.press-table th, .press-table td {
+  padding: 9px 16px; text-align: left; white-space: nowrap;
+  border-bottom: 1px solid rgba(20, 22, 26, .17);
+}
+.press-table th {
+  font-size: .66rem; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--keyline); font-weight: 600; border-bottom: var(--rule) solid var(--keyline);
+}
+.press-table th .ty { display: block; font-size: .58rem; letter-spacing: .1em; color: var(--clove); margin-top: 3px; }
+/* Layer 2 — the indigo block: the row values */
+.press-table td { color: var(--indigo); }
+.press-table td.num { color: var(--indigo-deep); font-weight: 600; }
+/* Layer 3 — the safflower block: the profile marks registered on top */
+.press-table td.null { color: var(--safflower-ink); font-style: normal; }
+.press-foot {
+  display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  padding: 12px 16px; border-top: var(--rule) solid var(--keyline);
+  font-family: var(--mono); font-size: .68rem; color: var(--clove);
+}
+
+/* The pull: each pigment layer registers in, offset by a hair then snapping true. */
+@media (prefers-reduced-motion: no-preference) {
+  /* Three pulls in the order a print is actually made:
+     keyblock (headers) → indigo (values) → safflower (the null marks). */
+  .press.replay .press-table th      { animation: register .50s var(--ease) both; animation-delay: 0s; }
+  .press.replay .press-table td      { animation: register .62s var(--ease) both; animation-delay: .16s; }
+  .press.replay .press-table td.null { animation-delay: .38s; }
+}
+@keyframes register {
+  from { opacity: 0; transform: translate3d(-6px, 3px, 0); filter: blur(1.4px); }
+  to   { opacity: 1; transform: none; filter: none; }
+}
+
+/* Kento registration marks at the sheet corners */
+.kento { position: absolute; width: 16px; height: 16px; pointer-events: none; color: var(--safflower-ink); }
+.kento::before, .kento::after { content: ""; position: absolute; background: currentColor; }
+.kento::before { left: 0; top: 0; width: 100%; height: 2px; }
+.kento::after { left: 0; top: 0; width: 2px; height: 100%; }
+.kento.tl { left: -1px; top: -1px; }
+.kento.tr { right: -1px; top: -1px; transform: scaleX(-1); }
+.kento.bl { left: -1px; bottom: -1px; transform: scaleY(-1); }
+.kento.br { right: -1px; bottom: -1px; transform: scale(-1); }
+
+/* ==========================================================================
+   Download
+   ========================================================================== */
+.getit { margin-top: 34px; max-width: 520px; }
+.getit-row { display: flex; gap: 12px; align-items: stretch; flex-wrap: wrap; }
+@media (max-width: 560px) { .getit-row { flex-direction: column; } }
+.getit .hint { margin-top: 14px; font-size: .86rem; color: var(--indigo-fade); }
+.field--sheet .getit .hint { color: var(--clove); }
+/* Visually hidden but ANNOUNCED — real labels and the press table's caption. */
+.hp { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+
+/* ==========================================================================
+   Registered-blocks grid (the four views) — one keyline, four pigments
+   ========================================================================== */
+.blocks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; }
+/* Three uncut blocks read as a set; in the 2-up grid the third is an orphan. */
+.blocks--3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 980px) { .blocks--3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 780px) { .blocks, .blocks--3 { grid-template-columns: minmax(0, 1fr); } }
+.blocks .ink { padding: 28px; display: flex; flex-direction: column; gap: 12px; }
+.blocks h3 { color: var(--keyline); }
+.blocks p { color: var(--clove); font-size: .97rem; }
+/* The pigment is PRINTED, not labelled. Each block's heading is set in its own
+   ink and its top rule carries the same colour, so the naming is the render.
+   (A mono colour-name label above each heading was an eyebrow wearing the
+   world's clothes, and it carried no information: two blocks shared each ink.) */
+.blocks .ink { border-top: 5px solid var(--keyline); }
+.blocks h3 { color: var(--keyline); }
+.ink-indigo { border-top-color: var(--indigo) !important; }
+.ink-indigo h3 { color: var(--indigo); }
+.ink-saff { border-top-color: var(--safflower-ink) !important; }
+.ink-saff h3 { color: var(--safflower-ink); }
+.ink-clove { border-top-color: var(--clove) !important; }
+.ink-clove h3 { color: var(--clove); }
+
+/* ==========================================================================
+   Plates — the real screenshots, presented as printed impressions
+   ========================================================================== */
+.plates { display: grid; gap: 34px; }
+.plate-figure { margin: 0; }
+.plate-figure .block { position: relative; }
+.plate-figure img { width: 100%; }
+.plate-figure figcaption {
+  margin-top: 14px; font-family: var(--mono); font-size: .74rem; line-height: 1.65;
+  color: var(--indigo-fade); display: flex; gap: 12px; align-items: baseline;
+}
+.plate-figure figcaption b {
+  color: var(--safflower-lt); font-weight: 600; letter-spacing: .14em;
+  text-transform: uppercase; font-size: .64rem; flex: none;
+}
+/* The plates sit on paper, where fade-indigo is 2.03:1 — barely visible. */
+.field--sheet .plate-figure figcaption { color: var(--clove); }
+.field--sheet .plate-figure figcaption b { color: var(--safflower-ink); }
+
+/* ==========================================================================
+   Inventory (formats) — the block shelf
+   ========================================================================== */
+.inventory { display: flex; flex-wrap: wrap; gap: 10px; }
+.slug {
+  font-family: var(--mono); font-size: .78rem; font-weight: 600;
+  padding: 10px 15px; background: var(--keyline); color: var(--paper);
+  clip-path: polygon(7px 0, 100% 0, 100% calc(100% - 7px), calc(100% - 7px) 100%, 0 100%, 0 7px);
+}
+/* One ink for the whole shelf. Three colours across two columns implied a key
+   that did not exist and meant different things left and right, and the
+   safflower fill was byte-identical to the primary button. */
+.inv-col h3 { margin-bottom: 16px; }
+.inv-col p { margin-top: 16px; font-size: .95rem; }
+
+/* ==========================================================================
+   Order slip (CLI) + code
+   ========================================================================== */
+/* Column-flex so the paper pull fills the whole block. Side by side in a
+   stretched grid the shorter slip would otherwise show bare keyline below it. */
+.slip { background: var(--keyline); padding: var(--rule); display: flex; flex-direction: column; }
+.slip pre { flex: 1; }
+.slip-head {
+  font-family: var(--mono); font-size: .66rem; letter-spacing: .18em; text-transform: uppercase;
+  color: var(--paper); padding: 10px 16px; display: flex; justify-content: space-between; gap: 12px;
+}
+.slip pre {
+  margin: 0; padding: 22px 20px; overflow-x: auto;
+  background: var(--paper); background-image: var(--fibre); background-size: 140px 140px;
+}
+.slip code { font-family: var(--mono); font-size: .82rem; line-height: 1.85; color: var(--keyline); }
+.slip .c { color: #6d5d47; }   /* comments are ~40% of the visible lines; 4.8:1 */
+.slip .k { color: var(--safflower-ink); font-weight: 600; }
+.slip .s { color: var(--indigo); }
+.slip .f { color: var(--clove); }
+
+code.inline {
+  font-family: var(--mono); font-size: .87em;
+  background: rgba(20, 22, 26, .08); padding: 2px 6px; color: var(--keyline);
+}
+/* On the bare indigo ground the inline code inverts … */
+.field code.inline { background: rgba(242, 230, 206, .12); color: var(--paper); }
+/* … but inside a printed paper block it stays ink-on-paper. Without this the
+   rule above wins and paints paper text on a paper sheet, which is invisible. */
+.field .ink code.inline { background: rgba(20, 22, 26, .08); color: var(--keyline); }
+
+/* ==========================================================================
+   Register (FAQ)
+   ========================================================================== */
+.register { max-width: 860px; }
+.register details { border-bottom: 1px solid rgba(20, 22, 26, .2); }
+.register summary {
+  cursor: pointer; list-style: none; padding: 22px 0;
+  font-family: var(--display); font-weight: 800; font-size: 1.16rem; color: var(--keyline);
+  display: flex; justify-content: space-between; align-items: center; gap: 20px;
+}
+.register summary::-webkit-details-marker { display: none; }
+.register summary::after {
+  content: ""; flex: none; width: 15px; height: 15px;
+  border-right: 2px solid var(--safflower-ink); border-bottom: 2px solid var(--safflower-ink);
+  transform: rotate(45deg) translate(-3px, -3px);
+  transition: transform .2s var(--ease);
+}
+.register details[open] summary::after { transform: rotate(225deg) translate(-3px, -3px); }
+.register .answer { padding-bottom: 24px; color: var(--clove); }
+.register .answer p + p { margin-top: 12px; }
+
+/* ==========================================================================
+   Colophon
+   ========================================================================== */
+.colophon { border-top: var(--rule) solid var(--keyline); padding: 46px 0 38px; }
+.colophon-grid { display: flex; flex-wrap: wrap; gap: 28px; justify-content: space-between; }
+.colophon p { color: var(--indigo-fade); font-size: .9rem; max-width: 44ch; margin-top: 12px; }
+.colophon-links { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+.colophon-links a {
+  font-family: var(--mono); font-size: .72rem; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--indigo-fade);
+}
+.colophon-links a:hover { color: var(--paper); }   /* safflower on indigo drops to 3.39:1 */
+.colophon-legal {
+  margin-top: 32px; padding-top: 22px; border-top: 1px solid rgba(143, 167, 183, .26);
+  color: var(--indigo-fade); font-size: .82rem; font-family: var(--mono);
+}
+
+/* ==========================================================================
+   Utilities
+   ========================================================================== */
+.stack-lg > * + * { margin-top: 24px; }
+.two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 42px; }
+@media (max-width: 820px) { .two-col { grid-template-columns: minmax(0, 1fr); gap: 34px; } }
+
+@media print {
+  .masthead, .getit, .nav-toggle { display: none; }
+  body { background: #fff; color: #000; }
+}
