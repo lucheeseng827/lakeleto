@@ -31,6 +31,7 @@ use crate::context::RequestContext;
 use crate::engine::local::LocalReaderEngine;
 use crate::engine::NamedSource;
 use crate::error::{EngineError, Result};
+use crate::format::codec::Decompressed;
 use crate::format::{Input, Pass, PassFn, ReadOptions, RemoteObject};
 
 /// Batches a pass may decode ahead of the query reading it: enough to keep the decoder busy while
@@ -99,17 +100,34 @@ impl Streams {
         }
         widened
     }
+
+    /// `e`, or the limit's own error if a pass over a table's compressed file went past
+    /// `--max-decompressed`: that is why the query failed, whatever DataFusion made of the error
+    /// on its way out.
+    fn or_too_large(&self, e: EngineError) -> EngineError {
+        let tables = self
+            .0
+            .tables
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        tables.iter().fold(e, |e, table| table.at.or_too_large(e))
+    }
 }
 
 /// Run `op`, and once more if a table it streams turned out to have been registered with types
 /// too narrow for its file — planned with the file's wider schema the second time, so the query
 /// reads every value the grid would rather than failing on one the sample did not see. A second
-/// widening is reported, not retried: it would mean the file changed under the query.
+/// widening is reported, not retried: it would mean the file changed under the query. A query
+/// that failed because a pass went past `--max-decompressed` fails as `TooLarge`.
 pub(super) fn retrying<T>(ctx: &RequestContext, op: impl Fn(&Streams) -> Result<T>) -> Result<T> {
     let streams = Streams::default();
     match op(&streams) {
-        Err(_) if streams.widened(ctx) => op(&Streams::default()),
-        done => done,
+        Err(_) if streams.widened(ctx) => {
+            let again = Streams::default();
+            op(&again).map_err(|e| again.or_too_large(e))
+        }
+        done => done.map_err(|e| streams.or_too_large(e)),
     }
 }
 
@@ -134,6 +152,9 @@ pub(super) fn planning_failed(session: &SessionContext, e: &DataFusionError) {
 pub(super) enum At {
     File(PathBuf),
     Object(Arc<dyn RemoteObject>),
+    /// A compressed file or object, its bytes the decompressed ones, at most `--max-decompressed`
+    /// of them a pass.
+    Decompressed(Arc<Decompressed>),
 }
 
 impl At {
@@ -142,6 +163,15 @@ impl At {
         match self {
             At::File(path) => Input::File(path),
             At::Object(object) => Input::Object(object.as_ref()),
+            At::Decompressed(file) => Input::Object(file.as_ref()),
+        }
+    }
+
+    /// `e`, or the limit's own error if a read of this file went past `--max-decompressed`.
+    fn or_too_large(&self, e: EngineError) -> EngineError {
+        match self {
+            At::Decompressed(file) => file.or_too_large(e),
+            At::File(_) | At::Object(_) => e,
         }
     }
 }
@@ -152,6 +182,7 @@ impl std::fmt::Display for At {
         match self {
             At::File(path) => write!(f, "{}", path.display()),
             At::Object(object) => f.write_str(object.uri()),
+            At::Decompressed(file) => f.write_str(file.uri()),
         }
     }
 }
@@ -168,7 +199,10 @@ pub(super) fn register(
     let reader = crate::format::reader(table.source.format)
         .ok_or_else(|| EngineError::unsupported_format(table.source.format, "sql"))?;
     let opts = LocalReaderEngine::default().read_options(&table.source);
-    let schema = reader.schema(at.input(), &opts)?.schema;
+    let schema = reader
+        .schema(at.input(), &opts)
+        .map_err(|e| at.or_too_large(e))?
+        .schema;
     let file = Arc::new(TablePass {
         pass,
         at,

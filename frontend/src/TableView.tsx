@@ -4,8 +4,9 @@
 // the tab object so they round-trip through the workspace store. SQL "Run" goes up to the shell
 // (onRunSql) so the run is recorded in the workspace history and its result is cached.
 import { useEffect, useState, type CSSProperties } from "react";
-import { isJsonSource, normalizeJsonPath, type Backend, type Conn, type Profile, type Row, type RowsResp, type SchemaResp } from "./api";
+import { isJsonSource, normalizeJsonPath, type Backend, type Conn, type Profile, type Row, type SchemaResp } from "./api";
 import { Banner, Button, cellText, Chip, DataGrid, filterRows, Select, StatTable, Tabs, TextInput, Textarea } from "./components";
+import { useRowWindows } from "./windows";
 import { usedVars, type OpenTab, type SubView } from "./workspace";
 
 const fmtInt = (n?: number | null) => (n == null ? "?" : Number(n).toLocaleString());
@@ -17,6 +18,7 @@ const basename = (p: string) => { const i = Math.max(p.lastIndexOf("/"), p.lastI
 // a clean `C:\…` path instead of `\\?\C:\…` (the server canonicalizes to the verbatim form).
 const cleanPath = (p: string) => p.replace(/^\\\\\?\\UNC\\/, "\\\\").replace(/^\\\\\?\\/, "");
 
+/** One tab's explorer for a single source: its Grid, Schema, Profile and SQL views. */
 export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable, resolve, onOpenRow }: {
   backend: Backend; conn: Conn; tab: OpenTab;
   onPatch: (p: Partial<OpenTab>) => void;
@@ -31,7 +33,6 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
   // it (that errors "names a whole database"); show a table picker instead. Guarded HERE so a tab
   // that lands on a whole-DB path by ANY route (restore, launcher, add) browses rather than errors.
   const wholeDb = /^(sqlite|postgres|postgresql|mysql):\/\//i.test(rpath) && !/[?&]table=/.test(rpath);
-  const [grid, setGrid] = useState<RowsResp | null>(null);
   const [schema, setSchema] = useState<SchemaResp | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [dbTables, setDbTables] = useState<{ name: string; path: string }[] | null>(null);
@@ -43,13 +44,16 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
   // What the tab read is another table once it reads its source another way (other records, other
   // columns), so it is dropped as the setting changes — during the render, so not even one frame
   // shows it under the new setting — rather than left up until the new reads land. A new sort or
-  // filter keeps the rows on screen meanwhile: same table, same columns.
+  // filter keeps the rows on screen meanwhile: same table, same columns. (The grid's rows are
+  // dropped the same way, by `useRowWindows`.)
   const readKey = JSON.stringify([rpath, flatten, jsonPath]);
   const [readFor, setReadFor] = useState(readKey);
   if (readFor !== readKey) {
     setReadFor(readKey);
-    setGrid(null); setSchema(null); setProfile(null);
+    setSchema(null); setProfile(null);
   }
+  // The grid's rows, read a window at a time as it scrolls.
+  const grid = useRowWindows(backend, sub === "Grid" && !wholeDb ? { path: rpath, sort, filters, flatten, jsonPath } : null);
   const copyPath = () => {
     navigator.clipboard?.writeText(cleanPath(rpath))
       .then(() => { setPathCopied(true); setTimeout(() => setPathCopied(false), 1200); })
@@ -67,9 +71,7 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
         .catch((e) => { if (!cancelled) { setDbTables(null); fail(e); } });
       return () => { cancelled = true; };
     }
-    if (sub === "Grid") backend.rows({ path: rpath, offset: 0, limit: 200, sort, filters, flatten, jsonPath })
-      .then((r) => { if (!cancelled) setGrid(r); }).catch((e) => { if (!cancelled) setGrid(null); fail(e); });
-    else if (sub === "Schema") backend.schema(rpath, flatten, jsonPath)
+    if (sub === "Schema") backend.schema(rpath, flatten, jsonPath)
       .then((r) => { if (!cancelled) setSchema(r); }).catch((e) => { if (!cancelled) setSchema(null); fail(e); });
     else if (sub === "Profile") backend.stats({ path: rpath, filters, flatten, jsonPath })
       .then((r) => { if (!cancelled) setProfile(r); }).catch((e) => { if (!cancelled) setProfile(null); fail(e); });
@@ -89,7 +91,7 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
 
   const toggleSort = (c: string) => onPatch({ sort: !sort || sort.col !== c ? { col: c, desc: false } : !sort.desc ? { col: c, desc: true } : null });
   // Offered when there is a struct to spread, and while it is on so it can be turned off again.
-  const shown: { name: string; data_type: string }[] = grid?.columns ?? schema?.columns ?? profile?.columns ?? [];
+  const shown: { name: string; data_type: string }[] = (grid.ready ? grid.columns : null) ?? schema?.columns ?? profile?.columns ?? [];
   const hasStructs = shown.some((c) => STRUCT.test(c.data_type || ""));
   const toggleFlatten = () => {
     // Flattening renames what it spreads (`user` ↔ `user.name`), so a sort or filter survives the
@@ -134,6 +136,7 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
   const toolbar: CSSProperties = { display: "flex", gap: "var(--space-5)", alignItems: "center", padding: "var(--pad-toolbar)", borderBottom: "var(--border-hairline)", flexWrap: "wrap", flex: "0 0 auto" };
   const pane: CSSProperties = { flex: "1 1 auto", minHeight: 0, overflow: "auto", padding: "var(--gutter)" };
   const sqlOut = tab.sqlOut;
+  const shownErr = err ?? (sub === "Grid" ? grid.error : null);
 
   return (
     <main style={{ flex: "1 1 auto", minWidth: 0, display: "flex", flexDirection: "column" }}>
@@ -183,9 +186,9 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
         <Button onClick={doExport}>Download view</Button>
       </div>
 
-      {err && <div style={{ padding: "var(--gutter)" }}><Banner tone="err">{err}</Banner></div>}
+      {shownErr && <div style={{ padding: "var(--gutter)" }}><Banner tone="err">{shownErr}</Banner></div>}
 
-      {!err && wholeDb && (
+      {!shownErr && wholeDb && (
         <div style={pane}>
           <div style={{ color: "var(--muted)", fontSize: "var(--text-12)", marginBottom: 10 }}>
             This is a database — pick a table to open{dbTables ? ` (${dbTables.length} tables)` : "…"}.
@@ -203,19 +206,20 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
         </div>
       )}
 
-      {!err && sub === "Grid" && grid && (
-        <DataGrid columns={grid.columns} rows={grid.rows} sort={sort} onSort={toggleSort}
-          filters={filters} onFilter={setFilter}
+      {!shownErr && sub === "Grid" && grid.ready && (
+        <DataGrid columns={grid.columns} count={grid.count} row={grid.row} onRange={grid.want} resetKey={grid.epoch}
+          sort={sort} onSort={toggleSort} filters={filters} onFilter={setFilter} onOpenRow={onOpenRow}
           footer={<>
-            <span>{grid.total_known ? `${fmtInt(grid.matched_rows)} rows` : `≥ ${fmtInt(grid.offset + grid.num_rows)} rows`}</span>
-            <span>window @ {fmtInt(grid.offset)}</span>
-            <span>scanned {fmtInt(grid.scanned_rows)}</span>
+            <span>{grid.count === 0 ? "0 rows" : `of ${grid.exact ? fmtInt(grid.count) : `≥ ${fmtInt(grid.seen)}`}`}</span>
+            <span>scanned {fmtInt(grid.scanned)}</span>
             {nFilters > 0 && <Chip>filtered: {nFilters} filter(s)</Chip>}
-            {grid.bounded && <Chip tone="warn">bounded: first {fmtInt(grid.scanned_rows)} rows</Chip>}
+            {grid.bounded && <Chip tone="warn">bounded: first {fmtInt(grid.scanned)} rows</Chip>}
+            {grid.loading && <span>reading…</span>}
+            {grid.windowError && <Chip tone="warn" title={grid.windowError}>some rows couldn't be read; trying again</Chip>}
           </>} />
       )}
 
-      {!err && sub === "Schema" && schema && (
+      {!shownErr && sub === "Schema" && schema && (
         <div style={pane}>
           <div style={{ color: "var(--muted)", fontSize: "var(--text-12)", marginBottom: 8 }}>
             source: {schema.source} · format: {schema.format} · engine: {schema.engine} · rows: {fmtInt(schema.row_count)}
@@ -225,7 +229,7 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
         </div>
       )}
 
-      {!err && sub === "Profile" && profile && (
+      {!shownErr && sub === "Profile" && profile && (
         <div style={pane}>
           <div style={{ color: "var(--muted)", fontSize: "var(--text-12)", marginBottom: 8, display: "flex", gap: 8, alignItems: "center" }}>
             engine: {profile.engine} · scanned {fmtInt(profile.scanned_rows)} rows

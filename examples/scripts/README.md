@@ -23,8 +23,9 @@ need the Rust build; they just need the server up.
 
 ## Prerequisites
 
-- A running server: `lakeleto serve --features serve,sql` (the release binary already has every
-  engine — just `lakeleto serve`). The `sql` engine is only needed for the shaped-report export.
+- A running server: `lakeleto serve` from a release binary, which has every engine, or a build
+  from source with `--features serve,sql` (as in the quickstart below). The `sql` engine is only
+  needed for the shaped-report export.
 - **Bash:** `curl`, `jq` (+ `duckdb` for the BI step).
 - **PowerShell:** 7+ (`pwsh`) (+ `duckdb` for the BI step).
 - Config via environment: `LAKELETO_URL` (default `http://127.0.0.1:8080`) and, if the server was

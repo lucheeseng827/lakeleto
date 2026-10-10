@@ -50,6 +50,7 @@
 //! bytes. JSON stays the default for browsers; Arrow is the engine-to-engine codec.
 
 use std::io::Read;
+use std::sync::{Arc, Mutex};
 
 use super::{Capabilities, Engine, NamedSource, RowBatch, TableProfile, TableSchema};
 use crate::context::RequestContext;
@@ -85,6 +86,11 @@ const ARROW_STREAM_MIME: &str = "application/vnd.apache.arrow.stream";
 /// distinction: it is simply outside this change, which is the engine seam. Cap it there too
 /// before either client is aimed at anything untrusted.
 const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
+/// How long [`RemoteEngine::capabilities`] waits for `GET /v1/engines`. The answer is a few
+/// hundred bytes the server has to hand, and the accessor can't fail, so a server slower than
+/// this is reported as capabilities unknown rather than holding up the caller.
+const CAPABILITIES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The `?path=` / `?format=` pair every `/v1/*` read takes — with `format` **omitted** when the
 /// client never resolved one.
@@ -137,12 +143,35 @@ fn wire_params(source: &Source) -> Vec<(&'static str, String)> {
     params
 }
 
+/// What a server says about itself at `GET /v1/engines`: the part a client acts on.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[non_exhaustive]
+pub struct ServerInfo {
+    /// The server's Lakeleto version.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The `/v1` contract it speaks (see [`crate::protocol`]). `None` from a server that
+    /// predates versioning, which speaks a subset of `1.0`.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// What its read engine does.
+    pub engine: Capabilities,
+    /// What each of its engines does. Empty from a server that predates the list.
+    #[serde(default)]
+    pub engines: Vec<Capabilities>,
+    /// Whether it runs SQL over files.
+    #[serde(default)]
+    pub sql_available: bool,
+}
+
 /// A client for a server speaking the Lakeleto `/v1/*` HTTP contract (`lakeleto serve`).
 pub struct RemoteEngine {
     endpoint: String,
     token: Option<String>,
     client: reqwest::blocking::Client,
     max_response_bytes: usize,
+    /// What the server said at `GET /v1/engines`, once it has said it.
+    server: Mutex<Option<Arc<ServerInfo>>>,
 }
 
 impl RemoteEngine {
@@ -152,7 +181,33 @@ impl RemoteEngine {
             token,
             client: reqwest::blocking::Client::new(),
             max_response_bytes: MAX_RESPONSE_BYTES,
+            server: Mutex::new(None),
         }
+    }
+
+    /// What the server says about itself at `GET /v1/engines`: its version, the protocol it
+    /// speaks, and what its engines do. Asked once and kept; asked again after a failure, since a
+    /// server that was down may be up.
+    pub fn server(&self, ctx: &RequestContext) -> Result<Arc<ServerInfo>> {
+        if let Some(info) = self.lock_server().clone() {
+            return Ok(info);
+        }
+        let url = self.url("v1/engines");
+        let body = self.send(ctx, self.client.get(&url), &url)?;
+        let info: ServerInfo = serde_json::from_slice(&body)
+            .map_err(|e| EngineError::Remote(format!("decoding response from {url}: {e}")))?;
+        let info = Arc::new(info);
+        *self.lock_server() = Some(info.clone());
+        Ok(info)
+    }
+
+    fn lock_server(&self) -> std::sync::MutexGuard<'_, Option<Arc<ServerInfo>>> {
+        self.server.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The server this engine sends its requests to, as it was given.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Override the response byte cap ([`MAX_RESPONSE_BYTES`]).
@@ -347,31 +402,41 @@ impl Engine for RemoteEngine {
         "remote"
     }
 
-    /// What this *client* can ask for — not a report on the server, which is not consulted here.
+    /// What the server's engines do, as `GET /v1/engines` says, less what this client can't ask
+    /// for yet.
     ///
-    /// `sql: true` is the honest reading of that: `query`/`query_capped` are implemented and
-    /// will issue `POST /v1/query`. Whether the peer can answer is the peer's answer to give,
-    /// and it gives a good one — a server built without the `sql` feature replies `501` with a
-    /// body naming the missing feature, which [`Self::send`] surfaces verbatim. The server does
-    /// publish the truth as `sql_available` on `GET /v1/engines`, but reading it would put a
-    /// network round trip (and a failure mode) inside an infallible accessor, and the answer
-    /// would still be a guess by the time a query was actually issued. `formats` says
-    /// `server-defined` for the same reason.
+    /// The formats are the server's read engine's, and `sql` is whether the server runs SQL.
+    /// `scan` and `filtered_stats` stay false whatever the server does, because this client
+    /// doesn't implement either: a grid window needs `scan`, and `stats` would drop its filters.
+    ///
+    /// The server is asked once, through [`Self::server`], and the answer is kept. One that
+    /// doesn't answer within [`CAPABILITIES_TIMEOUT`], because it is down or serves only part of
+    /// `/v1` as a hosted plane does, is reported as capabilities unknown: no formats, no SQL.
+    /// Its methods still send their requests, and the server answers each in its own words.
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            // Not "Lakeleto Cloud": this points at whatever speaks the `/v1/*` contract, which
-            // today means a `lakeleto serve`. Naming the endpoint says more than a brand would.
-            engine: format!("remote (HTTP @ {})", self.endpoint),
-            formats: vec!["server-defined".to_string()],
-            sql: true,
-            profile: true,
-            remote: true,
-            // Neither is implemented here: `scan` needs a `ScanSpec` encoder (now available —
-            // `FilterSpec::to_wire` — but the method is still unwritten), and `stats` inherits
-            // the filter-dropping default. Both previously read as capable because the struct
-            // had no bit for either, which is how a client discovered the gap by taking a 501.
-            scan: false,
-            filtered_stats: false,
+        // Not "Lakeleto Cloud": this points at whatever speaks the `/v1/*` contract, which today
+        // means a `lakeleto serve`. Naming the endpoint says more than a brand would.
+        let engine = format!("remote (HTTP @ {})", self.endpoint);
+        let ctx = RequestContext::detached().with_timeout(CAPABILITIES_TIMEOUT);
+        match self.server(&ctx) {
+            Ok(server) => Capabilities {
+                engine,
+                formats: server.engine.formats.clone(),
+                sql: server.sql_available,
+                profile: server.engine.profile,
+                remote: true,
+                scan: false,
+                filtered_stats: false,
+            },
+            Err(_) => Capabilities {
+                engine: format!("{engine}, capabilities unknown"),
+                formats: Vec::new(),
+                sql: false,
+                profile: false,
+                remote: true,
+                scan: false,
+                filtered_stats: false,
+            },
         }
     }
 

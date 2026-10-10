@@ -18,14 +18,15 @@ Install it with Cargo, fetch a prebuilt binary, or run the container for the
 ```sh
 # from a checkout of this crate:
 cargo install --path .                       # local reader only (lean default)
-cargo install --path . --features serve,sql,iceberg,object-store   # full: UI + SQL + Iceberg + cloud reads
+cargo install --path . --features serve,sql,iceberg,object-store,catalog   # UI + SQL + Iceberg + cloud reads + catalogs
 
 # or build in place:
 cargo build --release --bin lakeleto --features serve,sql   # → target/release/lakeleto
 ```
 
-Default builds pull only `arrow`/`parquet`/`csv` (no C++ toolchain, no async runtime, no
-server). Add only the [features](./CONFIG.md#feature-flags) you need.
+Default builds read Parquet, CSV/TSV, JSON and Arrow IPC with pure-Rust crates (no C++
+toolchain, no async runtime, no server). Add only the [features](./CONFIG.md#feature-flags)
+you need.
 
 ## Prebuilt binary (`cargo binstall`)
 
@@ -52,15 +53,19 @@ on your `PATH`:
 
 ```sh
 curl -sSL -o lakeleto.tar.gz \
-  https://github.com/lucheeseng827/lakeleto/releases/download/v0.1.0/lakeleto-x86_64-unknown-linux-musl.tar.gz
+  https://github.com/lucheeseng827/lakeleto/releases/latest/download/lakeleto-x86_64-unknown-linux-musl.tar.gz
 tar xzf lakeleto.tar.gz
 ./lakeleto schema data/events.parquet
 ```
 
 ## Container (`docker run`)
 
-The image ships the binary built with `--features serve,sql,iceberg,object-store` on a
-distroless static base ([`Dockerfile`](../Dockerfile)). `serve` binds loopback *inside*
+The published image, `mancube/lakeleto`, ships the release binary on a distroless static base
+([`Dockerfile.release`](../Dockerfile.release)), so it has the release feature set:
+`serve,sql,iceberg,object-store,catalog,sqlite,postgres,mysql,delta,mcp,remote,parquet-out,compression`.
+Older tags have fewer: `v0.3.0` has `serve,sql,iceberg,object-store,sqlite,postgres,mysql,delta`.
+The [`Dockerfile`](../Dockerfile) builds an x86_64 image from source instead, with
+`serve,sql,iceberg,object-store,catalog,mcp,compression`. `serve` binds loopback *inside*
 the container, so pass `--addr 0.0.0.0:8080` to make it reachable and publish the port to
 **loopback on the host**:
 
@@ -98,5 +103,6 @@ docker run --rm -p 127.0.0.1:8080:8080 lakeleto:dev serve --addr 0.0.0.0:8080
 ## Upgrade / rollback
 
 Stateless swap: replace the binary (or bump the image tag) and restart. The only on-disk
-state is the workspace store under `~/.lakeleto` (saved queries + cached results); back it
-up if it matters. There is no on-disk migration in 0.1.x.
+state is the workspace store under `~/.lakeleto` (saved queries + cached results), beside
+the `catalogs.toml` you may keep there; back them up if they matter. No release through
+0.4.0 has migrated on-disk state.

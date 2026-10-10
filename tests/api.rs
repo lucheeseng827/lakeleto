@@ -11,6 +11,7 @@ use tower::ServiceExt; // oneshot
 use lakeleto::api::router;
 use lakeleto::engine::Engine;
 use lakeleto::workspace::{LocalStore, WorkspaceStore};
+use lakeleto::EngineRegistry;
 use lakeleto::LocalReaderEngine;
 use lakeleto::RequestContext;
 
@@ -25,16 +26,21 @@ fn generic_store() -> Arc<dyn WorkspaceStore> {
 
 fn app() -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
-    router(read, None, None, 10_000, None, None, true, generic_store())
+    router(
+        EngineRegistry::new(read),
+        10_000,
+        None,
+        None,
+        true,
+        generic_store(),
+    )
 }
 
 fn app_auth(token: &str) -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
     // loopback = true, so the `?token=` query form is accepted (the local browser flow).
     router(
-        read,
-        None,
-        None,
+        EngineRegistry::new(read),
         10_000,
         Some(token.to_string()),
         None,
@@ -48,9 +54,7 @@ fn app_auth(token: &str) -> axum::Router {
 fn app_auth_net(token: &str) -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
     router(
-        read,
-        None,
-        None,
+        EngineRegistry::new(read),
         10_000,
         Some(token.to_string()),
         None,
@@ -65,9 +69,7 @@ fn app_root(root: std::path::PathBuf) -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
     let root = std::fs::canonicalize(&root).unwrap();
     router(
-        read,
-        None,
-        None,
+        EngineRegistry::new(read),
         10_000,
         None,
         Some(root),
@@ -80,7 +82,7 @@ fn app_root(root: std::path::PathBuf) -> axum::Router {
 /// token, no root — pass a store shared across requests within a test to observe persistence.
 fn app_store(store: Arc<dyn WorkspaceStore>) -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
-    router(read, None, None, 10_000, None, None, true, store)
+    router(EngineRegistry::new(read), 10_000, None, None, true, store)
 }
 
 async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
@@ -244,6 +246,39 @@ async fn rows_endpoint_filters() {
         get_json(&format!("/v1/rows?path={CSV}&filter=city:contains:London")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["matched_rows"].as_u64().unwrap(), 2);
+}
+
+/// `/v1/rows` shows a timestamp labelled `UTC`, as pandas and pyarrow label tz-aware UTC data, and
+/// filters on the text it shows, in a build with no time zone database as in one with it.
+#[tokio::test]
+async fn rows_endpoint_shows_and_filters_a_utc_timestamp() {
+    use arrow_array::{ArrayRef, RecordBatch, TimestampMicrosecondArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("events.parquet");
+    let at = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let schema = Arc::new(Schema::new(vec![Field::new("at", at, true)]));
+    let values =
+        TimestampMicrosecondArray::from(vec![1_704_164_645_123_456, 1_719_791_999_000_000])
+            .with_timezone("UTC");
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values) as ArrayRef]).unwrap();
+    let file = std::fs::File::create(&path).unwrap();
+    let mut w = parquet::arrow::ArrowWriter::try_new(file, schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let path = path.display();
+
+    let (status, json) = get_json(&format!("/v1/rows?path={path}")).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json["rows"][0]["at"], "2024-01-02T03:04:05.123456Z",
+        "{json}"
+    );
+    assert_eq!(json["rows"][1]["at"], "2024-06-30T23:59:59Z", "{json}");
+
+    let (status, json) = get_json(&format!("/v1/rows?path={path}&filter=at:contains:59Z")).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["matched_rows"], 1, "{json}");
 }
 
 #[tokio::test]
@@ -1182,9 +1217,7 @@ async fn workspace_run_is_confined_by_root() {
     let root = tempfile::tempdir().unwrap();
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
     let confined = router(
-        read,
-        None,
-        None,
+        EngineRegistry::new(read),
         10_000,
         None,
         Some(std::fs::canonicalize(root.path()).unwrap()),
@@ -1479,17 +1512,15 @@ async fn export_writes_a_nested_column_as_json_text() {
 }
 
 /// A router with the SQL engine wired, which is what a real `serve --features sql` is. It matters
-/// for filters specifically: `scan_engine` routes any non-plain window over a format DataFusion can
-/// read — i.e. every filtered scan of a CSV/Parquet source — to DataFusion, so the SQL `WHERE`
-/// builder, not the Arrow kernel path, answers them.
+/// for filters specifically: the engine registry routes any non-plain window over a format
+/// DataFusion can read — i.e. every filtered scan of a CSV/Parquet source — to DataFusion, so the
+/// SQL `WHERE` builder, not the Arrow kernel path, answers them.
 #[cfg(feature = "sql")]
 fn app_sql() -> axum::Router {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
     let sql: Arc<dyn Engine> = Arc::new(lakeleto::engine::sql::DataFusionEngine::new());
     router(
-        read,
-        Some(sql),
-        None,
+        EngineRegistry::new(read).with_sql(sql),
         10_000,
         None,
         None,
@@ -1578,7 +1609,7 @@ async fn get_json_from(app: axum::Router, uri: &str) -> (StatusCode, serde_json:
 
 /// A JSON grid in a `sql` build — what every release binary and the Docker image are.
 ///
-/// `scan_engine` used to send every sorted or filtered window to DataFusion, which could not
+/// The API used to send every sorted or filtered window to DataFusion, which could not
 /// register JSON then, so sorting or filtering *any* column of a `.json`/`.ndjson` file failed
 /// with "the `sql` engine cannot read json sources yet" — in the builds users download, while the
 /// lean build (no SQL engine, so the local reader answered) worked. The default `app()` has no SQL
@@ -1924,6 +1955,137 @@ async fn engines_reports_the_limits_it_will_enforce() {
     }
 }
 
+/// `GET /v1/engines` from `app`, as JSON.
+async fn engines_of(app: axum::Router) -> serde_json::Value {
+    let r = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/engines")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+/// The `engine` name of every entry in a `/v1/engines` answer's `engines` list.
+#[cfg(any(feature = "sql", feature = "sqlite"))]
+fn engine_names(engines: &serde_json::Value) -> Vec<String> {
+    engines["engines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["engine"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The endpoints a `/v1/engines` answer advertises.
+fn advertised(engines: &serde_json::Value) -> Vec<String> {
+    engines["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn engines_names_the_protocol_and_every_engine() {
+    let engines = engines_of(app()).await;
+    assert_eq!(engines["protocol"], lakeleto::protocol::PROTOCOL_VERSION);
+    assert_eq!(engines["protocol"], "1.0");
+    // A server that only reads has one engine, and it is the one `engine` names.
+    assert_eq!(engines["engines"].as_array().unwrap().len(), 1);
+    assert_eq!(engines["engines"][0], engines["engine"]);
+    // No engine here runs SQL, so the query endpoint, which would answer every request with a
+    // 501, isn't offered. Everything else is.
+    let endpoints = advertised(&engines);
+    assert!(
+        !endpoints.iter().any(|e| e == "POST /v1/query"),
+        "{endpoints:?}"
+    );
+    assert!(endpoints.iter().any(|e| e == "GET /v1/engines"));
+    assert!(endpoints.iter().any(|e| e.starts_with("GET /v1/rows")));
+}
+
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn engines_lists_the_sql_engine_after_the_read_engine() {
+    let engines = engines_of(app_sql()).await;
+    assert_eq!(
+        engine_names(&engines),
+        ["local (built-in reader)", "sql (DataFusion)"]
+    );
+    assert_eq!(engines["engines"][1]["sql"], true);
+    assert_eq!(engines["sql_available"], true);
+    assert!(advertised(&engines).iter().any(|e| e == "POST /v1/query"));
+}
+
+/// A server with a database engine and no SQL engine runs SQL on databases only. It offers the
+/// query endpoint, and says it has no SQL over files.
+#[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn a_server_with_only_a_database_engine_offers_queries_but_no_sql_over_files() {
+    let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
+    let dbe: Arc<dyn Engine> = Arc::new(lakeleto::engine::database::DatabaseEngine::new());
+    let engines = engines_of(router(
+        EngineRegistry::new(read).with_database(dbe),
+        10_000,
+        None,
+        None,
+        true,
+        generic_store(),
+    ))
+    .await;
+    let names = engine_names(&engines);
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names[1].starts_with("database ("), "{names:?}");
+    assert_eq!(engines["sql_available"], false);
+    assert!(advertised(&engines).iter().any(|e| e == "POST /v1/query"));
+}
+
+/// Every response says which protocol the server speaks, so a client learns it from whatever it
+/// asked first: an answer, the health check, the page, an error, a route that doesn't exist, and
+/// a request the token gate refused.
+#[tokio::test]
+async fn every_response_names_the_protocol() {
+    for (app, uri, status) in [
+        (app(), "/v1/engines".to_string(), StatusCode::OK),
+        (app(), "/healthz".to_string(), StatusCode::OK),
+        (app(), "/".to_string(), StatusCode::OK),
+        (
+            app(),
+            "/v1/schema?path=/no/such/file.parquet".to_string(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            app(),
+            "/v1/no-such-route".to_string(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            app_auth("s3cret"),
+            format!("/v1/schema?path={CSV}"),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let r = app
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), status, "{uri}");
+        assert_eq!(
+            r.headers()
+                .get(lakeleto::protocol::PROTOCOL_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(lakeleto::protocol::PROTOCOL_VERSION),
+            "{uri}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn preview_and_profile_clamp_a_caller_limit_to_the_query_cap() {
     // `POST /v1/query` was bounded, but `GET /v1/preview?limit=` and `GET /v1/profile?scan=` took
@@ -2091,6 +2253,31 @@ async fn info_reports_a_size_for_a_local_file() {
     assert_eq!(json["format"], "csv");
 }
 
+/// `GET /v1/info` answers in the shape `lakeleto info -o json` prints (`render::SourceInfo`): these
+/// keys, in this order, with `credentials` only for a catalog table.
+#[tokio::test]
+async fn info_answers_in_the_shape_lakeleto_info_prints() {
+    let (status, json) = get_json(&format!("/v1/info?path={CSV}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "path",
+            "format",
+            "engine",
+            "size_bytes",
+            "row_count",
+            "columns"
+        ]
+    );
+}
+
 /// A [`WorkspaceStore`] double that records whether any call ever HANDED IT result rows. This is
 /// the strongest statement a router-level test can make about egress: the store trait is the only
 /// door result bytes leave through (`RemoteStore` is just this trait over HTTP), so "the store was
@@ -2195,9 +2382,7 @@ async fn an_uncached_run_never_hands_result_rows_to_the_store() {
     let router = || {
         let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
         lakeleto::api::router(
-            read,
-            None,
-            None,
+            EngineRegistry::new(read),
             10_000,
             None,
             None,
@@ -2263,9 +2448,7 @@ async fn the_query_cap_binds_the_database_engine_too() {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
     let dbe: Arc<dyn Engine> = Arc::new(lakeleto::engine::database::DatabaseEngine::new());
     let app = router(
-        read,
-        None,
-        Some(dbe),
+        EngineRegistry::new(read).with_database(dbe),
         10_000,
         None,
         None,
@@ -2321,11 +2504,12 @@ async fn the_query_cap_binds_the_database_engine_too() {
 /// execution plan. If those two ever drifted in a way the check treats as a mismatch, every
 /// Arrow response from a `--features sql` server would turn into a 400 — a worse bug than the
 /// one the check exists to prevent. Both DataFusion-backed Arrow paths are pinned here: the
-/// filtered `/v1/rows` scan (which `scan_engine` routes to DataFusion) and `POST /v1/query`.
+/// filtered `/v1/rows` scan (which the engine registry routes to DataFusion) and `POST /v1/query`.
 #[tokio::test]
 #[cfg(feature = "sql")]
 async fn datafusion_results_still_encode_on_the_arrow_arm() {
-    // A filtered window: `scan_engine` sends this to DataFusion rather than the Arrow kernels.
+    // A filtered window: the engine registry sends this to DataFusion rather than the Arrow
+    // kernels.
     let r = app_sql()
         .oneshot(
             Request::builder()
@@ -2590,4 +2774,29 @@ async fn an_empty_streamed_result_is_still_a_valid_ipc_stream() {
         !rb.schema.fields().is_empty(),
         "the schema travels even with no rows — a client still needs the columns"
     );
+}
+
+/// A catalog reference is not a path under `--root`, so it is refused before anything resolves it,
+/// whether or not the build reads catalogs: as a source, and as a directory to browse.
+#[tokio::test]
+async fn a_catalog_reference_is_refused_under_root() {
+    let root = tempfile::tempdir().unwrap();
+    for uri in [
+        "/v1/schema?path=catalog%3A%2F%2Fprod%2Fsales%2Forders",
+        "/v1/preview?path=catalog%3A%2F%2Fprod%2Fsales%2Forders",
+        "/v1/list?dir=catalog%3A%2F%2F",
+        "/v1/list?dir=catalog%3A%2F%2Fprod%2Fsales%2F",
+    ] {
+        let r = app_root(root.path().to_path_buf())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{uri}");
+        let body = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("outside the server root"),
+            "{uri}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 }

@@ -70,13 +70,15 @@ fn one_shot_server() -> (SocketAddr, mpsc::Receiver<String>) {
 
 fn head_cli(path: &str, remote_url: Option<String>, format: Option<&str>) -> Cli {
     Cli {
-        output: Output::Table,
+        output: Some(Output::Table),
+        out: None,
         engine: EngineChoice::Auto,
         remote_url,
         remote_token: None,
         format: format.map(str::to_string),
         json_path: None,
         flatten: None,
+        max_decompressed: lakeleto::source::DEFAULT_MAX_DECOMPRESSED,
         cmd: Cmd::Head {
             path: path.into(),
             rows: 3,
@@ -209,5 +211,23 @@ fn the_rule_follows_the_engine_not_the_url() {
     assert!(
         msg.contains("io error") || msg.contains("unsupported format"),
         "expected a local resolution failure, got: {msg}"
+    );
+}
+
+/// `lakeleto engines --remote-url` asks the server what it runs, and a server that can't say fails
+/// the command with its own message.
+#[test]
+fn engines_asks_the_server_what_it_runs() {
+    let (addr, rx) = one_shot_server();
+    let mut cli = head_cli(OPAQUE_REF, Some(format!("http://{addr}")), None);
+    cli.cmd = Cmd::Engines;
+    let err = lakeleto::cli::run(cli).expect_err("the stub server answers 404");
+    assert!(err.to_string().contains("/v1/engines"), "{err}");
+    let request = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the client must actually have sent a request");
+    assert!(
+        request.starts_with("GET /v1/engines HTTP/1.1"),
+        "unexpected request: {request}"
     );
 }

@@ -86,12 +86,18 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// An Arrow error. Parquet's error for a page compressed with a codec this build lacks reaches
+    /// here too, from the Parquet reader, and becomes the refusal that names the feature.
     pub fn arrow(e: arrow_schema::ArrowError) -> Self {
-        EngineError::Arrow(e.to_string())
+        let message = e.to_string();
+        undecodable_parquet(&message).unwrap_or(EngineError::Arrow(message))
     }
 
+    /// A Parquet error, a page compressed with a codec this build lacks named for the feature that
+    /// decodes it.
     pub fn parquet(e: parquet::errors::ParquetError) -> Self {
-        EngineError::Parquet(e.to_string())
+        let message = e.to_string();
+        undecodable_parquet(&message).unwrap_or(EngineError::Parquet(message))
     }
 
     pub fn unsupported_format(format: Format, engine: &str) -> Self {
@@ -129,4 +135,83 @@ impl EngineError {
     }
 }
 
+/// The Parquet codecs a build decompresses with the `compression` feature: the name parquet's error
+/// gives the feature it was built without, and the codec's. Every build has Snappy, gzip and LZ4.
+const COMPRESSION_PARQUET_CODECS: [(&str, &str); 2] = [("zstd", "zstd"), ("brotli", "Brotli")];
+
+/// The Parquet codecs a build without `compression` decompresses: `iceberg` has zstd, which it
+/// links for Avro manifests. (A build with `sql` has all five, through DataFusion.)
+const PARQUET_CODECS_WITHOUT_COMPRESSION: &str = if cfg!(feature = "iceberg") {
+    "Snappy, gzip, LZ4 and zstd"
+} else {
+    "Snappy, gzip and LZ4"
+};
+
+/// The refusal for a Parquet page compressed with a codec this build lacks, when `message` holds
+/// parquet's error for one (`Disabled feature at compile time: zstd`); `None` for any other.
+/// Parquet's words name a feature of parquet's, which no Lakeleto user can turn on; this names
+/// Lakeleto's. zstd is Polars' default, so it is the one met most.
+fn undecodable_parquet(message: &str) -> Option<EngineError> {
+    let (_, lacking) = message.split_once("Disabled feature at compile time: ")?;
+    let &(_, codec) = COMPRESSION_PARQUET_CODECS
+        .iter()
+        .find(|(feature, _)| lacking.starts_with(feature))?;
+    Some(EngineError::UnsupportedFormat {
+        detail: format!(
+            "this Parquet file's pages are {codec}-compressed, and this build decompresses \
+             {PARQUET_CODECS_WITHOUT_COMPRESSION} only: {codec} needs the `compression` feature \
+             (`cargo install lakeleto --features compression`), which the release binaries and \
+             the image have ({message})"
+        ),
+    })
+}
+
 pub type Result<T> = std::result::Result<T, EngineError>;
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::ArrowError;
+    use parquet::errors::ParquetError;
+
+    use super::*;
+
+    /// Parquet's error for a page compressed with a codec it was built without, as its reader
+    /// returns it; `tests/parquet_codecs.rs` reads such a file to pin the words.
+    fn lacking(feature: &str) -> ParquetError {
+        ParquetError::General(format!("Disabled feature at compile time: {feature}"))
+    }
+
+    /// A Parquet codec this build lacks is refused naming the feature that decodes it, whether
+    /// parquet's error arrives as itself or as the Arrow reader hands it on.
+    #[test]
+    fn a_parquet_codec_this_build_lacks_is_refused_naming_the_feature() {
+        for (feature, codec) in [("zstd", "zstd"), ("brotli", "Brotli")] {
+            let wrapped = ArrowError::from(lacking(feature));
+            for refusal in [
+                EngineError::parquet(lacking(feature)),
+                EngineError::arrow(wrapped),
+            ] {
+                let EngineError::UnsupportedFormat { detail } = &refusal else {
+                    panic!("{feature}: {refusal}");
+                };
+                assert!(detail.contains(&format!("{codec}-compressed")), "{detail}");
+                assert!(detail.contains("--features compression"), "{detail}");
+                assert!(detail.contains(&lacking(feature).to_string()), "{detail}");
+            }
+        }
+    }
+
+    /// Any other error is passed on as it is, a codec every build has included.
+    #[test]
+    fn other_errors_are_passed_on() {
+        let missing_snappy = "Disabled feature at compile time: snap";
+        assert!(matches!(
+            EngineError::parquet(ParquetError::General(missing_snappy.into())),
+            EngineError::Parquet(m) if m.contains(missing_snappy)
+        ));
+        assert!(matches!(
+            EngineError::arrow(ArrowError::ComputeError("no kernel".into())),
+            EngineError::Arrow(m) if m.contains("no kernel")
+        ));
+    }
+}

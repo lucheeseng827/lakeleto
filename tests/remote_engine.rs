@@ -25,7 +25,7 @@ use lakeleto::engine::remote::RemoteEngine;
 use lakeleto::engine::Engine;
 use lakeleto::workspace::{LocalStore, WorkspaceStore};
 use lakeleto::RequestContext;
-use lakeleto::{LocalReaderEngine, NamedSource, Source};
+use lakeleto::{EngineRegistry, LocalReaderEngine, NamedSource, Source};
 
 /// 2^53 + 1 — the smallest integer an IEEE-754 double cannot represent. Any client that routes
 /// this column through a JSON number rounds it to 9007199254740992; the Arrow arm must not.
@@ -96,7 +96,11 @@ async fn serve_with_token(
     token: Option<String>,
 ) -> std::net::SocketAddr {
     let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
-    let app = router(read, sql, None, 10_000, token, None, true, store());
+    let engines = match sql {
+        Some(sql) => EngineRegistry::new(read).with_sql(sql),
+        None => EngineRegistry::new(read),
+    };
+    let app = router(engines, 10_000, token, None, true, store());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -585,4 +589,225 @@ fn a_database_source_is_refused_before_it_can_reach_a_peer() {
             );
         }
     }
+}
+
+/// Serve `app` on an ephemeral port, for a stand-in that is not a `lakeleto serve`.
+async fn serve_app(app: axum::Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// The client's capabilities are the server's, as `GET /v1/engines` reports them, less what the
+/// client doesn't implement. None of it is made up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capabilities_are_the_servers_as_v1_engines_reports_them() {
+    let addr = serve(None).await;
+    tokio::task::spawn_blocking(move || {
+        let engine = RemoteEngine::new(format!("http://{addr}"), None);
+        assert_eq!(engine.endpoint(), format!("http://{addr}"));
+        let caps = engine.capabilities();
+        assert_eq!(caps.engine, format!("remote (HTTP @ http://{addr})"));
+        assert_eq!(caps.formats, lakeleto::engine::readable_formats());
+        assert!(!caps.sql, "the server has no SQL engine");
+        assert!(caps.profile && caps.remote);
+        assert!(
+            !caps.scan && !caps.filtered_stats,
+            "this client implements neither, whatever the server does"
+        );
+
+        let server = engine.server(&RequestContext::detached()).unwrap();
+        assert_eq!(
+            server.protocol.as_deref(),
+            Some(lakeleto::protocol::PROTOCOL_VERSION)
+        );
+        assert_eq!(server.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(server.engines.len(), 1);
+        assert!(server.engines[0].scan, "the server's own engine scans");
+    })
+    .await
+    .unwrap();
+}
+
+/// `lakeleto engines --remote-url` against a live server lists it, and succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engines_lists_a_live_server() {
+    let addr = serve(None).await;
+    tokio::task::spawn_blocking(move || {
+        let cli = lakeleto::cli::Cli {
+            output: Some(lakeleto::render::Output::Table),
+            out: None,
+            engine: lakeleto::cli::EngineChoice::Auto,
+            remote_url: Some(format!("http://{addr}")),
+            remote_token: None,
+            format: None,
+            json_path: None,
+            flatten: None,
+            max_decompressed: lakeleto::source::DEFAULT_MAX_DECOMPRESSED,
+            cmd: lakeleto::cli::Cmd::Engines,
+        };
+        assert_eq!(lakeleto::cli::run(cli).unwrap(), 0);
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_that_runs_sql_is_reported_as_running_it() {
+    use lakeleto::engine::sql::DataFusionEngine;
+
+    let addr = serve(Some(Arc::new(DataFusionEngine::new()))).await;
+    tokio::task::spawn_blocking(move || {
+        let engine = RemoteEngine::new(format!("http://{addr}"), None);
+        assert!(engine.capabilities().sql);
+        let server = engine.server(&RequestContext::detached()).unwrap();
+        let names: Vec<&str> = server.engines.iter().map(|e| e.engine.as_str()).collect();
+        assert_eq!(names, ["local (built-in reader)", "sql (DataFusion)"]);
+    })
+    .await
+    .unwrap();
+}
+
+/// A server that serves part of `/v1` and no `/v1/engines`, as a hosted plane does: the client
+/// reports its capabilities as unknown rather than guessing them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_without_v1_engines_has_unknown_capabilities() {
+    let app = axum::Router::new().route("/v1/preview", axum::routing::get(|| async { "" }));
+    let addr = serve_app(app).await;
+    tokio::task::spawn_blocking(move || {
+        let engine = RemoteEngine::new(format!("http://{addr}"), None);
+        let caps = engine.capabilities();
+        assert_eq!(
+            caps.engine,
+            format!("remote (HTTP @ http://{addr}), capabilities unknown")
+        );
+        assert!(caps.formats.is_empty(), "{:?}", caps.formats);
+        assert!(!caps.sql && !caps.profile && !caps.scan && !caps.filtered_stats);
+        assert!(caps.remote);
+        let err = engine
+            .server(&RequestContext::detached())
+            .expect_err("there is no /v1/engines to answer");
+        assert!(err.to_string().contains("/v1/engines"), "{err}");
+    })
+    .await
+    .unwrap();
+}
+
+/// The server is asked once and its answer kept; an ask that failed is made again, since a server
+/// that was down may be up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_servers_answer_is_kept_and_a_failed_ask_is_made_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    // Fails the first ask and answers the rest, counting them.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = asked.clone();
+    let app = axum::Router::new().route(
+        "/v1/engines",
+        axum::routing::get(move || {
+            let counter = counter.clone();
+            async move {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::Json(serde_json::json!({ "error": "warming up" })),
+                    )
+                        .into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "version": "9.9.9",
+                    "protocol": "1.3",
+                    "engine": {
+                        "engine": "reader",
+                        "formats": ["parquet"],
+                        "sql": false,
+                        "profile": true,
+                        "remote": false,
+                    },
+                    "sql_available": true,
+                    "a field this client has never heard of": [1, 2, 3],
+                }))
+                .into_response()
+            }
+        }),
+    );
+    let addr = serve_app(app).await;
+    tokio::task::spawn_blocking(move || {
+        let engine = RemoteEngine::new(format!("http://{addr}"), None);
+        let ctx = RequestContext::detached();
+        let err = engine.server(&ctx).expect_err("the first ask fails");
+        assert!(err.to_string().contains("warming up"), "{err}");
+
+        let caps = engine.capabilities();
+        assert_eq!(caps.formats, ["parquet"]);
+        assert!(caps.sql && caps.profile);
+        let server = engine.server(&ctx).unwrap();
+        engine.capabilities();
+        assert_eq!(server.protocol.as_deref(), Some("1.3"));
+        assert_eq!(server.version.as_deref(), Some("9.9.9"));
+        assert!(server.engines.is_empty(), "this server predates the list");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "asked again after the failure, then never again"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// A server can read through another one. A `lakeleto serve` whose read engine is remote reports
+/// the far server's formats at `/v1/engines`, asking for them off its async threads, where the
+/// blocking client may wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_reading_through_another_reports_the_far_servers_formats() {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let far = serve(None).await;
+    // Built, and below dropped, where the blocking client may build and drop its runtime.
+    let remote = tokio::task::spawn_blocking(move || {
+        Arc::new(RemoteEngine::new(format!("http://{far}"), None)) as Arc<dyn Engine>
+    })
+    .await
+    .unwrap();
+    let near = router(
+        EngineRegistry::new(remote.clone()),
+        10_000,
+        None,
+        None,
+        true,
+        store(),
+    );
+    let r = near
+        .oneshot(
+            Request::builder()
+                .uri("/v1/engines")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        json["engine"]["engine"],
+        format!("remote (HTTP @ http://{far})")
+    );
+    assert_eq!(
+        json["engine"]["formats"],
+        serde_json::json!(lakeleto::engine::readable_formats())
+    );
+    tokio::task::spawn_blocking(move || drop(remote))
+        .await
+        .unwrap();
 }

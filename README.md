@@ -7,15 +7,15 @@ see the schema, a clean row preview, and per-column profiles **near-instantly** 
 upload, no server, offline. A single static binary that runs on your laptop or inside a
 locked-down CI runner. (`.tsv` is read tab-delimited; `--format tsv` forces it for any name.)
 
-> **Status: v0.3.0 — released 2026-10-03 (lakeleto).** *Low-Med MVP, "fastest to lovable,"
+> **Status: v0.4.0 — released 2026-10-10 (lakeleto).** *Low-Med MVP, "fastest to lovable,"
 > engine is a commodity → pure UX.* The MVP
-> ships the lean, pure-Rust **local reader** engine (`arrow` + `parquet` + `csv`) behind a
+> ships the lean, pure-Rust **local reader** engine (Parquet, CSV/TSV, JSON and Arrow IPC) behind a
 > single [`Engine`](src/engine/mod.rs) trait, with `schema` / `head` / `profile` / `info`
 > commands, table/JSON/NDJSON/CSV output, a virtualized-grid SPA (`--features serve`), an
 > opt-in DataFusion **SQL** engine (`--features sql`, read-only), a self-contained **Iceberg**
 > reader (`--features iceberg`), **BYO-credential `s3://`/`gs://`/`az://` reads**
 > (`--features object-store`), and the **Lakeleto Cloud** engine seam (`--features
-> remote`). Last updated 2026-10-03.
+> remote`). Last updated 2026-10-10.
 
 ## Why it exists
 
@@ -30,6 +30,10 @@ Two load-bearing seams, both traits: [`Engine`](src/engine/mod.rs) carries **rea
 [`WorkspaceStore`](src/workspace.rs) carries the **workbench** (connections, saved queries,
 run history + cached results). Everything above a seam binds only to the trait, so every
 backend below it is swappable — including a hosted cloud one.
+
+A third trait, [`Catalog`](src/catalog/mod.rs), says what a table's name refers to and what lives
+under it. Its one implementation so far, `PathCatalog`, is Lakeleto's format detection and
+directory browsing, for names that are paths, object-store URIs or database URIs.
 
 [![Lakeleto system context](docs/images/architecture-system-context.png)](docs/images/architecture-system-context.png)
 
@@ -52,13 +56,13 @@ flowchart LR
         GUARD["--root confinement<br/>(confine_entry / confine_members)"]
     end
     subgraph engines ["trait Engine (reads)"]
-        LOCAL["LocalReaderEngine<br/>arrow + parquet + csv (default)"]
+        LOCAL["LocalReaderEngine<br/>Parquet · CSV/TSV · JSON · Arrow IPC (default)"]
         SQL["DataFusionEngine<br/>(--features sql, read-only)"]
         REMOTE["RemoteEngine → Lakeleto Cloud<br/>(--features remote)"]
     end
     subgraph stores ["trait WorkspaceStore (workbench)"]
         LS["LocalStore<br/>JSON docs + Parquet result cache"]
-        CS["CloudStore (ee/, later)<br/>team-synced, same contract"]
+        CS["RemoteStore → Lakeleto Cloud<br/>(--features remote), same contract"]
     end
     DATA[("Parquet / CSV / Iceberg<br/>local disk or s3://gs://az://")]
     HOME[("~/.lakeleto/workspaces/&lt;id&gt;/<br/>workspace.json · history.jsonl · results/*.parquet")]
@@ -134,7 +138,7 @@ brew install lucheeseng827/lakeleto/lakeleto   # or: brew tap lucheeseng827/lake
 docker run --rm -p 8080:8080 -v "$PWD:/data:ro" mancube/lakeleto serve --addr 0.0.0.0:8080 --root /data
 
 # from source
-cargo install lakeleto --features serve,sql,iceberg,object-store
+cargo install lakeleto --features serve,sql,iceberg,object-store,catalog,mcp
 ```
 
 **Windows:** `cargo binstall lakeleto` pulls the `x86_64-pc-windows-msvc` zip automatically. Or download `lakeleto-x86_64-pc-windows-msvc.zip` from the release, unzip, and run `lakeleto.exe` — a single static executable, no install step.
@@ -197,7 +201,7 @@ tar xzf lakeleto-x86_64-unknown-linux-musl.tar.gz    # -> ./lakeleto
 
 Point at a file or a folder and you get, with no setup:
 
-- **Grid** — scroll the rows; type in a column's **filter** box (substring by default, or prefix `>` `<` `>=` `<=` `=` `!=` for comparisons); click a header to **sort**; click a cell to copy it; click a row for full **Row detail**.
+- **Grid** — scroll the rows, all of them: the grid reads them from the server a window at a time as you scroll; type in a column's **filter** box (substring by default, or prefix `>` `<` `>=` `<=` `=` `!=` for comparisons); click a header to **sort**; click a cell to copy it; click a row's number for full **Row detail**.
 - **Schema** — every column, its type, nullability, and the exact row count.
 - **Profile** — per-column null %, distinct count, min/max, and sample values.
 - **SQL** — run read-only `SELECT …` over the table (the current file is the table `t`).
@@ -235,6 +239,7 @@ cargo run --bin lakeleto -- engines
 
 # pipe-friendly output
 cargo run --bin lakeleto -- head examples/people.csv -o json
+cargo run --bin lakeleto -- info examples/people.csv -o json
 ```
 
 SQL is an **opt-in** upgrade (heavy DataFusion build stays out of the default binary):
@@ -261,13 +266,14 @@ cargo run --features serve,sql --bin lakeleto -- serve
 cargo run --features serve,sql --bin lakeleto -- open examples/people.csv
 ```
 
-The UI (`frontend/dist/index.html`, vanilla JS — no build step) is a **virtualized data
-grid** with a file browser, click-to-sort, per-column filters, column resize/reorder/hide,
-click-to-copy cells, and export, plus Schema / Profile / SQL tabs. The grid renders only the
-visible rows over a spacer sized to the total, fetching windows from `/v1/rows` on scroll — so
-it browses larger-than-memory Parquet. Hiding/reordering columns pushes a projection (`cols=`)
-so the fetch and the download match what's on screen. Non-API routes fall back to the SPA;
-`/v1/*` misses return `404` JSON.
+The UI (`frontend/`, React and TypeScript built by Vite into `frontend/dist/`, which the binary
+embeds) is a **virtualized data grid** with a file browser, click-to-sort, per-column filters,
+row numbers, click-to-copy cells, and export, plus Schema / Profile / SQL tabs. The grid draws
+only the rows in view, over a scroll area sized to the table, and reads them from `/v1/rows` 200
+at a time as it scrolls, sorted and filtered by the server, keeping 8,000 at most. So it scrolls
+from the first row of a two-million-row Parquet file to its last. A CSV, TSV or JSON file has no
+row count until its last window is read, so its scrollbar grows as you scroll. Non-API routes
+fall back to the SPA; `/v1/*` misses return `404` JSON.
 
 ![Lakeleto workspace — a SQL result grid over a local CSV, with the file browser and run history](docs/screenshots/lakeleto-sql-workspace.png)
 
@@ -283,7 +289,7 @@ connections — every query cached to a re-openable result.
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET`  | `/healthz` | liveness |
-| `GET`  | `/v1/engines` | serving engine capabilities + endpoint list |
+| `GET`  | `/v1/engines` | protocol version, every engine's capabilities, limits, endpoint list |
 | `GET`  | `/v1/schema?path=&format=` | columns, types, nullability, row count |
 | `GET`  | `/v1/info?path=&format=` | format, engine, size, rows, columns |
 | `GET`  | `/v1/preview?path=&limit=&format=` | first N rows as `{ columns, rows }` (or Arrow — see below) |
@@ -293,6 +299,10 @@ connections — every query cached to a re-openable result.
 | `GET`  | `/v1/export?path=&fmt=csv\|tsv\|json\|ndjson\|parquet&sort=&filter=&cols=` | current view as a download |
 | `GET`  | `/v1/list?dir=` | file browser: subdirs + readable data files |
 | `POST` | `/v1/query` | `{ sql, file?, tables[] }` → `{ columns, rows }` (or Arrow — see below; needs `sql`) |
+
+Every response names the contract it speaks in an `X-Lakeleto-Protocol` header (`1.0` today), as
+`/v1/engines` does in its `protocol` field. A minor version only adds; a change that would break a
+client would be served under `/v2`. See [CONFIG.md](docs/CONFIG.md#the-protocol-version-and-v1engines).
 
 **Rows as Arrow.** The three row-returning endpoints (`/v1/preview`, `/v1/rows`,
 `POST /v1/query`) answer JSON unless the request's `Accept` names the exact token
@@ -336,9 +346,12 @@ same way it would for its own paths. A route the server does not serve answers `
 a limit it imposes but this contract does not name (how many tables one query may register, say)
 answers `4xx` — both carrying the server's own message.
 
-Filter ops: `eq ne lt le gt ge contains` (or `= != < <= > >= ~`). With the `sql` feature, any
-sort/filter scan is **pushed into DataFusion** (`WHERE` / external `ORDER BY` / `LIMIT`/`OFFSET`
-+ exact `count(*)`) — correct and unbounded. Without it, the local reader sorts/filters with
+Filter ops: `eq ne lt le gt ge contains notcontains startswith endswith in isnull notnull` (or
+`= != < <= > >= ~ !~ ^ $`); `in` takes a comma-separated list (`status:in:new,open`). With the
+`sql` feature, a sorted or filtered window is **pushed into DataFusion** (`WHERE` / external
+`ORDER BY` / `LIMIT`/`OFFSET` + exact `count(*)`) and is exact over the whole table; an Iceberg or
+Delta table or a Parquet directory is read into memory whole for it first. A database table's
+window is pushed into the database's own SQL. Without `sql`, the local reader sorts/filters with
 Arrow kernels over a bounded working set (`scan_cap`, default 200k rows); the response's
 `bounded` flag then marks a partial view for a very large file.
 
@@ -401,19 +414,54 @@ began with. Every `Engine` op — `schema`/`head`/`profile`/grid/`export`/browse
 remote URI for free. Build without the feature and a URI gets a clear "rebuild
 with `--features object-store`" message rather than a filesystem error.
 
+## Let an AI agent read your tables: `lakeleto mcp`
+
+`lakeleto mcp` serves your tables to an AI agent over the [Model Context
+Protocol](https://modelcontextprotocol.io). Claude Code, Claude Desktop, Cursor or any other MCP
+client starts it and talks to it on stdin and stdout, and everything it can do is read:
+
+| Tool | What it answers |
+|---|---|
+| `list` | What's in a directory, an object-store prefix, a database or a catalog namespace. |
+| `describe` | What's in a table, without reading its rows: columns and types, the row count, and for a Parquet file each column's null count, min and max from its footer. |
+| `preview` | Rows, from any offset, optionally only some columns. |
+| `profile` | Per-column null %, distinct count, min/max and samples, from a bounded scan. |
+| `query` | One read-only SQL statement (`SELECT` / `WITH` / `EXPLAIN`) over the tables it names. Writes are refused. Needs `sql`, or a database driver for a database's own SQL. |
+| `catalog_ls` | The configured Iceberg REST catalogs, their namespaces and their tables. Needs `catalog`. |
+
+```bash
+# Claude Code, confined to one directory:
+claude mcp add lakeleto -- lakeleto mcp --root /path/to/data
+```
+
+`--root` confines it as it confines `serve`. A call returns at most 1,000 rows (`--max-rows`)
+and 32 KiB of JSON (`--max-bytes`), and says `truncated` when it was cut, so an agent narrows its
+question rather than filling its context. A call still running after 30 seconds (`--timeout`) is
+answered with an error: reading files stops there, but a database query that has started runs
+on to its end, and its result is dropped. It is in the release binaries and the Docker image;
+from source, build with `--features mcp`. Claude Desktop, Cursor and Docker configurations are in the
+[usage guide](docs/GUIDE.md), the tools' arguments and results in [CONFIG.md](docs/CONFIG.md).
+
 ## The one idea: an `Engine` trait
 
 Because the engine is a commodity, everything is built around a single trait
-([`src/engine/mod.rs`](src/engine/mod.rs)) and the (future) UI binds only to
-`Box<dyn Engine>`:
+([`src/engine/mod.rs`](src/engine/mod.rs)): the CLI and the API, and through the API the UI,
+read only through `dyn Engine`:
 
 | Backend | Feature | Reads | SQL | Role |
 |---------|---------|-------|-----|------|
-| `LocalReaderEngine` | *(default)* | Parquet, CSV/TSV, JSON | — | lean, pure-Rust MVP engine; compiles in seconds |
-| `DataFusionEngine` | `sql` | Parquet, CSV/TSV natively; JSON streamed through the local reader; Iceberg/Delta through it, in memory | ✅ (read-only) | the SQL power engine |
-| `RemoteEngine` | `remote` | server-defined | ✅ | the **Lakeleto Cloud** seam |
-| Iceberg reader | `iceberg` | Iceberg | — | self-contained (metadata + Avro manifests → Parquet); merge-on-read **positional + equality deletes** (sequence-number aware), compressed manifests, **schema evolution** (field-id match/cast/null-fill), **statistics/partition pruning** (skip files by manifest bounds) |
-| Object-store reads | `object-store` | remote Parquet/CSV/JSON (`s3://`/`gs://`/`az://`) | — | the local engine over your bucket with your own creds; ranged Parquet, streamed JSON and CSV, zero hosted compute |
+| `LocalReaderEngine` | *(default)* | Parquet (Snappy, gzip and LZ4 pages, and zstd/Brotli with `compression`), CSV/TSV, JSON, Arrow IPC; text compressed with gzip, and zstd/bzip2/xz with `compression` | — | lean, pure-Rust MVP engine; compiles in seconds |
+| `DataFusionEngine` | `sql` | Parquet, CSV/TSV and Arrow IPC natively; JSON and compressed text streamed through the local reader; Iceberg, Delta and Parquet directories through it, in memory | ✅ (read-only) | the SQL power engine |
+| `DatabaseEngine` | `sqlite` / `postgres` / `mysql` | a database's tables (`sqlite://`, `postgres://`, `mysql://`) | ✅ (read-only, the database's own SQL) | live databases; sort, filter and paging pushed into the database |
+| `RemoteEngine` | `remote` | the server's, from `GET /v1/engines` | the server's | the **Lakeleto Cloud** seam |
+| Iceberg reader | `iceberg` | Iceberg | — | self-contained (metadata + Avro manifests → Parquet); merge-on-read **positional + equality deletes** (scoped by sequence number, and by partition where the reader can prove two partitions differ; on a table with more than one partition spec, or with null or undecodable partition values, a delete applies anyway and can over-delete), compressed manifests, **schema evolution** (field-id match/cast/null-fill), **statistics/partition pruning** (skip files by manifest bounds) |
+| Delta reader | `delta` | Delta Lake (local) | — | self-contained: replays the `_delta_log` JSON commits (add/remove, latest schema, partition values); checkpoints are not read |
+| Object-store reads | `object-store` | remote Parquet/CSV/JSON/Arrow (`s3://`/`gs://`/`az://`) | — | the local engine over your bucket with your own creds; ranged Parquet and Arrow, streamed JSON and CSV, compressed text decompressed as it streams, zero hosted compute |
+
+One `EngineRegistry` decides which engine answers each request, for the CLI and the API alike:
+a database table goes to the database engine, SQL to the SQL engine, a sorted or filtered grid
+window to the SQL engine when it reads the table's format, and every other read to the read
+engine.
 
 **Which engine does the UI get built on first? The local one.** The hosted engine is *not* a
 separate product — it is one more `Engine`, added later, behind the same trait. That is a
@@ -443,19 +491,31 @@ lakeleto/
 ├── src/
 │   ├── main.rs                    # `lakeleto` binary
 │   ├── lib.rs                     # crate root + re-exports
-│   ├── cli.rs                     # clap surface: schema/head/profile/info/engines/query/serve/open
-│   ├── source.rs                  # format detection (directory shape → extension → magic bytes; s3:// URIs)
-│   ├── render.rs                  # table / json / ndjson / csv output
+│   ├── cli.rs                     # clap surface: schema/head/profile/info/engines/query/serve/open/mcp
+│   ├── source.rs                  # Source + Format; `Source::detect` hands off to PathCatalog
+│   ├── catalog/                   # the Catalog trait; PathCatalog: format detection (directory shape →
+│   │                              #   extension → magic bytes; s3:// URIs) and directory browsing
+│   ├── format/                    # the file readers behind one trait: CSV/TSV, JSON, Arrow IPC, and
+│   │                              #   codec.rs, which decompresses .gz/.zst/.bz2/.xz text as it is read
+│   ├── render.rs                  # table / json / ndjson / csv / tsv text; parquet / arrow / arrows bytes
 │   ├── api.rs                     # `lakeleto serve` HTTP/JSON API + embedded SPA (feature: serve)
+│   ├── mcp/                       # `lakeleto mcp`: the MCP server for agents, over stdio (feature: mcp)
+│   ├── confine.rs                 # `--root`: the confinement `serve` and `mcp` share
 │   ├── iceberg.rs                 # self-contained Iceberg reader (feature: iceberg)
 │   ├── objstore.rs                # BYO-credential s3://,gs://,az:// reads (feature: object-store)
+│   ├── workspace.rs               # the WorkspaceStore trait + LocalStore (the workbench)
+│   ├── workspace_remote.rs        # RemoteStore: the workbench on another server (feature: remote)
 │   ├── error.rs                   # one error type across the trait seam
 │   └── engine/
 │       ├── mod.rs                 # the Engine trait + shared schema/profile helpers
+│       ├── registry.rs            # EngineRegistry: which engine answers which request
 │       ├── local.rs               # LocalReaderEngine (default)
 │       ├── sql.rs                 # DataFusionEngine (feature: sql)
+│       ├── delta.rs               # self-contained Delta Lake reader (feature: delta)
+│       ├── database.rs            # DatabaseEngine, read-only (features: sqlite/postgres/mysql)
 │       └── remote.rs              # RemoteEngine — Lakeleto Cloud seam (feature: remote)
-├── frontend/dist/index.html       # the embedded SPA shell (rust-embed; build-step-free)
+├── frontend/                      # the web app: React + TypeScript in src/, built by Vite into
+│                                  #   dist/ (committed: `cargo build` needs no Node), which `serve` embeds
 └── examples/people.csv
 ```
 

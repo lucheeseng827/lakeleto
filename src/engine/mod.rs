@@ -7,7 +7,10 @@
 //! |---------|---------|-------|-----|------|
 //! | [`local::LocalReaderEngine`] | *(default)* | Parquet, CSV | no | the pure-Rust MVP engine |
 //! | `sql::DataFusionEngine` | `sql` | Parquet, CSV/TSV natively; JSON, Iceberg, Delta through the local reader | yes | the SQL power engine |
-//! | `remote::RemoteEngine` | `remote` | (server-defined) | yes | the **Lakeleto Cloud** seam |
+//! | `remote::RemoteEngine` | `remote` | the server's, from `GET /v1/engines` | the server's | the **Lakeleto Cloud** seam |
+//!
+//! Which of a process's engines answers a request is [`registry::EngineRegistry`]'s decision,
+//! for the CLI and the API alike.
 //!
 //! The (future) UI — a localhost SPA per the ROADMAP (egui/Tauri stays an option for a
 //! native shell) — is meant to hold a `Box<dyn Engine>` and never name a
@@ -18,6 +21,7 @@
 
 pub mod flatten;
 pub mod local;
+pub mod registry;
 
 // Self-contained Delta Lake reader (JSON transaction log → active Parquet files).
 #[cfg(feature = "delta")]
@@ -67,6 +71,12 @@ pub struct TableSchema {
     /// Omitted otherwise, and defaulted when a peer that predates it omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub records_path: Option<String>,
+    /// Whose credentials read the files, for a table a catalog serves from an object store:
+    /// `vended` (by the catalog, for this table), `catalog` (the storage keys configured for it) or
+    /// `ambient` (this machine's own). Omitted for every other source, and defaulted when a peer
+    /// that predates it omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<String>,
     pub columns: Vec<ColumnSchema>,
 }
 
@@ -334,6 +344,8 @@ pub trait Engine: Send + Sync {
     /// Short, stable identifier (`"local"`, `"sql"`, `"remote"`).
     fn name(&self) -> &str;
 
+    /// What this engine reads and does. A remote engine answers by asking its server, once, so
+    /// call this off an async runtime's threads, as the other methods are.
     fn capabilities(&self) -> Capabilities;
 
     /// Read just the schema (+ cheap row count) without scanning data.
@@ -672,6 +684,7 @@ pub fn build_table_schema(
         engine: engine.to_string(),
         row_count,
         records_path: None,
+        credentials: None,
         columns,
     }
 }
@@ -701,7 +714,10 @@ const SAMPLE_N: usize = 5;
 /// Column profiling over a set of already-read batches. Engine-agnostic: the local reader,
 /// the DataFusion engine, and (a decoded) remote engine all funnel through here so the
 /// stats are computed identically no matter who read the bytes.
-pub fn profile_columns(schema: &SchemaRef, batches: &[RecordBatch]) -> Vec<ColumnProfile> {
+///
+/// Values are counted and compared as they print, so a timestamp in a zone this build cannot
+/// print fails the profile, as it fails `head` (see `crate::zone`).
+pub fn profile_columns(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Vec<ColumnProfile>> {
     let opts = FormatOptions::default();
     let mut out = Vec::with_capacity(schema.fields().len());
 
@@ -724,7 +740,7 @@ pub fn profile_columns(schema: &SchemaRef, batches: &[RecordBatch]) -> Vec<Colum
         let mut max_str: Option<String> = None;
 
         for batch in batches {
-            let col = batch.column(ci);
+            let col = crate::zone::printable(batch.column(ci))?;
             let fmt = ArrayFormatter::try_new(col.as_ref(), &opts).ok();
             for row in 0..col.len() {
                 total += 1;
@@ -800,7 +816,7 @@ pub fn profile_columns(schema: &SchemaRef, batches: &[RecordBatch]) -> Vec<Colum
         });
     }
 
-    out
+    Ok(out)
 }
 
 /// How a column's min/max should be accumulated.
@@ -1056,7 +1072,8 @@ fn is_nested(dt: &DataType) -> bool {
 /// filtered at all. Nulls stay null.
 fn as_text(column: &arrow_array::ArrayRef) -> Result<StringArray> {
     if !is_nested(column.data_type()) {
-        let cast = arrow_cast::cast(column, &DataType::Utf8).map_err(EngineError::arrow)?;
+        let cast = arrow_cast::cast(&crate::zone::printable(column)?, &DataType::Utf8)
+            .map_err(EngineError::arrow)?;
         return cast
             .as_any()
             .downcast_ref::<StringArray>()
@@ -1074,6 +1091,7 @@ fn as_text(column: &arrow_array::ArrayRef) -> Result<StringArray> {
 /// A row counts as null by its logical validity, which for a dictionary also looks through to the
 /// value its key points at.
 pub(crate) fn json_text(column: &arrow_array::ArrayRef) -> Result<StringArray> {
+    let column = &crate::zone::printable(column)?;
     let field = std::sync::Arc::new(arrow_schema::Field::new(
         "",
         column.data_type().clone(),
@@ -1286,7 +1304,7 @@ mod wire_tests {
     #[test]
     fn capabilities_roundtrip_and_older_peer_defaults_to_false() {
         let caps = Capabilities {
-            engine: "local (arrow/parquet/csv reader)".to_string(),
+            engine: "local (built-in reader)".to_string(),
             formats: vec!["parquet".to_string(), "csv".to_string()],
             sql: false,
             profile: true,
@@ -1473,5 +1491,91 @@ mod sql_format_tests {
             cfg!(feature = "iceberg")
         );
         assert_eq!(sql.iter().any(|f| f == "delta"), cfg!(feature = "delta"));
+    }
+}
+
+/// A timestamp labelled `UTC` is profiled and filtered on the text it prints, in every build, and
+/// a zone the build cannot print fails the profile rather than profiling blanks. See `crate::zone`.
+#[cfg(test)]
+mod time_zone_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, StructArray, TimestampMicrosecondArray};
+    use arrow_schema::{Field, Schema, TimeUnit};
+
+    use super::*;
+    use crate::zone::has_tz_database;
+
+    /// `ts`, in `zone`, and `nested`, a struct holding it as `at`: 2024-01-02T03:04:05.123456Z,
+    /// 2024-06-30T23:59:59Z, a null, and the first again.
+    fn zoned(zone: &str) -> (SchemaRef, RecordBatch) {
+        let ts_type = DataType::Timestamp(TimeUnit::Microsecond, Some(zone.into()));
+        let ts: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![
+                Some(1_704_164_645_123_456),
+                Some(1_719_791_999_000_000),
+                None,
+                Some(1_704_164_645_123_456),
+            ])
+            .with_timezone(zone),
+        );
+        let at = Arc::new(Field::new("at", ts_type.clone(), true));
+        let nested: ArrayRef = Arc::new(StructArray::from(vec![(at.clone(), ts.clone())]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", ts_type, true),
+            Field::new("nested", DataType::Struct(vec![at].into()), true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![ts, nested]).unwrap();
+        (schema, batch)
+    }
+
+    #[test]
+    fn a_utc_column_is_profiled_as_it_prints() {
+        let (schema, batch) = zoned("UTC");
+        let profile = profile_columns(&schema, &[batch]).unwrap();
+        let ts = &profile[0];
+        assert_eq!((ts.null_count, ts.distinct), (1, 2));
+        assert_eq!(ts.min.as_deref(), Some("2024-01-02T03:04:05.123456Z"));
+        assert_eq!(ts.max.as_deref(), Some("2024-06-30T23:59:59Z"));
+        assert_eq!(
+            ts.sample,
+            [
+                "2024-01-02T03:04:05.123456Z",
+                "2024-06-30T23:59:59Z",
+                "2024-01-02T03:04:05.123456Z"
+            ]
+        );
+    }
+
+    /// The grid's filters compare the text a cell shows: Arrow's for a scalar, JSON for a struct.
+    #[test]
+    fn a_utc_column_is_filtered_on_the_text_it_prints() {
+        let (schema, batch) = zoned("UTC");
+        for column in ["ts", "nested"] {
+            let filters = [FilterSpec {
+                column: column.to_string(),
+                op: FilterOp::Contains,
+                value: "2024-06-30T23:59:59Z".to_string(),
+            }];
+            let (_, kept) =
+                filter_batches(&schema, std::slice::from_ref(&batch), &filters).unwrap();
+            let rows: usize = kept.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, 1, "{column}");
+        }
+    }
+
+    #[test]
+    fn a_zone_this_build_cannot_print_fails_the_profile() {
+        let (schema, batch) = zoned("Europe/Paris");
+        match profile_columns(&schema, &[batch]) {
+            Ok(profile) => {
+                assert!(has_tz_database());
+                assert_eq!(profile[0].max.as_deref(), Some("2024-07-01T01:59:59+02:00"));
+            }
+            Err(e) => {
+                assert!(!has_tz_database(), "{e}");
+                assert!(e.to_string().contains("`Europe/Paris`"), "{e}");
+            }
+        }
     }
 }

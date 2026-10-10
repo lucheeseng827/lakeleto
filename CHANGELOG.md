@@ -6,6 +6,270 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-10
+
+### Added
+- **Compressed text: `t.csv.gz`, `t.ndjson.zst`, `t.tsv.bz2`, `t.json.xz`.** CSV, TSV and every
+  JSON layout read as the format they hold, in the grid, `head`, `schema`, `profile` and SQL.
+  Before, such a file was refused.
+  - **gzip in every build**; zstd, bzip2 and xz with the new `compression` feature, which the
+    release binaries, the image and the installers have. A build without a codec's decoder refuses
+    the file up front, naming the feature.
+  - **Decompressed as it is read**, so the first rows of a file in an object store arrive without a
+    download. A JSON document's records member is read from the start each time: its offsets are
+    the decompressed bytes'.
+  - **`--max-decompressed`** (4 GiB unless set; env `LAKELETO_MAX_DECOMPRESSED`) stops a read that
+    inflates past it with a `too large` error, 413 from `serve`: the guard against a small file
+    that inflates without end.
+  - A file whose bytes are not what its name says fails as such: `… is not valid gzip: …`.
+  - The file browser lists compressed files, as the format they hold.
+  - SQL reads a compressed file through the reader the grid uses, a pass at a time and under the
+    same `--max-decompressed`: DataFusion's own decompression knows no limit.
+- **Arrow IPC input: `.arrow`, `.feather`, `.ipc` files and `.arrows` streams.** What pyarrow,
+  pandas, Polars and `-o arrow|arrows` write opens as a table; which framing a file has, its first
+  bytes say.
+  - **A file is read by its footer.** Its row count is exact, in `schema`, `info` and the grid's
+    scrollbar, and a window reads only the record batches it covers: from an object store by
+    ranged requests. What the footer says is kept per version of the file.
+  - **A stream** is read front to back.
+  - **Compressed buffers:** LZ4, pyarrow's Feather default, in every build, and zstd with
+    `compression`. Feather v1 files are refused, with how to rewrite them.
+  - SQL reads both framings through DataFusion. A file with no extension is recognised by its
+    `ARROW1` magic.
+- For the library: `Format::Arrow` is a new variant. `Source::require_uncompressed` is now
+  `Source::require_decodable`, which refuses only a codec this build lacks. New are
+  `Codec::decodable` and `source::{max_decompressed, set_max_decompressed,
+  DEFAULT_MAX_DECOMPRESSED}`, and `cli::Cli` has a `max_decompressed` field.
+- **Parquet and Arrow output for pipelines: `-o parquet`, `-o arrow`, `-o arrows` and `--out`.**
+  `head`, `query` and `catalog ls` write their rows in a format the next program reads with its
+  types: DuckDB, Polars, pandas, pyarrow or Spark.
+  - **`arrow`** is the Arrow IPC file format (`.arrow`, Feather v2), and **`arrows`** the stream
+    format, which a reader takes from a pipe:
+    `lakeleto query … -o arrows | python -c '… pl.read_ipc_stream(sys.stdin.buffer)'`.
+    **`parquet`** is Snappy-compressed. Lists, structs and maps stay nested, and `query` writes all
+    three as the engine answers.
+  - **`--out <file>`** writes to a file, and with no `-o` takes the format from its extension. The
+    file appears only when the command succeeds: it is written under a temporary name beside the
+    destination and renamed over it, so a failed run leaves no half-written file and keeps the one
+    that was there. On Unix the temporary file is private, and the result keeps the permission
+    bits of the file it replaces. `--out -` is stdout.
+  - **Refused where they make no sense:** on a terminal, and on `schema`, `profile`, `info` and
+    `engines`, which print descriptions rather than rows. Both are refused before anything is read.
+  - **`-o parquet` needs the new `parquet-out` feature**, which the release binaries, the image and
+    the installers have. Its writer is about 530 KB of the default build, against about 110 KB for
+    the Arrow writers, which every build has.
+  - For the library: `cli::Cli`'s `output` is now an `Option` (resolved by `Cli::output()`) beside
+    a new `out` field, and `render::stream_rows` takes a `Send` writer, as Parquet's writer needs.
+- **`lakeleto mcp`: an AI agent reads your tables (`--features mcp`).** An MCP client — Claude
+  Code, Claude Desktop, Cursor — starts `lakeleto mcp` and speaks the Model Context Protocol on its
+  stdin and stdout. Everything it can do is read.
+  - **The tools.** `list` (a directory's tables, an object-store prefix, a database's tables, a
+    catalog namespace); `describe` (columns and types, the row count, and for a Parquet file each
+    column's null count, min and max from its footer, all without reading a row); `preview` (rows,
+    from any offset, optionally only some columns); `profile` (column statistics from a bounded
+    scan); `query` (one read-only SQL statement over the tables it names, with `sql` or a
+    database driver); and `catalog_ls` (the configured Iceberg REST catalogs, with `catalog`).
+    `tools/list` offers only the ones the build and flags can run.
+  - **Bounded.** A call returns at most `--max-rows` rows (1,000) and `--max-bytes` of JSON
+    (32 KiB), as arrays in column order rather than objects that repeat every name, and says
+    `truncated` when it was cut. It is answered within `--timeout` seconds (30): the engines that
+    can stop at the deadline do, and a call one doesn't stop is answered with an error when it
+    passes.
+  - **`--root`** confines it as it confines `serve`, and relative paths are taken from it.
+  - **Refusals say what they are.** A refused call is a result with `isError` and a kind:
+    `forbidden`, `not_found`, `query` (including a write the read-only guard refused), `deadline`,
+    `invalid_arguments`, `unsupported`, …
+  - **No new crate.** The protocol is a loop over `serde_json`: the `rmcp` SDK measured 0.9 MB
+    larger in a release build. It speaks revisions 2024-11-05 to 2025-11-25, and a client of a
+    later revision falls back to them. Calls run concurrently, up to 16 at once, a cancellation
+    stops one, and a `ping` is answered during a long call.
+  - The release binaries and the Docker image include it; the guide has configurations for Claude
+    Code, Claude Desktop, Cursor and Docker.
+- **`lakeleto::confine`**, the `--root` check, shared by `serve` and `mcp` so that they refuse the
+  same paths with the same code.
+- **A protocol version for the HTTP contract.** `lakeleto serve` speaks protocol `1.0`, and says
+  so on every response, errors and refusals included, in an `X-Lakeleto-Protocol` header, and in
+  the `protocol` field of `GET /v1/engines`. The major is the `/v1` in the path; a minor version
+  only adds endpoints, fields and parameters. `lakeleto::protocol` holds the version and
+  `compatible()`, which says whether a server's version is one this build speaks.
+- **`/v1/engines` lists every engine.** Its new `engines` field has the capabilities of each engine
+  the server reads with: the read engine, then the SQL and database engines when the build has
+  them. `engine` stays, for clients that read only the read engine.
+- **`lakeleto engines --remote-url …`** also prints what the server says it runs: its version, its
+  protocol, and a row per engine.
+- **`EngineRegistry`, which decides which engine answers what,** for the CLI and the API alike. A
+  database table goes to the database engine, SQL to the SQL engine, a sorted or filtered grid
+  window to the SQL engine when it reads the table's format, and every other read to the read
+  engine. `EngineRegistry::local()` is this build's engines. `RemoteEngine::server()` returns what
+  a server says about itself at `/v1/engines`.
+- **Iceberg REST catalogs (`--features catalog`).** A table a catalog serves is named by
+  reference, wherever a path goes: `lakeleto head catalog://prod/sales/orders`,
+  `--table t=catalog://prod/sales/orders`, `?path=`, and the file browser.
+  - **Configuration.** Catalogs are configured by name in `$LAKELETO_HOME/catalogs.toml`, with the
+    keys the Iceberg REST clients use (`uri`, `warehouse`, `credential`, `token`,
+    `oauth2-server-uri`, `scope`, `header.*`, `s3.*`, …), or entirely through
+    `LAKELETO_CATALOG__<NAME>__<KEY>` variables, which win over the file.
+  - **The protocol.** Lakeleto speaks the read side of it: `GET /v1/config` (with the warehouse,
+    the route prefix and the namespace separator it answers), namespace and table listings
+    (followed across pages, up to 10,000 entries), and `loadTable`.
+  - **Logging in.** It logs in with a bearer token or OAuth2 client credentials, keeps the token in
+    memory, and fetches a new one before it expires, or once when the catalog stops taking it.
+  - **Reading.** A table is planned from the metadata `loadTable` hands over, so its metadata file
+    is not fetched again.
+  - **Credentials for the table's files.** They come from the catalog, which Lakeleto asks to vend
+    them, matched to the table by the longest `storage-credentials` prefix. They are renewed
+    through the catalog before they expire and never written to disk. Without vended
+    credentials, the catalog's configured storage keys are used, then this machine's, unless the
+    catalog sets `storage-fallback = "none"`. `lakeleto info` and `/v1/info` say which one a read
+    used.
+  - **Browsing.** `lakeleto catalog ls [catalog://…]` lists the configured catalogs, a catalog's
+    namespaces, or a namespace's namespaces and tables, in every `-o` format, never printing a
+    credential. `/v1/list?dir=catalog://…` lists the same for the file browser.
+  - **Tables on the catalog's own disk.** A catalog that serves tables from its own disk, with
+    `file://` metadata, is read from disk.
+  - **What is refused.** A namespace, a table that does not exist and a misnamed catalog are each
+    refused with what they are, and with the next step.
+  - **Tested against Apache Polaris 1.8.0 and Lakekeeper 0.14.0**, each vending credentials for
+    an S3 store. pyiceberg writes a table into each, and Lakeleto lists it, counts and queries it,
+    and serves it to the grid, with the vended credentials alone.
+- **A `Catalog` trait, for what a table's name refers to.** `Catalog::load_table` says what a name
+  is, as a `TableHandle` (its location, format and codec), and `Catalog::list` says what lives
+  under a name, in the shape the file browser shows. `PathCatalog` is its one implementation:
+  Lakeleto's format detection and directory listing, moved behind the trait unchanged.
+  `Source::detect_in`, `Source::resolve_in` and `list_dir` hand their work to it, and `serve`
+  resolves and browses through it, so every path, object-store URI and database URI resolves as it
+  did. Like detection, it lists an object-store prefix as the request's identity when the request
+  carries one, and under `RemoteProbe::VendedOnly` it refuses to list one as the server. A catalog
+  that serves tables by name plugs in as another implementation.
+
+### Changed
+- **`lakeleto engines` says what each backend is.**
+  - The `duckdb` flag is shown as **inert**, not planned: it wires nothing, and nothing is planned
+    for it.
+  - The local engine is the **built-in reader**, in `lakeleto engines` and in `GET /v1/engines`
+    alike. Its old label named three crates, which read as the formats it opens.
+  - The object-store row lists every format it reads remotely: Parquet, CSV, TSV, JSON and Arrow.
+- **The release binaries and the Docker image include the `remote` engine:** `--remote-url`, a
+  client for another Lakeleto server, and `serve --workspace-remote`. The guide already said the
+  release binaries had every engine, and they lacked this one. It adds no crate (`reqwest` is
+  already in them for `catalog`) and 170 KB to a 45 MB binary.
+- **The web grid scrolls through the whole table.** It showed a table's first 200 rows, sorted
+  and filtered, and nothing past them. It now reads 200-row windows from `/v1/rows` as it
+  scrolls, two at a time, draws only the rows in view over a scroll area sized to the table, and
+  keeps 8,000 rows at most:
+  - **Very tall tables.** A table taller than a browser can draw maps onto its scrollbar in
+    proportion, and the wheel and the keys still move by rows.
+  - **Unknown totals.** A CSV, TSV or JSON file's row count isn't known until its last window is
+    read, so its scrollbar grows as you scroll and its footer says `≥ N`.
+  - **Rows.** They are numbered, and a row's number opens it in Row detail.
+  - **Failures.** A window that fails is asked for again after 3 seconds, then less often.
+- **The CLI reads database tables.** `lakeleto head`, `schema`, `profile` and `info` read a
+  `sqlite://`, `postgres://` or `mysql://` table with the database engine, and `lakeleto query`
+  runs SQL over one on it, as `serve` already did. They used to hand it to the file reader or to
+  DataFusion, neither of which reads a database. `--engine local` still runs no SQL.
+- **`RemoteEngine` reports the server's capabilities.** The formats it reads, and whether it runs
+  SQL and profiles, come from the server's `GET /v1/engines`, asked once and kept. It used to
+  report `server-defined` formats and SQL whatever the server did. A server that doesn't answer
+  within 5 seconds, or serves no `/v1/engines`, is reported as capabilities unknown, with no
+  formats and no SQL, and asked again the next time.
+- **`/v1/engines` offers `POST /v1/query` only when the server can run SQL:** on files with the
+  `sql` engine, or on databases with a database engine. Without either, every query answered
+  `501`.
+- **`api::router` and `api::serve` take an `EngineRegistry`** in place of a read engine and
+  optional SQL and database engines: `router(EngineRegistry::new(read).with_sql(sql), …)`.
+- **A cancelled Iceberg read stops at its next batch.** It used to finish the data file it was in
+  before checking the request's deadline and cancellation. From an object store each row group is
+  a request, so a read nobody wanted any longer kept downloading the rest of the file.
+- **An Iceberg table in an object store is read in place.** It used to be copied whole to a private
+  temporary directory on its first read in a process: every object under the table's prefix,
+  earlier snapshots and files no snapshot names included. Now:
+  - the current snapshot's metadata, manifest list and manifests are fetched, a `GET` each, and
+    nothing else the table has written;
+  - data files are read by ranged requests, as Parquet objects are, so a page of the grid reads
+    one footer and one row group;
+  - the table's row count is the sum of what its manifests record for each file (a footer counts
+    any file a manifest leaves out), so counting it opens no file. Local tables are counted the
+    same way;
+  - nothing is written to disk.
+
+  On a 299 MiB table (8 data files of 500,000 rows, plus an old snapshot and an orphaned file) at
+  31 MB/s with 20 ms per request, the first page of a fresh server took 12.8 s and 299 MiB of
+  downloads, and now takes 0.7 s and 6 MiB; its schema and row count went from 12.7–12.8 s to
+  0.4 s.
+  The cost: every read now goes to the store, where the copy served reads after the first from
+  disk. A later page takes 0.4–0.8 s rather than 0.05 s, and SQL over the table reads the current
+  snapshot's data files on every query (7 s at 125 MB/s, where the copy took 0.7 s once it was
+  made).
+
+### Removed
+- `objstore::materialize_prefix`, `objstore::materialize_prefix_with` and `iceberg::plan_object`,
+  which made and read that copy.
+
+### Fixed
+- **`lakeleto info` prints what `-o` asks for.** It printed its `name : value` lines whatever
+  `-o` said, so `info -o json` gave a script text it could not parse.
+  - **`-o json`** is the object `GET /v1/info` returns: `path`, `format`, `engine`, `size_bytes`,
+    `row_count`, `columns` and, for a catalog table, `credentials`. What is not known is `null`.
+    The CLI and the API now build it from one type, so the two cannot drift apart.
+  - **`-o ndjson`** is the same object on one line.
+  - **`-o csv` and `-o tsv`** are a header and one row, with the same columns for every
+    source, so the rows for many files line up under one header.
+  - The default output is unchanged, and the binary formats are still refused.
+- **Polars' Parquet reads without `sql`.** Polars compresses Parquet with zstd unless told
+  otherwise, and every build without `sql` failed such a file's rows with "Disabled feature at
+  compile time: zstd": the default build, whose Parquet reader decompressed Snappy only, and a
+  build with `compression`, which read zstd text but not zstd Parquet. The release binaries, which
+  have `sql`, read it all along.
+  - **Snappy, gzip and LZ4 pages read in every build**, LZ4 in Hadoop's framing and the raw one,
+    through the gzip and LZ4 decoders every build links for compressed text and Arrow files: no new
+    crate, and about 48 KB.
+  - **zstd and Brotli come with `compression`**, which the release binaries, the image and the
+    installers have. `iceberg` reads zstd too, with the zstd it links for Avro manifests: Iceberg
+    writes its data files zstd-compressed by default since 1.4. In the default build, zstd measured
+    eight crates, over its crate budget, and Brotli 1.1 MB, over its size budget.
+  - **A build without one refuses the file naming the feature**, where it used to fail in parquet's
+    words, which name a feature of parquet's: "this Parquet file's pages are zstd-compressed, and
+    this build decompresses Snappy, gzip and LZ4 only: zstd needs the `compression` feature
+    (`cargo install lakeleto --features compression`), which the release binaries and the image
+    have". It is an `unsupported format` error: 400 from `serve`, as before, and
+    `unsupported_format` to an MCP client. `schema`, `info` and `profile --fast` read only the
+    footer, and read such a file as before.
+- **A timestamp in `UTC` prints in every build.** `timestamp[us, tz=UTC]` is what pandas, pyarrow
+  and Polars write for tz-aware UTC data, and what the Parquet reader calls any column a file marks
+  as adjusted to UTC, as DuckDB, Spark, Trino and Iceberg write them. The default build, which has
+  no time zone database, printed such a column blank in `head`'s table, failed `-o csv`, `-o tsv`
+  (after the header), `-o json` and `-o ndjson` with "only offset based timezones supported without
+  chrono-tz feature", and profiled it with no min or max and one distinct value. Every build
+  without `sql` failed the same way in the grid's `/v1/rows`, in its filters, and on an Iceberg
+  equality delete keyed on a `timestamptz` column.
+  - **A name of UTC prints as the offset `+00:00`:** `UTC`, `Etc/UTC`, `Z`, and the tz database's
+    other names for its two zero-offset zones (`GMT`, `Zulu`, `Universal`, …). The values are UTC
+    instants already, so every build prints them exactly as the release binaries do:
+    `2024-01-02T03:04:05.123456Z`. `Z`, which no build could print, prints in all of them.
+  - **Another named zone, such as `Europe/Paris`, needs the database.** The release binaries and
+    the image have it, through DataFusion, and print the zone's own time as before. A build without
+    it now refuses the column before writing anything, naming the zone and the builds that print it.
+    The database measured 1.9 MB and four crates in the default build, over its size budget, and
+    printing the instant in UTC instead would show a time the column does not hold.
+  - Only text changes: `schema`, and `-o arrow`, `-o arrows` and `-o parquet`, keep the zone the
+    file names.
+  - For the library: `engine::profile_columns` returns a `Result`.
+
+### Security
+- **Catalog logins stay off the network and out of logs.** A catalog is reached over `https`, or
+  over plain `http` only to this machine, and a login never follows a redirect. Tokens and
+  vended credentials live in memory only, and are never printed in an error, a `Debug` value or
+  `lakeleto catalog ls`. On Unix, Lakeleto warns when `catalogs.toml` holds a secret other users can
+  read.
+- **A table a catalog restricts is refused, not read in full.** Lakeleto refuses, before reading a
+  file, a table whose catalog requires row filters or column masks it cannot apply
+  (`read-restrictions`), server-side scan planning, or remote request signing.
+- **`--root` refuses catalog references**, as it refuses object-store URIs, before anything reaches
+  a catalog.
+- **A table in an object store can no longer read a file on this machine.** When the table was
+  copied to disk to be read, a manifest naming a local path or a `file://` URI was followed onto
+  the local disk. Such a table is now refused with a 403, before the file is opened.
+
 ## [0.3.0] - 2026-10-03
 
 ### Added
@@ -643,7 +907,8 @@ one pluggable trait.
 - Release scaffolding: `LICENSE` (Apache-2.0), `NOTICE`, `CONTRIBUTING.md` (DCO),
   `SECURITY.md`, `CODE_OF_CONDUCT.md`, and this changelog.
 
-[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.4.0
 [0.3.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.3.0
 [0.2.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.2.0
 [0.1.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.1.0

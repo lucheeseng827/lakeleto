@@ -63,7 +63,7 @@ $releaseDir = Join-Path $repoRoot 'target\release'
 # Keep this in step with `FEATURES` in ops/release.yml, which the installer job
 # builds as "desktop,$FEATURES". A locally built .msi that quietly ships fewer
 # connectors than the released one is worse than no local build at all.
-$features = 'desktop,serve,sql,iceberg,object-store,sqlite,postgres,mysql,delta'
+$features = 'desktop,serve,sql,iceberg,object-store,catalog,sqlite,postgres,mysql,delta,mcp,remote,parquet-out,compression'
 
 # cargo resolves -p against the workspace containing the *current directory*, not
 # the script's location, so honour the "run from anywhere" promise above by

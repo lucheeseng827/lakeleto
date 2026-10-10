@@ -81,7 +81,7 @@ use std::sync::Arc;
 use axum::{
     extract::{DefaultBodyLimit, Path as UrlPath, Query, RawQuery, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri},
-    middleware::{from_fn_with_state, Next},
+    middleware::{from_fn_with_state, map_response, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
@@ -89,13 +89,17 @@ use axum::{
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::{Catalog, PathCatalog};
 use crate::context::RequestContext;
+use crate::engine::registry::{EngineRegistry, Need};
 use crate::engine::{
     Capabilities, ColumnSchema, Engine, FilterOp, FilterSpec, NamedSource, RowBatch, ScanResult,
     ScanSpec, SortSpec, TableProfile, TableSchema,
 };
 use crate::error::{CancelReason, EngineError};
-use crate::source::{list_dir, DirListing, Flatten, Format, RemoteProbe, Source};
+use crate::protocol::{PROTOCOL_HEADER, PROTOCOL_VERSION};
+use crate::render::SourceInfo;
+use crate::source::{DirListing, Flatten, RemoteProbe, Source};
 use crate::workspace::{RunRecord, RunStatus, Workspace, WorkspaceBundle, WorkspaceStore};
 
 /// Export view cap — the most rows `GET /v1/export` will materialize.
@@ -130,6 +134,7 @@ const QUERY_DEFAULT_LIMIT: usize = 10_000;
 struct Assets;
 
 /// Endpoints advertised by `GET /v1/engines` (kept next to the routes so they stay in sync).
+/// [`endpoints`] leaves out the ones this server's engines cannot answer.
 const ENDPOINTS: &[&str] = &[
     "GET /healthz",
     "GET /v1/engines",
@@ -152,15 +157,14 @@ const ENDPOINTS: &[&str] = &[
     "PUT|GET /v1/workspaces/{id}/runs/{run_id}/result",
 ];
 
-/// Shared server state: the read engine (schema/preview/profile/info) and, when compiled with
-/// `sql`, the SQL engine for `POST /v1/query`.
+/// Shared server state: the engines, and what every request is confined, authorized and stored
+/// by.
 #[derive(Clone)]
 pub struct AppState {
-    read: Arc<dyn Engine>,
-    sql: Option<Arc<dyn Engine>>,
-    /// The BYO-database engine (sqlx). Present when a DB backend feature is compiled in. Every
-    /// `Format::Database` source is routed here (the file engines can't read a live DB).
-    db: Option<Arc<dyn Engine>>,
+    /// The engines this server reads with, and which one answers what: the read engine for
+    /// schema, preview, profile and info; the SQL engine for `POST /v1/query` and the grid's
+    /// sorted and filtered windows; the database engine for every database table.
+    engines: EngineRegistry,
     default_scan: usize,
     /// When set, `/v1/*` requires this bearer token (header always; `?token=` only on a loopback
     /// bind). The SPA + `/healthz` are exempt so the page can load and health checks stay open.
@@ -174,9 +178,17 @@ pub struct AppState {
     /// Persistent workspaces + query history + result cache (the "Postman" data plane). Behind the
     /// [`WorkspaceStore`] trait so a synced cloud store drops in later without a route change.
     store: Arc<dyn WorkspaceStore>,
+    /// The catalogs `/v1/list?dir=catalog://…` browses: the process's, as the engines read them.
+    #[cfg(feature = "catalog")]
+    catalogs: Arc<crate::catalog::Catalogs>,
 }
 
 impl AppState {
+    /// The engine for `need`, or a refusal naming the feature this build lacks.
+    fn engine(&self, need: Need<'_>) -> Result<Arc<dyn Engine>, ApiError> {
+        self.engines.resolve(need).map_err(ApiError)
+    }
+
     /// The [`RequestContext`] every engine call on this server is made under.
     ///
     /// Detached today — `serve` imposes no deadline and has no way to cancel — so behaviour is
@@ -199,40 +211,40 @@ impl AppState {
         RequestContext::detached()
     }
 
-    /// Resolve a caller-supplied path under this server's identity and probe posture.
+    /// The catalog this server resolves and browses caller-supplied paths through: a
+    /// [`PathCatalog`] under [`RemoteProbe::Ambient`].
     ///
-    /// The posture is [`RemoteProbe::Ambient`], and the reason is what `serve` is: a local
-    /// explorer the operator ran on their own machine, against their own credentials, bound to
-    /// loopback by default. There is no second principal for a probe to be confused about. With
-    /// `--root` set the question does not arise at all — [`confine_entry`] refuses every
-    /// object-store and database URI before this runs, because `--root` is a local-filesystem
+    /// The posture is `Ambient`, and the reason is what `serve` is: a local explorer the operator
+    /// ran on their own machine, against their own credentials, bound to loopback by default.
+    /// There is no second principal for a probe to be confused about. With `--root` set the
+    /// question does not arise at all — [`confine_entry`] refuses every object-store and database
+    /// URI before a read or a listing reaches the catalog, because `--root` is a local-filesystem
     /// gate.
     ///
     /// It is one function, and named, for the same reason [`AppState::ctx`] is: the posture of a
     /// multi-tenant server is [`RemoteProbe::VendedOnly`], and if that is ever what this becomes,
     /// this is the line that changes rather than ten call sites that each looked fine.
+    fn catalog(&self) -> PathCatalog {
+        PathCatalog::new(RemoteProbe::Ambient)
+    }
+
+    /// Resolve a caller-supplied path through [`AppState::catalog`], as this server's identity.
     fn resolve(&self, path: &str, read: &ReadAs) -> Result<Source, ApiError> {
         let flatten = match read.flatten.as_deref() {
             Some(value) => Flatten::parse(value)?,
             None => None,
         };
-        Ok(Source::resolve_in(
-            path,
-            read.format.as_deref(),
-            &self.ctx(),
-            RemoteProbe::Ambient,
-        )?
-        .with_json_path(read.json_path.as_deref())?
-        .with_flatten(flatten))
+        Ok(self
+            .catalog()
+            .resolve(&self.ctx(), Path::new(path), read.format.as_deref())?
+            .with_json_path(read.json_path.as_deref())?
+            .with_flatten(flatten))
     }
 }
 
 /// Build the router. Exposed (not just `serve`) so it can be driven in tests without a socket.
-#[allow(clippy::too_many_arguments)]
 pub fn router(
-    read: Arc<dyn Engine>,
-    sql: Option<Arc<dyn Engine>>,
-    db: Option<Arc<dyn Engine>>,
+    engines: EngineRegistry,
     default_scan: usize,
     token: Option<String>,
     root: Option<PathBuf>,
@@ -240,15 +252,20 @@ pub fn router(
     store: Arc<dyn WorkspaceStore>,
 ) -> Router {
     let state = AppState {
-        read,
-        sql,
-        db,
+        engines,
         default_scan,
         token: token.map(Arc::from),
         root: root.map(Arc::new),
         loopback,
         store,
+        #[cfg(feature = "catalog")]
+        catalogs: crate::catalog::Catalogs::configured(),
     };
+    routes(state)
+}
+
+/// The routes, over `state`.
+fn routes(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/engines", get(engines))
@@ -288,7 +305,19 @@ pub fn router(
         .fallback(spa)
         // Bearer-auth gate on /v1/* (no-op when no token is configured).
         .layer(from_fn_with_state(state.clone(), auth))
+        // Outermost, so every response says which protocol it speaks, a refusal included.
+        .layer(map_response(protocol_header))
         .with_state(state)
+}
+
+/// Stamp a response with the protocol version this server speaks, so a client learns it from
+/// whatever it asked first.
+async fn protocol_header(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        HeaderName::from_static(PROTOCOL_HEADER),
+        HeaderValue::from_static(PROTOCOL_VERSION),
+    );
+    response
 }
 
 /// Require the configured bearer token on `/v1/*`. The token may arrive as
@@ -390,12 +419,9 @@ fn asset_response(path: &str, body: &[u8]) -> Response {
 /// Bind `addr` and serve until Ctrl-C. Owns its own multi-thread Tokio runtime so the
 /// synchronous [`crate::cli::run`] can call it directly. When `open_url` is set (`lakeleto open`),
 /// the browser is launched once the socket is bound.
-#[allow(clippy::too_many_arguments)]
 pub fn serve(
     addr: &str,
-    read: Arc<dyn Engine>,
-    sql: Option<Arc<dyn Engine>>,
-    db: Option<Arc<dyn Engine>>,
+    engines: EngineRegistry,
     default_scan: usize,
     open_url: Option<String>,
     token: Option<String>,
@@ -410,16 +436,7 @@ pub fn serve(
         Some(s) => s,
         None => Arc::new(crate::workspace::LocalStore::open()?),
     };
-    let app = router(
-        read,
-        sql,
-        db,
-        default_scan,
-        token.clone(),
-        root,
-        loopback,
-        store,
-    );
+    let app = router(engines, default_scan, token.clone(), root, loopback, store);
     // A non-loopback bind with no token is an open API on the network — warn loudly.
     if token.is_none() && !is_loopback(addr) {
         eprintln!("lakeleto: WARNING binding {addr} (non-loopback) with no --token — the API is unauthenticated");
@@ -483,89 +500,14 @@ fn is_loopback(addr: &str) -> bool {
         || addr.starts_with("::1")
 }
 
-/// The uniform "outside `--root`" refusal. The message is deliberately the same whether the path
-/// is out-of-root, non-existent, or unreadable, so a token holder can't use `/v1/*` as an
-/// existence/type oracle over the filesystem outside the root.
-fn out_of_root() -> ApiError {
-    ApiError(EngineError::Forbidden(
-        "path is outside the server root (--root)".to_string(),
-    ))
-}
-
-/// **Pre-resolve** confinement of a request path to `--root`: refuses object-store URIs and
-/// anything anchored outside the root *before* [`Source::resolve`]/`detect` touches the
-/// filesystem — so an out-of-root path can't be used as an existence/type/readability oracle (via
-/// `detect`'s `is_dir`/`read_dir`/`sniff_magic`), nor trigger a recursive-`read_dir` DoS. A
-/// missing leaf *inside* the root is allowed through so the reader still returns a normal 404.
-/// No-op when no root is configured (the default "point at any file" behaviour).
+/// [`crate::confine::entry`]: refuse a request path outside `--root` before it is resolved.
 fn confine_entry(root: &Option<Arc<PathBuf>>, path: &str) -> Result<(), ApiError> {
-    let Some(root) = root else { return Ok(()) };
-    if crate::source::is_object_uri(path) || crate::source::is_database_uri(path) {
-        return Err(out_of_root()); // --root is local-filesystem only (no object-store / DB URIs)
-    }
-    // Walk up to the nearest existing ancestor and canonicalize it (symlinks resolved). If that
-    // lies under the root the request is in-root (a missing leaf 404s later); otherwise — or when
-    // nothing along the path exists — it's refused with the same error, leaking nothing.
-    let mut cur = Path::new(path);
-    loop {
-        if let Ok(canon) = std::fs::canonicalize(cur) {
-            return if canon.starts_with(root.as_ref()) {
-                Ok(())
-            } else {
-                Err(out_of_root())
-            };
-        }
-        match cur.parent() {
-            Some(p) if !p.as_os_str().is_empty() => cur = p,
-            _ => return Err(out_of_root()),
-        }
-    }
+    crate::confine::entry(root.as_deref().map(PathBuf::as_path), path).map_err(ApiError)
 }
 
-/// Confine every file the engine will actually **read** for `source` to `--root`. The entry path
-/// is already gated by [`confine_entry`], but a directory dataset reads every member `.parquet`
-/// (a symlink escaping the root is caught here by canonicalizing each), and a table format reads
-/// whatever paths its own metadata names — Iceberg's manifest list, manifests, delete files and
-/// absolute data-file paths, or Delta's `add.path` entries — any of which can point outside the
-/// table dir. No-op without a root.
-///
-/// Note the shape of this guard: it is a per-format traversal whitelist, not a generic filesystem
-/// sandbox. Each arm has to know, format by format, every file its reader will subsequently open —
-/// so a new readable format needs an arm here, and its absence is a confinement hole rather than a
-/// missing feature.
+/// [`crate::confine::members`]: refuse a source that reads any file outside `--root`.
 fn confine_members(root: &Option<Arc<PathBuf>>, source: &Source) -> Result<(), ApiError> {
-    let Some(root) = root else { return Ok(()) };
-    match source.format {
-        Format::Parquet if source.path.is_dir() => {
-            for f in crate::source::list_parquet_files(&source.path) {
-                confine_canonical(root, &f)?;
-            }
-        }
-        #[cfg(feature = "iceberg")]
-        Format::Iceberg => {
-            // Re-plan with the root so every path the reader will open (manifests + delete files
-            // + data files) is validated *before* it is read — gating metadata too, not just data.
-            crate::iceberg::plan_with_root(&source.path, Some(root.as_path())).map_err(ApiError)?;
-        }
-        #[cfg(feature = "delta")]
-        Format::Delta => {
-            // Same reasoning as Iceberg, and just as necessary: a Delta `add.path` may be absolute
-            // or relative-with-`..`, so the log can name data files anywhere on the filesystem.
-            // The planner memoizes, so this replay and the engine's own share one pass over the log.
-            crate::engine::delta::plan_with_root(&source.path, Some(root.as_path()))
-                .map_err(ApiError)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Canonicalize `path` and require it under `root`; refuse (uniformly) on escape or any failure.
-fn confine_canonical(root: &Arc<PathBuf>, path: &Path) -> Result<(), ApiError> {
-    match std::fs::canonicalize(path) {
-        Ok(canon) if canon.starts_with(root.as_ref()) => Ok(()),
-        _ => Err(out_of_root()),
-    }
+    crate::confine::members(root.as_deref().map(PathBuf::as_path), source).map_err(ApiError)
 }
 
 /// Reject an export whose rendered body exceeds `max` bytes (→ 413). Extracted so the boundary
@@ -732,16 +674,6 @@ struct RowsWindow {
     rows: Vec<serde_json::Value>,
 }
 
-#[derive(Serialize)]
-struct InfoResponse {
-    path: String,
-    format: String,
-    engine: String,
-    size_bytes: Option<u64>,
-    row_count: Option<u64>,
-    columns: usize,
-}
-
 /// The bounds this server will enforce, stated up front so a client can show them before it hits
 /// one instead of explaining a rejection afterwards.
 ///
@@ -777,7 +709,13 @@ struct EnginesResponse {
     /// The running binary's version (from `CARGO_PKG_VERSION`) — the SPA shows it in the header
     /// so a user can see which Lakeleto they're talking to.
     version: &'static str,
+    /// The `/v1` contract this server speaks, as `major.minor`. See [`crate::protocol`].
+    protocol: &'static str,
+    /// What the read engine does. Kept beside `engines` for clients that read only this.
     engine: Capabilities,
+    /// What every engine this server has does: the read engine, then the SQL and database
+    /// engines when there are any.
+    engines: Vec<Capabilities>,
     sql_available: bool,
     /// Whether this is the Lakeleto Cloud (EE) edition. Off in the open-source binary; an `ee`
     /// build flips it, which lifts the OSS connection cap in the UI. The real EE capabilities live
@@ -899,11 +837,24 @@ async fn healthz() -> &'static str {
     "ok\n"
 }
 
-async fn engines(State(st): State<AppState>) -> Json<EnginesResponse> {
-    Json(EnginesResponse {
+async fn engines(State(st): State<AppState>) -> Result<Json<EnginesResponse>, ApiError> {
+    // Asked on a blocking worker: a remote engine answers by asking its server.
+    let registry = st.engines.clone();
+    let (engine, engines) = blocking(move || {
+        let engines: Vec<Capabilities> = registry
+            .engines()
+            .iter()
+            .map(|engine| engine.capabilities())
+            .collect();
+        Ok((engines[0].clone(), engines))
+    })
+    .await?;
+    Ok(Json(EnginesResponse {
         version: env!("CARGO_PKG_VERSION"),
-        engine: st.read.capabilities(),
-        sql_available: st.sql.is_some(),
+        protocol: PROTOCOL_VERSION,
+        engine,
+        engines,
+        sql_available: st.engines.has_sql(),
         ee: cfg!(feature = "ee"),
         limits: Limits {
             max_export_rows: EXPORT_CAP,
@@ -917,8 +868,18 @@ async fn engines(State(st): State<AppState>) -> Json<EnginesResponse> {
                 Some(OSS_MAX_DB_CONNECTIONS)
             },
         },
-        endpoints: ENDPOINTS.to_vec(),
-    })
+        endpoints: endpoints(&st.engines),
+    }))
+}
+
+/// The endpoints this server answers: [`ENDPOINTS`], less `POST /v1/query` when it has no engine
+/// to run SQL on, which would answer every query with a 501.
+fn endpoints(engines: &EngineRegistry) -> Vec<&'static str> {
+    ENDPOINTS
+        .iter()
+        .copied()
+        .filter(|endpoint| *endpoint != "POST /v1/query" || engines.can_query())
+        .collect()
 }
 
 async fn schema(
@@ -928,15 +889,17 @@ async fn schema(
     confine_entry(&st.root, &q.path)?;
     let source = st.resolve(&q.path, &q.read)?;
     confine_members(&st.root, &source)?;
-    let engine = read_engine(&st, &source)?;
+    let engine = st.engine(Need::Read(&source))?;
     let ctx = st.ctx();
     Ok(Json(blocking(move || engine.schema(&ctx, &source)).await?))
 }
 
+/// `GET /v1/info`: what `lakeleto info -o json` prints, in the same [`SourceInfo`] shape, with an
+/// object in a store sized by a `HEAD`.
 async fn info(
     State(st): State<AppState>,
     Query(q): Query<SourceQuery>,
-) -> Result<Json<InfoResponse>, ApiError> {
+) -> Result<Json<SourceInfo>, ApiError> {
     confine_entry(&st.root, &q.path)?;
     let source = st.resolve(&q.path, &q.read)?;
     confine_members(&st.root, &source)?;
@@ -960,17 +923,18 @@ async fn info(
     };
     let format = source.format.to_string();
     let path = source.display();
-    let engine = read_engine(&st, &source)?;
+    let engine = st.engine(Need::Read(&source))?;
     let engine_name = engine.name().to_string();
     let ctx = st.ctx();
     let schema = blocking(move || engine.schema(&ctx, &source)).await?;
-    Ok(Json(InfoResponse {
+    Ok(Json(SourceInfo {
         path,
-        format,
+        format: Some(format),
         engine: engine_name,
         size_bytes,
         row_count: schema.row_count,
         columns: schema.columns.len(),
+        credentials: schema.credentials,
     }))
 }
 
@@ -987,7 +951,7 @@ async fn preview(
     // `limit=0` (an explicit "no rows" probe) keeps returning zero rows; the absent-value default
     // (a screenful) is already small and left untouched.
     let limit = q.limit.map(|n| n.min(QUERY_CAP)).unwrap_or(50);
-    let engine = read_engine(&st, &source)?;
+    let engine = st.engine(Need::Read(&source))?;
     let ctx = st.ctx();
     let arrow = wants_arrow(&headers);
     let payload = blocking(move || {
@@ -1017,7 +981,7 @@ async fn profile(
     // Only the upper bound is clamped — `scan=0` is the footer-statistics fast path (see
     // `LocalReaderEngine::profile`), so a lower clamp would silently disable it.
     let scan = q.scan.map(|n| n.min(QUERY_CAP)).unwrap_or(st.default_scan);
-    let engine = read_engine(&st, &source)?;
+    let engine = st.engine(Need::Read(&source))?;
     let ctx = st.ctx();
     Ok(Json(
         blocking(move || engine.profile(&ctx, &source, scan)).await?,
@@ -1059,16 +1023,9 @@ async fn query(
         )));
     }
 
-    let engine = if named.iter().any(|n| n.source.format == Format::Database) {
-        // A DB table routes to the DB engine (it runs the SQL against the first table's connection).
-        st.db
-            .clone()
-            .ok_or_else(|| ApiError(EngineError::missing_feature("query a database", "sqlite")))?
-    } else {
-        st.sql
-            .clone()
-            .ok_or_else(|| ApiError(EngineError::missing_feature("run SQL", "sql")))?
-    };
+    // A database table goes to the database engine, which runs the SQL against the first table's
+    // connection; files go to the SQL engine.
+    let engine = st.engine(Need::Query(&named))?;
     let sql = body.sql.clone();
     let cap = body
         .limit
@@ -1220,10 +1177,11 @@ async fn rows(
     let source = st.resolve(&params.path, &params.read)?;
     confine_members(&st.root, &source)?;
     let spec = params.spec;
-    let engine = scan_engine_for(&st, &source, &spec)?;
+    let registry = st.engines.clone();
     let ctx = st.ctx();
     let arrow = wants_arrow(&headers);
     let payload = blocking(move || {
+        let engine = registry.resolve(Need::Scan(&source, &spec))?;
         let res = engine.scan(&ctx, &source, &spec)?;
         if arrow {
             // Every count [`RowsWindow`] carries inline — the virtual scrollbar needs all of
@@ -1259,7 +1217,7 @@ async fn stats(
     confine_members(&st.root, &source)?;
     let filters = params.spec.filters;
     let scan = st.default_scan;
-    let engine = read_engine(&st, &source)?;
+    let engine = st.engine(Need::Read(&source))?;
     let ctx = st.ctx();
     Ok(Json(
         blocking(move || engine.stats(&ctx, &source, &filters, scan)).await?,
@@ -1277,10 +1235,11 @@ async fn export(State(st): State<AppState>, RawQuery(q): RawQuery) -> Result<Res
     let source = st.resolve(&params.path, &params.read)?;
     confine_members(&st.root, &source)?;
     let spec = params.spec;
-    let engine = scan_engine_for(&st, &source, &spec)?;
+    let registry = st.engines.clone();
     let ctx = st.ctx();
 
     let (body, mime, ext) = blocking(move || {
+        let engine = registry.resolve(Need::Scan(&source, &spec))?;
         let rb = engine.scan(&ctx, &source, &spec)?.batch;
         let out: (Vec<u8>, &'static str, &'static str) = match fmt.as_str() {
             "parquet" => (
@@ -1345,50 +1304,37 @@ async fn list(
     #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
     if crate::source::is_database_uri(&dir) {
         if st.root.is_some() {
-            return Err(out_of_root());
+            return Err(ApiError(crate::confine::out_of_root()));
         }
         let ctx = st.ctx();
-        let listing = tokio::task::spawn_blocking(move || db_listing(&ctx, &dir))
-            .await
-            .map_err(|e| ApiError(EngineError::Other(format!("worker task failed: {e}"))))?
-            .map_err(ApiError)?;
+        let listing =
+            tokio::task::spawn_blocking(move || crate::engine::database::table_listing(&ctx, &dir))
+                .await
+                .map_err(|e| ApiError(EngineError::Other(format!("worker task failed: {e}"))))?
+                .map_err(ApiError)?;
         return Ok(Json(listing));
     }
-    // Confine browsing to the root when set (also refuses object-store prefixes — `--root` is
-    // local-filesystem only). Uses the same pre-access gate as the read handlers.
+    // Confine browsing to the root when set (also refuses object-store prefixes and catalogs —
+    // `--root` is local-filesystem only). Uses the same pre-access gate as the read handlers.
     confine_entry(&st.root, &dir)?;
-    let listing = tokio::task::spawn_blocking(move || list_dir(&dir))
+    // A catalog reference lists the configured catalogs, a catalog's namespaces, or a namespace's
+    // namespaces and tables: directories and files, so the browser walks it as it walks a disk.
+    #[cfg(feature = "catalog")]
+    if crate::catalog::is_catalog_uri(&dir) {
+        let (catalogs, ctx) = (st.catalogs.clone(), st.ctx());
+        let listing = blocking(move || {
+            let reference = crate::catalog::CatalogRef::parse(&dir)?;
+            Ok(catalogs.list(&ctx, &reference)?.listing)
+        })
+        .await?;
+        return Ok(Json(listing));
+    }
+    let (catalog, ctx) = (st.catalog(), st.ctx());
+    let listing = tokio::task::spawn_blocking(move || catalog.list(&ctx, Path::new(&dir)))
         .await
         .map_err(|e| ApiError(EngineError::Other(format!("worker task failed: {e}"))))?
         .map_err(ApiError)?;
     Ok(Json(listing))
-}
-
-/// List a database's tables as a [`DirListing`] — each table an entry deep-linked `?table=<name>`
-/// so clicking it opens that table as a `Format::Database` source.
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
-fn db_listing(ctx: &RequestContext, dir: &str) -> Result<DirListing, EngineError> {
-    // Strip any existing `?table=…` so we always list the whole database.
-    let base = dir.split('?').next().unwrap_or(dir).to_string();
-    let tables = crate::engine::database::list_tables(ctx, dir)?;
-    let entries = tables
-        .into_iter()
-        .map(|name| {
-            let path = format!("{base}?table={name}");
-            crate::source::DirEntry {
-                name,
-                path,
-                kind: "file",
-                format: Some("database".to_string()),
-                size: None,
-            }
-        })
-        .collect();
-    Ok(DirListing {
-        dir: base,
-        parent: None,
-        entries,
-    })
 }
 
 // ---- workspaces (Postman-style data plane) --------------------------------------------
@@ -1531,17 +1477,13 @@ async fn ws_run(
     let cache = req.cache.unwrap_or(false);
     let cap = req.limit.unwrap_or(10_000).clamp(1, WORKSPACE_RUN_CAP);
     let preview_n = req.preview.unwrap_or(200).clamp(1, cap);
-    let engine = if source.format == Format::Database {
-        // A DB source always goes to the DB engine — for both a raw SQL run and a plain scan.
-        st.db
-            .clone()
-            .ok_or_else(|| ApiError(EngineError::missing_feature("query a database", "sqlite")))?
-    } else if sql.is_some() {
-        st.sql
-            .clone()
-            .ok_or_else(|| ApiError(EngineError::missing_feature("run SQL", "sql")))?
-    } else {
-        st.read.clone()
+    // A database source goes to the database engine, for an SQL run and a plain one alike.
+    let engine = match &sql {
+        Some(_) => st.engine(Need::Query(&[NamedSource {
+            name: "t".to_string(),
+            source: source.clone(),
+        }]))?,
+        None => st.engine(Need::Read(&source))?,
     };
     let store = st.store.clone();
     let ctx = st.ctx();
@@ -1726,9 +1668,11 @@ struct ScanParams {
     fmt: Option<String>,
 }
 
-/// Parse the shared `path/format/json_path/flatten/offset/limit/sort/desc/filter/fmt` query params
-/// into a [`ScanSpec`]. `filter` may repeat; each is `column:op:value` (op =
-/// eq/ne/lt/le/gt/ge/contains).
+/// Parse the shared `path/format/json_path/flatten/offset/limit/sort/desc/filter/cols/fmt` query
+/// params into a [`ScanSpec`]. `filter` may repeat; each is `column:op:value`, with an op
+/// [`FilterOp::parse`] reads (`eq ne lt le gt ge contains notcontains startswith endswith in isnull
+/// notnull`, or an alias of one, such as `>=` or `not_contains`), and `isnull`/`notnull` take no
+/// value.
 fn parse_scan_params(qs: &str) -> Result<ScanParams, ApiError> {
     let pairs = decode_pairs(qs)?;
     let mut path = None;
@@ -1808,62 +1752,6 @@ fn parse_scan_params(qs: &str) -> Result<ScanParams, ApiError> {
         },
         fmt,
     })
-}
-
-/// Pick the engine for a scan: the DataFusion engine (external, unbounded sort/filter) when
-/// it's compiled in, the request actually sorts or filters, **and it can read the source's
-/// format**; otherwise the local reader (fast plain-window reads with offset pushdown, and its own
-/// Arrow-kernel sort/filter over a bounded working set).
-///
-/// The format check keeps a window on an engine that can read it: it once sent every sorted or
-/// filtered window to DataFusion, JSON included, which it could not register then, so a JSON grid
-/// failed on the first click. Falling back costs the planner, never the feature. It asks the
-/// engine's own capabilities rather than a list kept here, because [`router`] accepts any engine
-/// as `sql`. A format SQL reads through the local reader (JSON, Iceberg, Delta) is loaded whole
-/// for each such window: complete over the file, at the cost of holding it in memory.
-fn scan_engine(st: &AppState, source: &Source, spec: &ScanSpec) -> Arc<dyn Engine> {
-    match &st.sql {
-        Some(sql) if !spec.is_plain_window() && can_read(sql.as_ref(), source.format) => {
-            sql.clone()
-        }
-        _ => st.read.clone(),
-    }
-}
-
-/// Does `engine` report `format` among the formats it can read?
-fn can_read(engine: &dyn Engine, format: Format) -> bool {
-    engine
-        .capabilities()
-        .formats
-        .iter()
-        .any(|f| f == format.as_str())
-}
-
-/// Route a source to the engine that can read it: the DB engine for a `Format::Database` source,
-/// else the file read engine. Errors clearly when a DB source arrives with no DB backend compiled.
-fn read_engine(st: &AppState, source: &Source) -> Result<Arc<dyn Engine>, ApiError> {
-    if source.format == Format::Database {
-        st.db
-            .clone()
-            .ok_or_else(|| ApiError(EngineError::missing_feature("query a database", "sqlite")))
-    } else {
-        Ok(st.read.clone())
-    }
-}
-
-/// Like [`scan_engine`] but routes a DB source to the DB engine (which does its own filter/sort).
-fn scan_engine_for(
-    st: &AppState,
-    source: &Source,
-    spec: &ScanSpec,
-) -> Result<Arc<dyn Engine>, ApiError> {
-    if source.format == Format::Database {
-        st.db
-            .clone()
-            .ok_or_else(|| ApiError(EngineError::missing_feature("query a database", "sqlite")))
-    } else {
-        Ok(scan_engine(st, source, spec))
-    }
 }
 
 /// Shape a [`ScanResult`] into the `GET /v1/rows` JSON body. Runs on the blocking worker (it
@@ -1977,6 +1865,79 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/v1/list?dir=catalog://` lists the catalogs this server is configured with, as directories
+    /// the browser walks into, and a catalog reference is refused under `--root` before anything
+    /// reaches a catalog.
+    #[cfg(feature = "catalog")]
+    #[tokio::test]
+    async fn the_browser_lists_configured_catalogs_and_root_refuses_them() {
+        use tower::ServiceExt;
+
+        let home = tempfile::tempdir().unwrap();
+        let state = |root: Option<PathBuf>| AppState {
+            engines: EngineRegistry::new(Arc::new(crate::LocalReaderEngine::default())),
+            default_scan: 10,
+            token: None,
+            root: root.map(Arc::new),
+            loopback: true,
+            store: Arc::new(crate::workspace::LocalStore::at(home.path()).unwrap()),
+            catalogs: Arc::new(
+                crate::catalog::Catalogs::from_configs([
+                    crate::catalog::CatalogConfig::new("prod")
+                        .unwrap()
+                        .with("uri", "https://catalog.example.com"),
+                    crate::catalog::CatalogConfig::new("dev")
+                        .unwrap()
+                        .with("uri", "http://localhost:8181"),
+                ])
+                .unwrap(),
+            ),
+        };
+        let get = |root: Option<PathBuf>, uri: &str| {
+            routes(state(root)).oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+        };
+
+        let response = get(None, "/v1/list?dir=catalog%3A%2F%2F").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entries: Vec<(&str, &str, &str)> = listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().unwrap(),
+                    e["path"].as_str().unwrap(),
+                    e["kind"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            [
+                ("dev", "catalog://dev/", "dir"),
+                ("prod", "catalog://prod/", "dir")
+            ]
+        );
+
+        let root = home.path().canonicalize().unwrap();
+        for uri in [
+            "/v1/list?dir=catalog%3A%2F%2F",
+            "/v1/schema?path=catalog%3A%2F%2Fprod%2Fsales%2Forders",
+        ] {
+            let response = get(Some(root.clone()), uri).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        }
+    }
 
     /// A request's `Accept`, or none at all.
     fn accept(value: Option<&str>) -> HeaderMap {

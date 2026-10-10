@@ -59,11 +59,12 @@
 //! Delta writers periodically emit a `_delta_log/_last_checkpoint` pointer to a
 //! `…N.checkpoint.parquet` that snapshots the state at version `N`, letting readers skip replaying
 //! commits `0..=N`. **This reader does not consult checkpoints** — it replays *all* `*.json`
-//! commits from version 0. That is correct for any table whose json commits are still present
-//! (the default for delta-rs / pyarrow writers that have not run `VACUUM`/log-retention cleanup,
-//! which is the overwhelmingly common case). It would under-report only for a table whose early
-//! json commits have been physically deleted while a checkpoint retained their state — that case
-//! is intentionally out of scope for this JSON-only reader.
+//! commits from version 0. That is correct for any table whose json commits are all still present:
+//! one that log-retention cleanup has not reached. (`VACUUM` deletes unused data files, not
+//! commits, so it does not matter here.) Once cleanup has deleted the early json commits, leaving
+//! a checkpoint with their state, this reader either fails, finding no `metaData` to replay, or
+//! reads only the files added since and under-reports the rows. Reading checkpoints is out of
+//! scope for this JSON-only reader.
 
 #![cfg(feature = "delta")]
 

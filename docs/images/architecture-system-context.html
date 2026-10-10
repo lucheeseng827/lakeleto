@@ -60,7 +60,7 @@
 
     <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="lakeleto-title lakeleto-desc">
       <title id="lakeleto-title">System context — two load-bearing seams</title>
-      <desc id="lakeleto-desc">Architecture diagram showing Lakeleto's CLI and embedded SPA reaching one axum server whose data-read paths are confined to --root, then crossing one of two trait seams: Engine for reads, backed by local arrow/parquet, DataFusion or a remote cloud engine over the tables themselves, and WorkspaceStore for the workbench, backed by a local JSON and Parquet cache or a later cloud store.</desc>
+      <desc id="lakeleto-desc">Architecture diagram showing Lakeleto's CLI and embedded SPA reaching one axum server whose data-read paths are confined to --root, then crossing one of two trait seams: Engine for reads, backed by the local reader (Parquet, CSV, JSON, Arrow IPC), DataFusion or a remote cloud engine over the tables themselves, and WorkspaceStore for the workbench, backed by a local JSON and Parquet cache or a remote store on Lakeleto Cloud.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4a5361"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#a13d24"/></marker>
@@ -166,7 +166,7 @@
       <text x="904" y="167" fill="#1c1f26" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">IMPL</text>
       <text x="976" y="196" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Engine impls</text>
       <text x="976" y="216" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">LocalReaderEngine</text>
-      <text x="976" y="232" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">arrow + parquet + csv</text>
+      <text x="976" y="232" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Parquet · CSV · JSON · Arrow</text>
       <text x="976" y="248" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">DataFusion (--sql)</text>
       <text x="976" y="264" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">Remote → Cloud</text>
 
@@ -198,7 +198,7 @@
       <text x="976" y="420" fill="#1c1f26" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Store impls</text>
       <text x="976" y="440" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">LocalStore · JSON docs</text>
       <text x="976" y="456" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">+ Parquet result cache</text>
-      <text x="976" y="472" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">CloudStore (ee/, later)</text>
+      <text x="976" y="472" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">RemoteStore → Cloud</text>
       <text x="976" y="488" fill="#4a5361" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">same contract</text>
 
       <!-- ~/.lakeleto (store) -->

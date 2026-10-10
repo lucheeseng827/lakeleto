@@ -10,27 +10,53 @@ use std::io::{BufRead, BufReader, Cursor, Read};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{ArrowError, SchemaRef};
 
-use super::{batch_size_for, collect, FileSchema, FormatReader, Input, ReadOptions, SqlSupport};
+use super::{
+    batch_size_for, collect, FileSchema, FormatReader, Input, Pass, PassFn, ReadOptions, SqlSupport,
+};
 use crate::context::RequestContext;
 use crate::error::{EngineError, Result};
-use crate::source::Format;
+use crate::source::{Codec, Format};
 
 pub(crate) struct Delimited {
     format: Format,
     extensions: &'static [&'static str],
+    /// [`Delimited::pass`] for this format, as SQL takes it.
+    pass: PassFn,
 }
 
 pub(crate) static CSV: Delimited = Delimited {
     format: Format::Csv,
     extensions: &["csv"],
+    pass: csv_pass,
 };
 
 pub(crate) static TSV: Delimited = Delimited {
     format: Format::Tsv,
     extensions: &["tsv"],
+    pass: tsv_pass,
 };
+
+/// SQL's pass over a compressed CSV file.
+fn csv_pass(
+    input: Input<'_>,
+    opts: &ReadOptions<'_>,
+    schema: &SchemaRef,
+    each: &mut dyn FnMut(RecordBatch) -> bool,
+) -> Result<Pass> {
+    CSV.pass(input, opts, schema, each)
+}
+
+/// SQL's pass over a compressed TSV file.
+fn tsv_pass(
+    input: Input<'_>,
+    opts: &ReadOptions<'_>,
+    schema: &SchemaRef,
+    each: &mut dyn FnMut(RecordBatch) -> bool,
+) -> Result<Pass> {
+    TSV.pass(input, opts, schema, each)
+}
 
 impl Delimited {
     /// How arrow-csv reads this format: a header row, then rows split on its delimiter.
@@ -67,14 +93,59 @@ impl Delimited {
         opts: &ReadOptions<'_>,
         row_limit: Option<usize>,
     ) -> Result<Vec<RecordBatch>> {
-        let reader = arrow_csv::reader::ReaderBuilder::new(schema.clone())
-            .with_header(true)
-            .with_delimiter(self.format.delimiter())
-            .with_batch_size(batch_size_for(opts, row_limit))
-            .build(r)
-            .map_err(EngineError::arrow)?;
+        let reader = self.reader(schema, r, batch_size_for(opts, row_limit))?;
         collect(ctx, reader, row_limit)
     }
+
+    /// The rows read from `r`, decoded as `schema`, `batch_size` to a batch.
+    fn reader<R: Read>(
+        &self,
+        schema: &SchemaRef,
+        r: R,
+        batch_size: usize,
+    ) -> Result<arrow_csv::Reader<R>> {
+        arrow_csv::reader::ReaderBuilder::new(schema.clone())
+            .with_header(true)
+            .with_delimiter(self.format.delimiter())
+            .with_batch_size(batch_size)
+            .build(r)
+            .map_err(EngineError::arrow)
+    }
+
+    /// Every row of `input`, decoded as `schema` and handed to `each` until it returns `false`:
+    /// SQL's [`PassFn`] for a compressed file of this format. A value that does not fit `schema`,
+    /// one past the rows it was inferred from, fails the pass, as it fails DataFusion's own scan
+    /// of a file that is not compressed. Read as [`Delimited::read`] reads, so arrow-csv is built
+    /// for no reader type it was not built for already.
+    fn pass(
+        &self,
+        input: Input<'_>,
+        opts: &ReadOptions<'_>,
+        schema: &SchemaRef,
+        each: &mut dyn FnMut(RecordBatch) -> bool,
+    ) -> Result<Pass> {
+        let size = opts.batch_size;
+        match input {
+            Input::File(path) => hand_over(self.reader(schema, File::open(path)?, size)?, each),
+            Input::Bytes(bytes) => hand_over(self.reader(schema, Cursor::new(bytes), size)?, each),
+            Input::Object(object) => {
+                hand_over(self.reader(schema, object.open(None)?, size)?, each)
+            }
+        }
+    }
+}
+
+/// Every batch of `batches`, handed to `each` until it returns `false`.
+fn hand_over(
+    batches: impl Iterator<Item = std::result::Result<RecordBatch, ArrowError>>,
+    each: &mut dyn FnMut(RecordBatch) -> bool,
+) -> Result<Pass> {
+    for batch in batches {
+        if !each(batch.map_err(EngineError::arrow)?) {
+            break;
+        }
+    }
+    Ok(Pass::Done)
 }
 
 impl FormatReader for Delimited {
@@ -86,12 +157,22 @@ impl FormatReader for Delimited {
         self.extensions
     }
 
-    fn sql(&self) -> SqlSupport {
-        SqlSupport::Native
+    /// DataFusion's own scan, which splits a file across every core — unless it is compressed:
+    /// then a pass at a time through this reader, as DataFusion would decompress it with no limit
+    /// (and on one core: a compressed file cannot be split).
+    fn sql(&self, codec: Option<Codec>) -> SqlSupport {
+        match codec {
+            Some(_) => SqlSupport::Streamed(self.pass),
+            None => SqlSupport::Native,
+        }
     }
 
     /// An object is read as its bytes arrive, one request a read.
     fn streams_objects(&self) -> bool {
+        true
+    }
+
+    fn compressible(&self) -> bool {
         true
     }
 
@@ -201,6 +282,56 @@ mod tests {
         // The delimiter is the format's: the same bytes as CSV are one column.
         let as_csv = CSV.schema(Input::Bytes(body), &opts).unwrap().schema;
         assert_eq!(as_csv.fields().len(), 1);
+    }
+
+    /// Compressed, a CSV or TSV file is read by SQL a pass at a time through this reader: every
+    /// row, a batch at a time, from a file, its bytes or an object alike, and no further than the
+    /// query takes.
+    #[test]
+    fn a_pass_hands_over_every_row_until_told_to_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = ReadOptions {
+            batch_size: 2,
+            csv_infer_rows: 10,
+            json_path: None,
+        };
+        for (reader, body) in [
+            (&CSV, "a,b\n1,x\n2,y\n3,z\n"),
+            (&TSV, "a\tb\n1\tx\n2\ty\n3\tz\n"),
+        ] {
+            let SqlSupport::Streamed(pass) = reader.sql(Some(Codec::Gzip)) else {
+                panic!("{} is read natively, compressed", reader.format());
+            };
+            let schema = reader
+                .schema(Input::Bytes(body.as_bytes()), &opts)
+                .unwrap()
+                .schema;
+            assert_eq!(schema.fields().len(), 2, "{}", reader.format());
+            let path = dir.path().join(reader.extensions()[0]);
+            std::fs::write(&path, body).unwrap();
+            let object = MemObject::new("s3://bucket/t", "v1", body);
+            for input in [
+                Input::File(&path),
+                Input::Bytes(body.as_bytes()),
+                Input::Object(&object),
+            ] {
+                let mut rows = Vec::new();
+                let mut every = |batch: RecordBatch| {
+                    rows.push(batch.num_rows());
+                    true
+                };
+                let done = pass(input, &opts, &schema, &mut every).unwrap();
+                assert!(matches!(done, Pass::Done));
+                assert_eq!(rows, [2, 1], "{} {input:?}", reader.format());
+                let mut batches = 0;
+                let mut first = |_: RecordBatch| {
+                    batches += 1;
+                    false
+                };
+                pass(input, &opts, &schema, &mut first).unwrap();
+                assert_eq!(batches, 1, "{} {input:?}: stops when told", reader.format());
+            }
+        }
     }
 
     /// `rows` CSV records under a header, every seventh with a quoted line break and padded so a

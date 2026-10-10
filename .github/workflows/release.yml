@@ -54,8 +54,13 @@ env:
   # index.docker.io for this reason. Tags, `docker run` and cosign keep IMAGE.
   ATTEST_SUBJECT: index.docker.io/mancube/lakeleto
   # Server build profile: HTTP/JSON API + embedded SPA, SQL engine, Iceberg + Delta readers,
-  # object-store, plus read-only SQLite/Postgres/MySQL database backends.
-  FEATURES: serve,sql,iceberg,object-store,sqlite,postgres,mysql,delta
+  # object-store, Iceberg REST catalogs, read-only SQLite/Postgres/MySQL database backends,
+  # `lakeleto mcp` (the MCP server for agents), the `remote` engine, a client for another
+  # Lakeleto server (`--remote-url`), `parquet-out`, Parquet output from the CLI (`-o parquet`),
+  # and `compression`, zstd, bzip2 and xz text. None of the last three adds a crate: reqwest is
+  # already in for `catalog`, the Parquet writer for `serve`'s exports, and the three codecs for
+  # DataFusion's own reads.
+  FEATURES: serve,sql,iceberg,object-store,catalog,sqlite,postgres,mysql,delta,mcp,remote,parquet-out,compression
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:

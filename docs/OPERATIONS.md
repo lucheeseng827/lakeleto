@@ -56,16 +56,28 @@ lakeleto open data/events.parquet    # start server + launch a browser tab deep-
   history, shell history, and proxy/access logs.
 - **Filesystem confinement.** By default `serve` will read any path the process can
   (the "point at any file" behaviour). `--root <dir>` confines all `/v1/*` file access to
-  one directory: paths outside it — and *all* object-store URIs — are refused with a
-  uniform 403 that leaks nothing (same message whether out-of-root, missing, or
+  one directory: paths outside it — and *all* object-store URIs and `catalog://` references —
+  are refused with a uniform 403 that leaks nothing (same message whether out-of-root, missing, or
   unreadable). Confinement is enforced *before* the filesystem is touched and re-checked
   for every member a directory dataset / Iceberg table actually reads. **Set `--root`
   whenever you expose the API beyond your own machine.**
-- **Reads stay local.** Local and Iceberg reads never touch the network. Object-store
+- **Reads stay local.** Reads of local files and tables never touch the network. Object-store
   reads use *your own* credentials with zero hosted compute — bytes go bucket → machine,
   nothing is uploaded. The `remote` engine is opt-in and never a default.
-- **Read-only.** `query` / `POST /v1/query` reject anything that isn't
+- **A table in an object store stays in it.** An Iceberg table in a store may name only
+  objects. A manifest that names a local path or a `file://` URI is refused rather than
+  followed, so a table someone else wrote can't make the server read its disk.
+- **A catalog is trusted with what it serves, and checked on what it asks.** A `catalog://` table
+  is read where its catalog says its metadata is, with the credentials it vends. Lakeleto reaches
+  a catalog over `https`, or plain `http` only to this machine, never follows a redirect with a
+  login, and refuses a table whose catalog requires row filters or column masks it cannot apply.
+- **Read-only.** `query` / `POST /v1/query` / the MCP `query` tool reject anything that isn't
   `SELECT`/`WITH`/`EXPLAIN`. Lakeleto never mutates your data.
+- **`lakeleto mcp` opens no socket.** It speaks only to the client that started it, on its stdin
+  and stdout, and reads with that user's permissions and credentials. `--root` confines it
+  exactly as it confines `serve`, with the same checks, and every tool is read-only. What a tool
+  returns goes to the agent, and from there to the model service it runs on: point `--root` at
+  what you're willing to send there.
 
 ## Object-store credentials (BYO)
 
@@ -87,11 +99,35 @@ lakeleto schema s3://my-bucket/events.parquet
 Note: `--root` confinement is local-filesystem only, so it always refuses object-store
 URIs. A `serve` deployment that must stay on-disk only is naturally covered by `--root`.
 
+## Catalog credentials (`--features catalog`)
+
+A `catalog://` table involves two logins, kept apart:
+
+- **The catalog's own.** `token` sends a bearer token. `credential` runs OAuth2 client
+  credentials against `oauth2-server-uri`. Both come from `$LAKELETO_HOME/catalogs.toml` or, better
+  for a secret, its `LAKELETO_CATALOG__<NAME>__<KEY>` variable. A token from the flow is kept in
+  memory and fetched again before it expires, or when the catalog stops taking it.
+- **The table's files.** Lakeleto reads them with:
+  1. the credentials the catalog vends for the table;
+  2. else the storage keys configured for the catalog;
+  3. else this machine's, as any `s3://` read uses them.
+
+  A catalog with `storage-fallback = "none"` refuses the third, so its tables are never read as
+  this machine. Set it for a catalog you don't trust with this machine's credentials: on the third
+  step, the catalog still says which bucket and endpoint they are used against. `lakeleto info`
+  and `/v1/info` say which one a read used.
+
+Neither login is written to disk, put in a log or an error message, or printed by `lakeleto
+catalog ls`. On Unix, Lakeleto warns when `catalogs.toml` holds a secret and other users can read
+it. `chmod 600` it, or move the secret to its variable.
+
 ## Resource notes
 
 - **Streams; flat RAM.** The grid renders only the visible rows over a spacer sized to
-  the total and fetches windows from `/v1/rows` on scroll, so it browses
-  **larger-than-memory Parquet**. Remote Parquet is read with ranged requests (footer +
+  the total and fetches 200-row windows from `/v1/rows` on scroll, two at a time and
+  8,000 rows at most in the browser, so it browses **larger-than-memory Parquet**. A
+  window that fails is asked for again after 3 seconds, then less often, up to every
+  30. Remote Parquet is read with ranged requests (footer +
   only the row groups a window touches); local Parquet reads are windowed the same way.
   A CSV window is read from the file's start as far as the window: from local disk, or as
   one streamed request to an object store. A JSON window is read the same way, except that
@@ -101,15 +137,34 @@ URIs. A `serve` deployment that must stay on-disk only is naturally covered by `
 - **Bounded scans.** Profiles scan up to `--scan` rows (CLI, default 10k) /
   `--default-scan` (server). Without the `sql` feature, grid sort/filter runs over a
   bounded working set (~200k rows) and the `/v1/rows` response's `bounded` flag marks a
-  partial view; with `sql`, sort/filter/count are pushed into DataFusion (exact,
-  unbounded). Exports are capped at 1,000,000 rows **and** 512 MiB (413 past either) —
+  partial view; with `sql`, sort/filter/count are pushed into DataFusion and are exact over
+  the whole table, an Iceberg or Delta table or a Parquet directory being read into memory
+  whole for it first. Exports are capped at 1,000,000 rows **and** 512 MiB (413 past either) —
   narrow the view (filters / fewer columns) for large downloads.
+- **MCP calls are small.** A `lakeleto mcp` call returns at most `--max-rows` rows (1,000) and
+  `--max-bytes` of JSON (32 KiB), and is answered within `--timeout` seconds (30). Each call runs
+  on a thread of its own, so an agent's parallel calls run at once, up to 16 (one more is
+  refused as `busy`), and a `ping` is answered during a long one. A call whose engine doesn't
+  stop at the deadline (a database query, once it has started) is answered with an error a
+  second after it; its thread runs on until the engine returns, and its result is dropped.
 - **Workspace store.** Persisted under `$LAKELETO_HOME` (`~/.lakeleto/workspaces/<id>/`):
   `workspace.json` + `history.jsonl` + `results/*.parquet` result cache. Runs are capped
   at 100k rows; result uploads (sync path) at 128 MiB. Back up `~/.lakeleto` if the saved
   queries / cached results matter.
 
 ## Troubleshooting (symptom first)
+
+- **``no catalog named `prod` is configured``.** Lakeleto read `$LAKELETO_HOME/catalogs.toml` and
+  the `LAKELETO_CATALOG__…` variables and found no `prod`. The message lists the catalogs it did
+  find. A `serve` started before the file was written needs a restart.
+- **``catalog `prod` refused the request: … 401``.** The token is wrong or expired, or the client
+  credentials are. A refused client-credentials login names the identity provider's reason
+  (`invalid_client: …`).
+- **`… is a namespace, not a table`.** The reference names a namespace. List it with `lakeleto
+  catalog ls <reference>/`.
+- **`Forbidden` reading a catalog table's files.** The message ends with whose credentials the read
+  used. If those were this machine's, the catalog vended none: check that it is configured to vend
+  credentials, or set storage keys for it.
 
 What the client sees → why → what to do.
 
@@ -123,6 +178,8 @@ What the client sees → why → what to do.
 | `400` `<uri> is an object-store URI — rebuild with --features object-store` | An `s3://`/`gs://`/`az://` path without the feature | Rebuild with `--features object-store` and set the store's env credentials. |
 | `413` export is `N` bytes, over the cap | Export view exceeds 1,000,000 rows or 512 MiB | Narrow with filters / fewer columns, or export a smaller window. |
 | `404` JSON `no such endpoint: /v1/…` | Typo'd `/v1/*` path (API misses never fall back to the SPA) | Check the path against [CONFIG.md](./CONFIG.md#serve-httpjson-endpoints) / `GET /v1/engines`. |
+| `query a database` … `rebuild with … --features sqlite` on a `sqlite://`, `postgres://` or `mysql://` table | Binary built without a database engine | Rebuild with `--features sqlite` (or `postgres`, `mysql`). |
+| `lakeleto engines --remote-url …` fails on `…/v1/engines` | The server serves only part of `/v1`, as a hosted plane does, and not `/v1/engines` | Its other routes still answer; the client reports its capabilities as unknown. Check which version a server speaks with `curl -sI <url>/healthz`: a versioned one sends `X-Lakeleto-Protocol`. |
 | Startup: `WARNING binding <addr> (non-loopback) with no --token — the API is unauthenticated` | `--addr` is non-loopback and no token set | Add `--token`, and front it with a TLS proxy; or bind loopback. |
 | Startup fails: `--root <dir> … / is not a directory` | `--root` path is missing or not a directory | Create the directory / fix the path. |
 | Browser tab didn't open on `lakeleto open` (headless/CI) | No browser to launch | Expected — the URL is printed to stderr; open it yourself or use `serve` + `curl`. |

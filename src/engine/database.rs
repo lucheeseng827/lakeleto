@@ -878,6 +878,29 @@ pub fn list_tables(ctx: &RequestContext, url_path: &str) -> Result<Vec<String>> 
     }
 }
 
+/// A database's tables as a [`DirListing`](crate::source::DirListing), for a browser that walks
+/// it as it walks a directory: each table is a file entry whose path is the database URI with
+/// `?table=<name>`, so opening it opens that table. A `?table=` already on `dir` is dropped, so the
+/// whole database is listed. Used by `/v1/list` and the MCP `list` tool.
+pub fn table_listing(ctx: &RequestContext, dir: &str) -> Result<crate::source::DirListing> {
+    let base = dir.split('?').next().unwrap_or(dir).to_string();
+    let entries = list_tables(ctx, dir)?
+        .into_iter()
+        .map(|name| crate::source::DirEntry {
+            path: format!("{base}?table={name}"),
+            name,
+            kind: "file",
+            format: Some("database".to_string()),
+            size: None,
+        })
+        .collect();
+    Ok(crate::source::DirListing {
+        dir: base,
+        parent: None,
+        entries,
+    })
+}
+
 /// Collect table names from a per-row `try_get` result, turning a decode failure into an
 /// [`EngineError::Query`]. Shared by every dialect's [`list_tables`] arm.
 fn collect_names<I>(rows: I) -> Result<Vec<String>>
@@ -1002,7 +1025,7 @@ impl Engine for DatabaseEngine {
         );
         let rb = fetch_batch(&uri, &sql, &[])?;
         let scanned_rows = rb.num_rows() as u64;
-        let columns = profile_columns(&rb.schema, &rb.batches);
+        let columns = profile_columns(&rb.schema, &rb.batches)?;
         Ok(TableProfile {
             source: source.display(),
             engine: self.name().to_string(),

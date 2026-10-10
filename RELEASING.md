@@ -45,9 +45,10 @@ publish in order.
    - **pushes** a multi-arch (`linux/amd64`+`linux/arm64`) distroless image to
      `docker.io/mancube/lakeleto:{vX.Y.Z,latest}`, cosign-signed + SLSA-attested.
 
-Which release-build features are compiled into the published binary/image
-(default lean vs. `serve,sql,iceberg,object-store`) is set by the workflow's
-build matrix — confirm it matches what this doc advertises before tagging.
+The binaries, the image and the installers are built with the workflow's
+`FEATURES` (`serve,sql,iceberg,object-store,catalog,sqlite,postgres,mysql,delta,mcp,remote,parquet-out,compression`;
+the installers add `desktop`). Confirm that the README and the guide advertise
+what it builds before tagging.
 
 `workflow_dispatch` re-runs the pipeline against an existing tag (input `tag`);
 `promote` re-points Homebrew + `:latest` (use only for the newest tag).

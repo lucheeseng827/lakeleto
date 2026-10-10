@@ -1,8 +1,10 @@
 # Security Policy
 
-Lakeleto reads columnar data files — Parquet, CSV/TSV, Iceberg tables — from local
+Lakeleto reads tables — Parquet, CSV/TSV, JSON and Arrow IPC files (text compressed
+too), Iceberg and Delta tables, and read-only SQLite/Postgres/MySQL tables — from local
 disk and (with `--features object-store`) from object stores using **your own**
-credentials, and can expose the `Engine` surface over HTTP (`lakeleto serve`).
+credentials, and can expose the `Engine` surface over HTTP (`lakeleto serve`) and to AI
+agents over stdio (`lakeleto mcp`).
 Parsers over untrusted files and a network listener are the sensitive surfaces,
 so we treat security reports with priority and coordinate disclosure.
 
@@ -18,8 +20,9 @@ then, GitHub private vulnerability reporting is the supported channel.)*
 
 Include, where you can:
 
-- the affected component (the `lakeleto` binary, the local reader, the `sql`,
-  `iceberg`, `object-store`, or `serve` feature) and version / commit,
+- the affected component (the `lakeleto` binary, the local reader, or a feature:
+  `sql`, `iceberg`, `delta`, `catalog`, `object-store`, `sqlite` / `postgres` /
+  `mysql`, `compression`, `serve`, `mcp`, `remote`) and version / commit,
 - a description of the issue and its impact (e.g. a crafted Parquet/Avro file
   causing memory unsafety or unbounded allocation, path traversal past the
   `serve --root` confinement, a `serve` auth-token bypass, credential leakage),
@@ -38,9 +41,10 @@ Include, where you can:
 
 In scope — the OSS engine in this module, specifically:
 
-- **Malformed-input handling** — a crafted Parquet, CSV/TSV, Avro/Iceberg
-  metadata, or manifest file that causes a crash, memory unsafety, or unbounded
-  resource consumption in the reader.
+- **Malformed-input handling** — a crafted Parquet, CSV/TSV, JSON or Arrow IPC
+  file, Avro/Iceberg metadata or manifest, Delta log, or compressed file (one that
+  inflates past `--max-decompressed`) that causes a crash, memory unsafety, or
+  unbounded resource consumption in the reader.
 - **`serve` confinement bypass** — reaching a file outside the `--root` boundary
   (`confine_entry` / `confine_members`), or a path-traversal / SSRF via a `path=`
   or object-store URI parameter.

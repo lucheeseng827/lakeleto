@@ -2,18 +2,19 @@
 
 A task-oriented tour: start it, understand how it thinks, then worked examples —
 **viewing daily data**, **exploring in the browser**, **batch-querying many files
-at once**, **reusable `{{variables}}`**, and **reading your S3 / GCS / Azure data
-locally**.
+at once**, **reusable `{{variables}}`**, **reading your S3 / GCS / Azure data
+locally**, and **letting an AI agent read your tables**.
 
 Everything runs on your own machine. Lakeleto never uploads your data and needs
 no account or server.
 
 > The prebuilt release binary already includes every optional engine (`serve`,
-> `sql`, `iceberg`, `object-store`, `delta`, and the `sqlite`/`postgres`/`mysql`
-> database connectors) on top of the built-in `local` reader, so the commands
-> below are just `lakeleto …` — no `--features` flag needed. If you build from
-> source, add
-> `--features serve,sql,iceberg,object-store,delta,sqlite,postgres,mysql`.
+> `sql`, `iceberg`, `object-store`, `catalog`, `delta`, the `sqlite`/`postgres`/`mysql`
+> database connectors, and `remote`, a client for another Lakeleto server) on top of the
+> built-in `local` reader, the MCP server (`mcp`), Parquet output (`parquet-out`) and the zstd,
+> bzip2, xz and Brotli decoders (`compression`), so the commands below are just `lakeleto …` — no
+> `--features` flag needed. If you build from source, add
+> `--features serve,sql,iceberg,object-store,catalog,delta,sqlite,postgres,mysql,mcp,remote,parquet-out,compression`.
 
 ---
 
@@ -32,9 +33,10 @@ Stop the server anytime with **Ctrl-C**. (New to the terminal? See the
 
 ## 2. How Lakeleto thinks (the 3 ideas)
 
-1. **A source is a file or a folder.** Parquet, CSV, or TSV on local disk, an
-   Iceberg table, or an object-store URI (`s3://…`). Point Lakeleto at it and it
-   reads the bytes directly — no import step, no copy.
+1. **A source is a file or a folder.** Parquet, CSV/TSV, JSON or Arrow IPC on
+   local disk (text gzip-, zstd-, bzip2- or xz-compressed too), an Iceberg or Delta
+   table, a database table, or an object-store URI (`s3://…`). Point Lakeleto at it
+   and it reads the bytes directly — no import step, no copy.
 2. **In SQL, your source is the table `t`.** The SQL tab (and `lakeleto query`)
    register the current file as a table named `t`, so every query is
    `… FROM t`. Queries are **read-only** — Lakeleto is an explorer, not an editor.
@@ -100,17 +102,54 @@ ORDER BY date DESC
 > `lakeleto open "exports/orders-$(date +%F).parquet"` on macOS/Linux — one
 > command each morning opens today's file in the browser.
 
+### Compressed files, and Arrow files from Python
+
+A compressed text file opens as the format it holds, and an Arrow file as the table it is:
+
+```bash
+lakeleto open logs/2026-07-18.ndjson.gz        # gzip: decompressed as it is read
+lakeleto head exports/orders.csv.zst -n 20     # zstd, bzip2 and xz too
+lakeleto open features.feather                 # df.to_feather(…) in pandas, df.write_ipc(…) in Polars
+lakeleto schema features.feather               # the exact row count, from the file's footer
+```
+
+- **Compressed text:** `.csv`, `.tsv`, `.json`, `.ndjson` and `.jsonl` with `.gz`, `.zst`, `.bz2`
+  or `.xz` after them. A file in an object store is decompressed as it streams, so the first rows
+  arrive without a download. Every build reads gzip; zstd, bzip2 and xz need
+  `--features compression` when you build from source, and the release binaries have it. A read
+  stops at 4 GiB of decompressed bytes, which `--max-decompressed` changes: the guard against a
+  small file that inflates without end.
+- **Parquet from Polars:** Polars compresses Parquet with zstd unless told otherwise, as Iceberg
+  does its data files; pyarrow, pandas, DuckDB and Spark use Snappy. Every build reads Snappy, gzip
+  and LZ4 Parquet; zstd and Brotli need `--features compression` when you build from source
+  (`iceberg` reads zstd too), and the release binaries have it. A build without them refuses such
+  a file's rows, naming the feature; `schema`, `info` and `profile --fast`, which read only its
+  footer, work all the same.
+- **Arrow:** `.arrow`, `.feather` and `.ipc` files, and `.arrows` streams, as pyarrow, pandas,
+  Polars and `lakeleto -o arrow` write them. A file says how many rows it holds in its footer, so
+  the grid knows its end, and a window reads only the batches it covers, from an object store too.
+  Feather's default LZ4 compression reads in every build, zstd with `compression`. Feather v1 files,
+  from pyarrow before 0.17, are not read.
+- **Time zones:** a tz-aware UTC column, a pandas `datetime64[…, UTC]` or a pyarrow
+  `timestamp[us, tz=UTC]`, shows as `2024-01-02T03:04:05Z` in every build, and so does a column
+  in an offset such as `+02:00`. Another zone, such as `Europe/Paris`, is shown in its own time by
+  the release binaries and the image. A build from source without `--features sql` has no time
+  zone database, and refuses such a column in text output, naming its zone.
+
 ---
 
 ## 4. Example — explore a table in the browser
 
 Once a file is open:
 
-- **Grid** — scroll rows (windowed, so million-row files stay smooth). Type in a
+- **Grid** — scroll rows, from the first to the last: the grid reads them a window
+  at a time as you scroll, so a two-million-row file stays smooth. A CSV, TSV or
+  JSON file's total isn't known until its end is read, so the footer says
+  `≥ N` and the scrollbar grows as you scroll. Type in a
   column's **filter** box: plain text is a *contains* match; prefix
   `>` `<` `>=` `<=` `=` `!=` for comparisons (e.g. `>= 100` on an amount column,
   or `Singapore` on a city column). Click a header to **sort**, a cell to copy
-  it, a row for the full **Row detail** panel.
+  it, a row's number for the full **Row detail** panel.
 - **Schema** — every column, its type, nullability, and the exact row count.
 - **Profile** — per-column null %, distinct count, min/max, and sample values —
   a fast data-quality read on any file.
@@ -128,6 +167,47 @@ lakeleto profile --fast sales.parquet          # instant, from Parquet footer st
 lakeleto query "SELECT city, count(*) n FROM t GROUP BY city ORDER BY n DESC" --file sales.csv
 lakeleto head sales.parquet -o json | jq .     # pipe-friendly
 ```
+
+### Output for other tools
+
+`-o` picks the format (`table`, `json`, `ndjson`, `csv`, `tsv`), and for rows, from `head`, `query`
+and `catalog ls`, three that keep their types for the next program: `parquet`, `arrow` and
+`arrows`. `--out <file>` writes to a file instead of stdout and, with no `-o`, takes the format
+from the file's extension:
+
+```bash
+# A Parquet file DuckDB, Polars, pandas or Spark reads as a table, with its types:
+lakeleto query "SELECT * FROM t WHERE amount > 100" --file sales.csv --out big.parquet
+duckdb -c "SELECT city, sum(amount) FROM 'big.parquet' GROUP BY city"
+
+# An Arrow stream straight into Python, with no file in between:
+lakeleto head sales.parquet -n 100000 -o arrows | python -c '
+import sys, polars as pl
+print(pl.read_ipc_stream(sys.stdin.buffer).describe())'
+
+# An Arrow file (Feather v2) for pandas.read_feather or polars.read_ipc:
+lakeleto head sales.parquet --out sample.arrow
+```
+
+- **`arrow` or `arrows`.** `arrow` is the Arrow IPC *file* format, what `.arrow` and `.feather`
+  name, and its readers look for an index at the end of the file. `arrows` is the *stream* format,
+  which a reader takes from a pipe as it arrives (`polars.read_ipc_stream`,
+  `pyarrow.ipc.open_stream`). DuckDB reads the Parquet file, but takes neither format from a pipe.
+- **Nested columns stay nested.** A list, struct or map is the formats' own, where `csv` writes
+  it as JSON text. A dictionary-encoded column, such as a pandas or Polars categorical, keeps its
+  dictionary in `parquet` and `arrows`; `arrow` writes its values, because that format holds one
+  dictionary per column for the whole file.
+- **`--out` is all or nothing.** The file appears only when the command succeeds. A failed run
+  leaves no half-written file, and keeps the one that was there. On Unix it also keeps that
+  file's permissions, so a report you made private stays private, and nobody else can read the
+  output while it is being written. A run you interrupt keeps the old file too, but can leave
+  its hidden temporary file beside it, named `.lakeleto.<pid>-<hex>.tmp`, for you to delete.
+- **Not on a terminal.** These three are bytes, so Lakeleto refuses to print them to a terminal:
+  give `--out`, redirect, or pipe.
+- **Parquet needs `--features parquet-out`** when you build from source. The release binaries
+  and the image have it; without it, `-o parquet` is refused before anything is read. Its writer
+  is about 530 KB of the default build, where the Arrow writers are about 110 KB, so every build
+  writes `arrow` and `arrows`.
 
 ---
 
@@ -315,6 +395,17 @@ Read-only by design (an explorer, not an editor) — write statements are refuse
 and the connection is opened read-only. NUMERIC/DECIMAL render as numbers and
 dates/timestamps as text.
 
+**From the terminal**, a database URI goes wherever a path does:
+
+```bash
+lakeleto head 'sqlite:///home/me/app.db?table=orders'
+lakeleto schema 'sqlite:///home/me/app.db?table=orders'
+lakeleto query --file 'sqlite:///home/me/app.db' \
+  "SELECT city, count(*) AS n FROM orders GROUP BY city ORDER BY n DESC"
+```
+
+The SQL runs on the database itself, so it names the database's own tables.
+
 ## 9. Example — lakehouse tables (Iceberg · Delta · partitioned Parquet)
 
 Point Lakeleto at a lakehouse table directory and it reads the **correct current
@@ -325,13 +416,42 @@ snapshot**, not the raw files. All auto-detected — no format flag needed.
 ```bash
 lakeleto open ./warehouse/db/orders            # local Iceberg table
 ```
-Reads the current snapshot's Parquet data files (incl. merge-on-read positional
-deletes). Also works over object storage — an `s3://bucket/warehouse/db/orders`
+Reads the current snapshot's Parquet data files (incl. merge-on-read positional and
+equality deletes). Also works over object storage — an `s3://bucket/warehouse/db/orders`
 prefix with a `metadata/` child auto-detects as Iceberg and is read with your own
 env credentials (see §7 for the AWS/GCS/Azure vars):
 ```bash
 lakeleto open s3://my-bucket/warehouse/db/orders
 ```
+It is read in place. Lakeleto fetches the current snapshot's metadata and manifests,
+then reads data files by ranged requests, only as far as a read goes: a page of the
+grid reads part of one file. Earlier snapshots, and files the table no longer uses,
+are never fetched, and nothing is copied to disk.
+
+**Iceberg through a REST catalog** — name the table, not where it is
+(`--features catalog`; Polaris, Lakekeeper, Nessie, Unity Catalog):
+
+```bash
+# ~/.lakeleto/catalogs.toml
+#   [catalog.prod]
+#   uri = "https://polaris.example.com/api/catalog"
+#   warehouse = "analytics"
+#   oauth2-server-uri = "https://polaris.example.com/api/catalog/v1/oauth/tokens"
+export LAKELETO_CATALOG__PROD__CREDENTIAL='<client-id>:<client-secret>'
+
+lakeleto catalog ls                         # the configured catalogs
+lakeleto catalog ls catalog://prod/         # prod's namespaces
+lakeleto catalog ls catalog://prod/sales/   # what is in sales
+lakeleto info catalog://prod/sales/orders   # rows, columns, and whose credentials read it
+lakeleto open catalog://prod/sales/orders   # in the browser
+lakeleto query "SELECT count(*) FROM t" --table t=catalog://prod/sales/orders
+```
+The catalog says which metadata is current and vends credentials for the table's
+files, which Lakeleto keeps in memory and asks for again before they expire. In the
+browser, open a `catalog://` reference from **Open a source**: the sidebar then lists
+its namespace, and its folders and tables open like any others. Keys, environment
+variables and the credential order are in
+[CONFIG.md](./CONFIG.md#catalogs-catalogstoml).
 
 **Delta Lake** — a directory containing `_delta_log/`:
 
@@ -341,8 +461,10 @@ lakeleto open ./warehouse/delta_orders
 Lakeleto replays the transaction log (`_delta_log`), so an overwritten or
 row-deleted table reads the **right rows** — not the stale/removed Parquet files
 still sitting on disk. Partition columns are filled from the log. (JSON commit
-log; checkpoints aren't consulted — correct whenever the `*.json` commits are
-present, i.e. no `VACUUM`/log cleanup.)
+log; checkpoints aren't read, so the table's `*.json` commits must all still be
+there. Once log cleanup has removed the early ones, the table either fails to open
+or shows only the files added since, with a row count that falls short. `VACUUM`,
+which deletes unused data files, is fine.)
 
 **Hive-partitioned Parquet** — a directory of `date=…/region=…/*.parquet`:
 
@@ -360,7 +482,111 @@ FROM t GROUP BY region ORDER BY n DESC
 
 ---
 
-## 10. Sharing it safely (beyond your own machine)
+## 10. Example — let an AI agent read your tables (MCP)
+
+`lakeleto mcp` lets an AI agent read your tables: Claude Code, Claude Desktop,
+Cursor, or any other client of the [Model Context Protocol](https://modelcontextprotocol.io).
+The client starts it and talks to it on its stdin and stdout, so there is nothing
+for you to run. Everything it can do is read.
+
+**Claude Code** — add it, confined to your project's `data/` folder:
+
+```bash
+claude mcp add lakeleto -- lakeleto mcp --root "$PWD/data"
+```
+
+or share it with everyone on the project, in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "lakeleto": {
+      "command": "lakeleto",
+      "args": ["mcp", "--root", "${CLAUDE_PROJECT_DIR}/data"]
+    }
+  }
+}
+```
+
+**Claude Desktop** — *Settings → Developer → Edit Config* opens
+`claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`,
+Windows: `%APPDATA%\Claude\`). Desktop starts a server from no particular folder,
+so give it absolute paths; `which lakeleto` (`where lakeleto` on Windows) prints
+the binary's:
+
+```json
+{
+  "mcpServers": {
+    "lakeleto": {
+      "command": "/usr/local/bin/lakeleto",
+      "args": ["mcp", "--root", "/Users/me/data"]
+    }
+  }
+}
+```
+
+**Cursor** — `.cursor/mcp.json` in the project, or `~/.cursor/mcp.json` for every
+project:
+
+```json
+{
+  "mcpServers": {
+    "lakeleto": {
+      "type": "stdio",
+      "command": "lakeleto",
+      "args": ["mcp", "--root", "${workspaceFolder}"]
+    }
+  }
+}
+```
+
+**From the Docker image**, with the folder mounted read-only (`-i` keeps stdin
+open), in any of the files above:
+
+```json
+{
+  "mcpServers": {
+    "lakeleto": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-v", "/Users/me/data:/data:ro",
+               "mancube/lakeleto", "mcp", "--root", "/data"]
+    }
+  }
+}
+```
+
+Then ask in plain words — *"what's in orders.parquet?"*, *"which cities have the
+most orders?"* — and the agent picks the tools:
+
+| Tool | What it does |
+| --- | --- |
+| `list` | What's in a directory: its subdirectories and tables. Also an object-store prefix, a database's tables, or a catalog namespace. |
+| `describe` | What's in a table, without reading its rows: columns and types, the row count, and for a Parquet file each column's null count, min and max from its footer. A CSV or JSON file stores neither, so its types are inferred from its first rows. |
+| `preview` | Rows, from any `offset`, optionally only some `columns`. |
+| `profile` | For each column: null count and fraction, distinct values, min, max and samples, from a scan of up to `scan` rows. |
+| `query` | One read-only SQL statement over the tables it names (`path` is the table `t`). Anything that writes is refused. |
+| `catalog_ls` | The configured Iceberg REST catalogs, their namespaces and their tables. |
+
+What keeps it in bounds:
+
+- `--root <dir>` — only paths under `<dir>` can be read, and relative paths are
+  taken from it. Object-store, database and catalog references are refused, as
+  with `serve` (§11). Without `--root`, the agent can read whatever your user can.
+- `--max-rows <N>` (default `1000`) and `--max-bytes <N>` (default `32768`) — the
+  most one call returns. A result that was cut says `truncated` and why, so the
+  agent narrows its question rather than filling its context.
+- `--timeout <secs>` (default `30`) — a call that runs longer is answered with
+  an error. Reading files stops at the deadline; a database query that has
+  started runs on to its end, and its result is dropped.
+- A refused call says what kind of refusal it is (`forbidden`, `not_found`,
+  `query`, `deadline`, `invalid_arguments`, …), so the agent can correct itself.
+
+> The agent sees what the tools return, and so does the service that runs it.
+> Point `--root` at data you're happy for both to read.
+
+---
+
+## 11. Sharing it safely (beyond your own machine)
 
 By default `serve` binds to loopback (`127.0.0.1`) and the API is open — fine for
 your own machine. If you expose it (a shared box, a container), lock it down:
@@ -383,7 +609,7 @@ directly. See [OPERATIONS.md](OPERATIONS.md) and [DEPLOY.md](DEPLOY.md).
 
 ---
 
-## 11. Where things live · stopping · resetting
+## 12. Where things live · stopping · resetting
 
 - **Workspace state:** `~/.lakeleto/workspaces/<id>/` (`workspace.json`,
   `history.jsonl`, `results/*.parquet`). Override the base with `LAKELETO_HOME`.
@@ -391,7 +617,7 @@ directly. See [OPERATIONS.md](OPERATIONS.md) and [DEPLOY.md](DEPLOY.md).
 - **Reset a workspace:** delete its folder under `~/.lakeleto/workspaces/`, or use
   **Delete** in the workspace bar.
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Fix |
 | --- | --- |
@@ -400,6 +626,7 @@ directly. See [OPERATIONS.md](OPERATIONS.md) and [DEPLOY.md](DEPLOY.md).
 | macOS "cannot verify the developer" | Right-click the file → **Open** once, or `xattr -d com.apple.quarantine ./lakeleto`. |
 | An object-store URI errors about a missing feature | Use the release binary (all engines built in), or rebuild with `--features object-store`. |
 | Port 8080 already in use | `lakeleto serve --addr 127.0.0.1:8090` (any free port). |
+| An MCP client shows no Lakeleto tools | Run its command in a terminal, e.g. `lakeleto mcp --root /Users/me/data`: it should wait quietly for input (Ctrl-C to quit). An error there — a `--root` that doesn't exist, a binary built without `mcp` — is what the client hit. Claude Desktop needs absolute paths. |
 | A *Run across* / SQL query errors on one file only | That file's schema doesn't fit the query (a column it lacks); the other targets still run. |
 
 ---

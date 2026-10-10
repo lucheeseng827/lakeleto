@@ -9,10 +9,10 @@ panic = "unwind"
 
 [package]
 name = "lakeleto"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Lakeleto — instant local lakehouse-table explorer (\"the Postman of lakehouse tables\"): reads Parquet + CSV (and Iceberg tables with --features iceberg), all behind one pluggable Engine trait; a DuckDB backend and a hosted Lakeleto Cloud are on the roadmap. MVP: schema / head / profile / grid."
+description = "Lakeleto — instant local lakehouse-table explorer (\"the Postman of lakehouse tables\"): reads Parquet, CSV/TSV, JSON and Arrow IPC, and with features Iceberg and Delta tables, object stores and databases, all behind one pluggable Engine trait; a hosted Lakeleto Cloud is on the roadmap. Read-only: schema / head / profile / query / grid."
 repository = "https://github.com/lucheeseng827/lakeleto"
 publish = true
 
@@ -58,13 +58,13 @@ pkg-fmt = "zip"
 # The whole thesis of #25 Lakeleto is "engine is commodity -> pure UX". So the crate is built
 # around one `Engine` trait (src/engine/mod.rs) and the UI is meant to bind to that trait,
 # never to a concrete engine. The DEFAULT build is the pure-Rust `local` reader
-# (arrow + parquet + csv) — it always compiles, fast, no C++ toolchain, so
+# (Parquet, CSV/TSV, JSON, Arrow IPC) — it always compiles, fast, no C++ toolchain, so
 # `cargo build -p lakeleto` (and the workspace CI) stays lean. Everything heavier is an
 # OFF-BY-DEFAULT feature (same pattern as module_52/edgeguard-ner's `onnx` gate):
 #   sql     -> DataFusion SQL engine (datafusion 54, pinned in lockstep with module_62)
 #   remote  -> RemoteEngine over HTTP: the paid "Lakeleto Cloud" SaaS seam behind the same trait
-#   iceberg -> Apache Iceberg table reader (Phase 2 — wire iceberg-rust here)
-#   duckdb  -> DuckDB backend (the Radar's cited commodity engine; Phase 2, C++ toolchain)
+#   iceberg -> self-contained Apache Iceberg reader (src/iceberg.rs: apache-avro + the parquet reader; no iceberg-rust)
+#   duckdb  -> inert, deliberately not built: the `sql` (DataFusion) engine covers it
 # ADR: docs/ADR-0001-local-engine-first.md answers "local engine first, SaaS behind the trait".
 
 [dependencies]
@@ -96,17 +96,31 @@ arrow-json = "58"                                    # RecordBatch -> JSON / NDJ
 # behind a feature because it is ALREADY compiled in the default build — `parquet`'s `arrow`
 # feature depends on arrow-ipc (58.4.0 in the lockfile). Naming it here is a *nameability*
 # change, not a weight change, so the "lean default" note above stays honest.
-arrow-ipc = "58"
+arrow-ipc = { version = "58", features = ["lz4"] }
+# The buffers the Arrow file reader hands arrow-ipc's decoder; in the tree already, through arrow.
+arrow-buffer = "58"
 # Arrow compute kernels powering the grid's server-side sort + filter (the "pushed to Arrow
 # compute kernels" path): arrow-ord (sort_to_indices + cmp), arrow-select (filter/take/concat).
 arrow-ord = "58"
 arrow-select = "58"
-parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+# Parquet pages compressed with Snappy, gzip or LZ4 read in every build: gzip through the `flate2`
+# that reads compressed text (`flate2-rust_backened` is parquet's own spelling) and LZ4 through
+# the `lz4_flex` that reads Arrow IPC buffers, so the two add no crate and about 48 KB. zstd,
+# Polars' default, comes with `compression` and `iceberg`, which link it already, and Brotli with
+# `compression`: here zstd would add eight crates, a C library among them, and Brotli 1.1 MB.
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "flate2-rust_backened", "lz4"] }
+# Compressed text (`t.csv.gz`, `t.ndjson.zst`): gzip in every build, pure Rust through
+# `miniz_oxide`; zstd, bzip2 and xz behind `compression`. The versions are the ones DataFusion's
+# own `compression` feature links, so the release binary, which has `sql`, adds no crate.
+flate2 = "1"
+zstd = { version = "0.13", optional = true }
+bzip2 = { version = "0.6", optional = true }
+liblzma = { version = "0.4", optional = true }
 
 # --- optional engine backends + server (all OFF by default; heavy compiles stay opt-in) --
 datafusion = { version = "54", optional = true }     # `sql` — full SQL engine over the same trait
 async-trait = { version = "0.1", optional = true }   # `sql` — DataFusion's async `TableProvider`
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"], optional = true }  # `remote` — Lakeleto Cloud seam
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"], optional = true }  # `remote` (the Lakeleto Cloud seam) and `catalog` (Iceberg REST)
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }  # `sql`/`serve` — async runtime
 axum = { version = "0.8", optional = true }          # `serve` — the HTTP/JSON backend the SPA + Lakeleto Cloud speak
 # `debug-embed` embeds the SPA bundle even in debug builds, so `lakeleto serve`/`lakeleto open` are
@@ -117,6 +131,8 @@ serde_urlencoded = { version = "0.7", optional = true }  # `serve` — parse rep
 # is pinned to datafusion 52): parse metadata.json + the Avro manifest-list/manifests to find the
 # current snapshot's Parquet data files, then read them with the existing arrow-58 parquet reader.
 apache-avro = { version = "0.17", optional = true }
+# `catalog` — parse `catalogs.toml`. Parsing only: Lakeleto never writes the file.
+toml = { version = "0.8", default-features = false, features = ["parse"], optional = true }
 # `object-store` — BYO-credential reads of s3://, gs://, az:// tables ("sits next to your cloud
 # data"). Pinned to the object_store 0.13 that `parquet`'s `object_store` feature also uses, so
 # the async ParquetObjectReader type-matches. rustls (native roots) TLS; no C toolchain.
@@ -160,15 +176,23 @@ remote = ["dep:reqwest"]
 # on a blocking thread and handed to axum through an mpsc channel adapted into a `Stream`. Neither
 # adds a crate — `futures` is already in the tree via datafusion/object_store.
 serve = ["dep:axum", "dep:rust-embed", "dep:serde_urlencoded", "dep:tokio", "dep:futures", "tokio/net", "tokio/macros", "tokio/signal", "tokio/sync"]
-# self-contained Iceberg reader (metadata + Avro manifests → Parquet data files, incl. positional
-# merge-on-read deletes). snappy/zstandard let it read compressed manifests (snap/zstd are already
-# in the tree via parquet, so no new heavy deps); deflate is built into apache-avro.
-iceberg = ["dep:apache-avro", "apache-avro/snappy", "apache-avro/zstandard"]
+# self-contained Iceberg reader (metadata + Avro manifests → Parquet data files, incl. positional and
+# equality merge-on-read deletes). snappy/zstandard let it read compressed manifests (snap is already
+# in the tree via parquet); deflate is built into apache-avro. The zstd that reads manifests reads
+# Parquet data files too, which Iceberg writes zstd-compressed by default since 1.4.
+iceberg = ["dep:apache-avro", "apache-avro/snappy", "apache-avro/zstandard", "parquet/zstd"]
+# `catalog` reads an Iceberg REST catalog's tables by name (`catalog://<catalog>/<namespace>/<table>`),
+# with catalogs configured in `$LAKELETO_HOME/catalogs.toml` or `LAKELETO_CATALOG__…` variables.
+# A REST catalog serves Iceberg tables in object stores, so it builds on both. reqwest is already in
+# the tree through object_store, and `async-trait` through DataFusion and object_store: it
+# implements object_store's credential provider, so credentials a catalog vends are refreshed
+# before they expire. `toml` and its parser are what this feature adds.
+catalog = ["iceberg", "object-store", "dep:reqwest", "dep:toml", "dep:async-trait"]
 # `object-store` reads remote Parquet/CSV with the user's own env credentials; enables
 # parquet/object_store for the ranged async reader and a shared multi-thread Tokio runtime.
 # `object_store/fs` is on so `file://` URLs resolve through the very same seam as `s3://`:
 # it is the only store `parse_url_opts` can build with no cloud account, which is what lets the
-# credential-scope and mirror-permission tests exercise the real code path with no credentials.
+# object-store tests exercise the real code path with no credentials.
 # It costs `walkdir` (pure Rust, already in the tree) and it is a genuine capability, not a
 # test-only hook. The default build has no object-store support at all, so nothing changes there.
 object-store = [
@@ -176,6 +200,25 @@ object-store = [
     "dep:tokio", "tokio/rt-multi-thread", "tokio/net", "tokio/time",
     "parquet/object_store",
 ]
+# `mcp` serves the tables to an AI agent over the Model Context Protocol (`lakeleto mcp`): JSON-RPC
+# on stdin and stdout, read-only, with `--root`, row and byte caps and a deadline per call. It adds
+# no crate: the protocol is a loop over `serde_json`, which every build has. The `rmcp` SDK measured
+# 0.9 MB larger in a release build and brought thirteen crates. What the tools can read is what the
+# build's other features read: `query` needs `sql` (or a database driver, for a database's own
+# SQL), and a catalog `catalog`.
+mcp = []
+# `parquet-out` lets the CLI write results as Parquet (`-o parquet`, or `--out` to a `.parquet`
+# file). It adds no crate, as `parquet` is linked to read, and is a feature for its bytes alone:
+# the writer is about 530 KB of the default build, against about 110 KB for the Arrow IPC writers
+# behind `-o arrow|arrows`, which every build has. The release binaries, the image and the
+# installers are built with it.
+parquet-out = []
+# `compression` reads zstd, bzip2 and xz text (`t.ndjson.zst`, `t.tsv.bz2`, `t.json.xz`), and
+# Parquet pages compressed with zstd or Brotli; gzip text, and Snappy, gzip and LZ4 Parquet, read
+# in every build. A feature for its bytes and its C compiler: zstd and xz are C libraries, and
+# Brotli's codec is 1.1 MB. The release binaries, the image and the installers are built with it,
+# and there it adds no crate, as DataFusion links the same four.
+compression = ["dep:zstd", "dep:bzip2", "dep:liblzma", "arrow-ipc/zstd", "parquet/zstd", "parquet/brotli"]
 # `desktop` builds `lakeleto-desktop`, the launcher installed by the .msi/.dmg: no
 # console window, picks its own port, opens the browser, and lives in the tray so
 # there is something to quit. Implies `serve` — it has nothing to show otherwise.
@@ -191,8 +234,9 @@ duckdb = []
 ee = []
 # self-contained Delta Lake reader (JSON transaction log → active Parquet data files, partition
 # columns filled from add-action partitionValues). No new deps: the log is parsed with serde_json
-# and data files read with the existing arrow-58 parquet reader. JSON-only (checkpoints not consulted
-# — correct whenever the *.json commits are still present, i.e. no VACUUM/log-cleanup).
+# and data files read with the existing arrow-58 parquet reader. JSON-only: checkpoints are not read,
+# so once log cleanup has removed a table's early *.json commits, the table either fails to open or
+# shows only the files added since, with a row count that under-reports.
 delta = []
 # `database` — bring-your-own-database connectors (read-only), behind the same `Engine` trait via
 # sqlx. Each backend is its own feature so a lean build can pick just what it needs; the umbrella

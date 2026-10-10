@@ -187,13 +187,9 @@ pub fn url(port: u16) -> String {
 /// server is on loopback with no token, exactly like `lakeleto open`.
 pub fn serve_at(port: u16, root: Option<PathBuf>) -> crate::Result<()> {
     let addr = format!("127.0.0.1:{port}");
-    let read: std::sync::Arc<dyn crate::Engine> =
-        std::sync::Arc::new(crate::LocalReaderEngine::default());
     crate::api::serve(
         &addr,
-        read,
-        crate::cli::sql_engine_arc(),
-        crate::cli::db_engine_arc(),
+        crate::EngineRegistry::local(),
         crate::cli::DEFAULT_SCAN,
         Some(url(port)),
         None,

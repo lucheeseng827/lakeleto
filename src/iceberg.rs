@@ -10,7 +10,12 @@
 //! Path: `<table>/metadata/` → current `*.metadata.json` (JSON) → current snapshot's Avro
 //! **manifest-list** → each **manifest** (Avro) → the `data_file.file_path` of live Parquet data
 //! files, plus any **merge-on-read positional delete files** (`content = 1`) whose `(file_path,
-//! pos)` rows mark physical positions to drop. Manifests compressed with deflate / snappy / zstd
+//! pos)` rows mark physical positions to drop.
+//!
+//! A table in an object store (`--features object-store`) is planned the same way, through
+//! `object_store` and as the request's identity: each of those files is one `GET`, and only the
+//! current snapshot's are fetched. Nothing is copied to disk, and the engine reads data files by
+//! ranged requests. Manifests compressed with deflate / snappy / zstd
 //! are read transparently. Handles append-only / copy-on-write **and** merge-on-read (positional
 //! `content = 1` + **equality** `content = 2`, the latter with sequence-number semantics) v1 & v2
 //! tables, plus **schema evolution** (files unified to the current schema by field-id: rename /
@@ -37,8 +42,6 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -50,8 +53,11 @@ use arrow_array::{
 };
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema, SchemaRef, TimeUnit};
+use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+#[cfg(feature = "object-store")]
+use crate::context::RequestContext;
 use crate::engine::{FilterOp, FilterSpec};
 use crate::error::{EngineError, Result};
 
@@ -87,7 +93,13 @@ pub enum PartVal {
 /// merge-on-read positional delete files (empty for append-only / copy-on-write files).
 #[derive(Debug, Clone)]
 pub struct DataFileEntry {
+    /// Where the file is: a path on this machine, or, for a table in an object store, the
+    /// object's URI.
     pub path: PathBuf,
+    /// The file's size in bytes, as its manifest records it (`None` when the manifest leaves it
+    /// out). A reader in an object store fetches the footer at the end of the file, and knowing
+    /// where the end is saves asking the store first.
+    pub size: Option<u64>,
     /// Deleted **physical** row positions within this file, sorted + deduped.
     pub deletes: BTreeSet<i64>,
     /// Data sequence number — an equality delete applies to this file only if its sequence
@@ -241,6 +253,17 @@ pub struct TablePlan {
     pub format_version: i64,
 }
 
+impl DataFileEntry {
+    /// The file's row count as its manifest records it, when it records one. Writers record every
+    /// data file's, so a table can be counted, and a file before a window skipped, without opening
+    /// the file: in an object store, opening one is a request for its footer.
+    pub fn manifest_rows(&self) -> Option<u64> {
+        u64::try_from(self.stats.record_count)
+            .ok()
+            .filter(|&n| n > 0)
+    }
+}
+
 impl TablePlan {
     /// Does the table carry any merge-on-read deletes (positional or equality)? When true the
     /// reader takes the read-from-start filter path instead of the footer-skip fast path.
@@ -251,13 +274,10 @@ impl TablePlan {
 
 /// Resolve the current-snapshot read plan: live Parquet data files + their positional deletes.
 pub fn plan(table_dir: &Path) -> Result<TablePlan> {
-    plan_inner(table_dir, None, None)
-}
-
-/// Plan a table whose files were mirrored from object-store URI `origin` into local `table_dir`
-/// (the object-store shim). Absolute object URIs inside the metadata are remapped to the mirror.
-pub fn plan_object(table_dir: &Path, origin: &str) -> Result<TablePlan> {
-    plan_inner(table_dir, None, Some(origin))
+    plan_inner(&LocalFiles {
+        table_dir,
+        root: None,
+    })
 }
 
 /// Like [`plan`], but when `root` is `Some`, every file the reader will open — the manifest
@@ -267,30 +287,71 @@ pub fn plan_object(table_dir: &Path, origin: &str) -> Result<TablePlan> {
 /// used to read data — *or metadata* — from outside it. `None` (the engine's own call) skips the
 /// check.
 pub fn plan_with_root(table_dir: &Path, root: Option<&Path>) -> Result<TablePlan> {
-    plan_inner(table_dir, root, None)
+    plan_inner(&LocalFiles { table_dir, root })
 }
 
-/// The planner body. `origin` (object-store shim) remaps absolute object URIs to the local mirror.
-fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Result<TablePlan> {
-    // Resolve a manifest/data/delete path relative to the table dir. When confined, refuse it if
-    // it canonicalizes outside the root and return the **canonical** path, so the subsequent
-    // `File::open` follows the already-validated target (a symlink swapped after the check can't
-    // redirect the open) and delete-file keys match data-file keys. The refusal message is
-    // path-free so the client-facing 403 doesn't disclose the resolved filesystem path.
-    let guard = |raw: &str| -> Result<PathBuf> {
-        let p = resolve(raw, table_dir, origin);
-        match root {
-            Some(r) => match std::fs::canonicalize(&p) {
-                Ok(c) if c.starts_with(r) => Ok(c),
-                _ => Err(EngineError::Forbidden(
-                    "iceberg: table references a file outside the server root".to_string(),
-                )),
-            },
-            None => Ok(p),
-        }
-    };
-    let meta_path = current_metadata(table_dir)?;
-    let meta: serde_json::Value = serde_json::from_reader(BufReader::new(File::open(&meta_path)?))
+/// Plan the table at object-store URI `table`, reading its metadata, manifest lists, manifests and
+/// delete files through `stores`, as the identity they were built with.
+///
+/// Nothing is copied to disk. Each metadata file is one `GET`, and only the files the current
+/// snapshot names are fetched: earlier metadata versions, other snapshots' manifests, and data
+/// files no longer in the table are never requested. Data files are named by their object URIs,
+/// for the engine to read through the same `stores` with ranged requests.
+#[cfg(feature = "object-store")]
+pub(crate) fn plan_in_store(
+    table: &str,
+    stores: &crate::objstore::Stores,
+    ctx: &RequestContext,
+) -> Result<TablePlan> {
+    plan_inner(&StoreFiles {
+        table: table.trim_end_matches('/'),
+        stores,
+        ctx,
+    })
+}
+
+/// Plan the table in an object store at `table` from `metadata`, its current metadata as its
+/// catalog handed it over: the manifest list and manifests it names are read through `stores`, and
+/// the metadata file is not read again.
+#[cfg(feature = "catalog")]
+pub(crate) fn plan_metadata_in_store(
+    table: &str,
+    metadata: &[u8],
+    stores: &crate::objstore::Stores,
+    ctx: &RequestContext,
+) -> Result<TablePlan> {
+    plan_from(
+        &StoreFiles {
+            table: table.trim_end_matches('/'),
+            stores,
+            ctx,
+        },
+        metadata,
+    )
+}
+
+/// Plan the table on this machine at `table_dir` from `metadata`, its current metadata as its
+/// catalog handed it over.
+#[cfg(feature = "catalog")]
+pub(crate) fn plan_metadata_local(table_dir: &Path, metadata: &[u8]) -> Result<TablePlan> {
+    plan_from(
+        &LocalFiles {
+            table_dir,
+            root: None,
+        },
+        metadata,
+    )
+}
+
+/// The planner body, wherever the table's files are.
+fn plan_inner(files: &dyn TableFiles) -> Result<TablePlan> {
+    let (_, meta) = locate_metadata(files)?;
+    plan_from(files, &meta)
+}
+
+/// Plan from the table's current metadata, reading what it names through `files`.
+fn plan_from(files: &dyn TableFiles, meta: &[u8]) -> Result<TablePlan> {
+    let meta: serde_json::Value = serde_json::from_slice(meta)
         .map_err(|e| EngineError::Other(format!("iceberg: bad metadata json: {e}")))?;
 
     // Recorded before anything else is read: it decides how a delete file that this reader cannot
@@ -328,7 +389,8 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
     // manifests (content 1), carrying each entry's sequence number (inherited from the
     // manifest-list entry when the manifest-entry leaves it null).
     #[allow(clippy::type_complexity)]
-    let mut data_files: Vec<(PathBuf, i64, FileStats, Vec<Option<PartVal>>)> = Vec::new();
+    let mut data_files: Vec<(PathBuf, Option<u64>, i64, FileStats, Vec<Option<PartVal>>)> =
+        Vec::new();
     let mut pos_delete_files: Vec<PathBuf> = Vec::new();
     let mut eq_delete_specs: Vec<EqDeleteSpec> = Vec::new();
     let mut skipped_non_parquet = 0usize;
@@ -339,8 +401,10 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
     // count is still stated as exact. That is a wrong answer, not a partial one, so it is refused.
     let mut skipped_delete_formats: BTreeSet<String> = BTreeSet::new();
     let mut skipped_delete_files = 0usize;
-    for (manifest_path, content, manifest_seq) in read_manifest_list(&guard(manifest_list)?)? {
-        for mut e in read_manifest_entries(&guard(&manifest_path)?)? {
+    let list = files.resolve(manifest_list)?;
+    for (manifest_path, content, manifest_seq) in read_manifest_list(&files.read(&list)?, &list)? {
+        let manifest = files.resolve(&manifest_path)?;
+        for mut e in read_manifest_entries(&files.read(&manifest)?, &manifest)? {
             if e.status == 2 {
                 continue; // DELETED manifest entry — not part of this snapshot
             }
@@ -358,14 +422,15 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
             let seq = e.sequence_number.unwrap_or(manifest_seq);
             match (content, e.content) {
                 (0, 0) => data_files.push((
-                    guard(&e.file_path)?,
+                    files.resolve(&e.file_path)?,
+                    e.file_size,
                     seq,
                     std::mem::take(&mut e.stats),
                     std::mem::take(&mut e.partition),
                 )),
-                (1, 1) => pos_delete_files.push(guard(&e.file_path)?),
+                (1, 1) => pos_delete_files.push(files.resolve(&e.file_path)?),
                 (1, 2) => eq_delete_specs.push(EqDeleteSpec {
-                    path: guard(&e.file_path)?,
+                    path: files.resolve(&e.file_path)?,
                     field_ids: std::mem::take(&mut e.equality_ids),
                     seq,
                     partition: std::mem::take(&mut e.partition),
@@ -376,13 +441,16 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
     }
 
     // Read every positional-delete file into a map: resolved data-file path -> deleted positions.
-    // The referenced data-file path goes through the same `guard` as the data files themselves, so
-    // the map keys match `DataFileEntry::path` under both the raw (unconfined) and canonical
-    // (confined) representations.
+    // The referenced data-file path is resolved the same way as the data files themselves, so the
+    // map keys match `DataFileEntry::path` under the raw (unconfined), canonical (confined) and
+    // object-URI representations alike.
     let mut deletes: HashMap<PathBuf, BTreeSet<i64>> = HashMap::new();
     for df in &pos_delete_files {
-        for (referenced, pos) in read_positional_deletes(df)? {
-            deletes.entry(guard(&referenced)?).or_default().insert(pos);
+        for (referenced, pos) in read_positional_deletes(files.read(df)?, df)? {
+            deletes
+                .entry(files.resolve(&referenced)?)
+                .or_default()
+                .insert(pos);
         }
     }
 
@@ -392,7 +460,7 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
         if spec.field_ids.is_empty() {
             continue;
         }
-        let keys = read_equality_delete_keys(&spec.path, &spec.field_ids)?;
+        let keys = read_equality_delete_keys(files.read(&spec.path)?, &spec.field_ids)?;
         equality_deletes.push(EqualityDelete {
             field_ids: spec.field_ids,
             keys,
@@ -401,12 +469,13 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
         });
     }
 
-    let files = data_files
+    let data_files: Vec<DataFileEntry> = data_files
         .into_iter()
-        .map(|(path, seq, stats, partition)| {
+        .map(|(path, size, seq, stats, partition)| {
             let deletes = deletes.get(&path).cloned().unwrap_or_default();
             DataFileEntry {
                 path,
+                size,
                 deletes,
                 seq,
                 stats,
@@ -418,7 +487,7 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
         eprintln!(
             "lakeleto: WARNING {skipped_non_parquet} non-Parquet data file(s) in {} were skipped \
              (this reader is Parquet-only) — row counts and scans under-report the table",
-            table_dir.display()
+            files.table()
         );
     }
     // Refuse rather than answer wrongly. The message names the mechanism and the way out, because
@@ -449,22 +518,22 @@ fn plan_inner(table_dir: &Path, root: Option<&Path>, origin: Option<&str>) -> Re
         // Once per table per process, not once per plan: this planner runs on every read, and
         // `--root` runs it twice per request — under `serve`, stderr is the operator's log, and a
         // note repeated hundreds of times is a note nobody reads.
-        static NOTED_V3: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        static NOTED_V3: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
             std::sync::OnceLock::new();
         let mut noted = NOTED_V3
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if noted.insert(table_dir.to_path_buf()) {
+        if noted.insert(files.table()) {
             eprintln!(
                 "lakeleto: NOTE {} is an Iceberg v3 table. Its data files are read correctly, \
                  but row lineage and the VARIANT/GEOMETRY types are not modelled by this reader.",
-                table_dir.display()
+                files.table()
             );
         }
     }
     Ok(TablePlan {
-        files,
+        files: data_files,
         schema: parse_current_schema(&meta),
         equality_deletes,
         partition_spec: parse_partition_spec(&meta),
@@ -694,15 +763,186 @@ pub fn project_batch(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordBa
     RecordBatch::try_new(target.clone(), cols).map_err(EngineError::arrow)
 }
 
-/// Locate the current `*.metadata.json` (via `version-hint.text`, else the highest version).
+// ---- where a table's files are ----------------------------------------------------------
+
+/// Where a table's files are. The planner reads every metadata file, manifest list, manifest and
+/// delete file through one of these, and names each data file by a location its engine opens the
+/// same way: a path for a table on this machine, an object URI for a table in an object store.
+trait TableFiles {
+    /// The table, as a message names it.
+    fn table(&self) -> String;
+    /// The table's `metadata/` directory, as a message names it.
+    fn metadata_dir(&self) -> String;
+    /// The file called `name` in the table's `metadata/` directory.
+    fn metadata_file(&self, name: &str) -> PathBuf;
+    /// The names of the files in the table's `metadata/` directory.
+    fn metadata_names(&self) -> Result<Vec<String>>;
+    /// A path written in the table's metadata (a manifest list, a manifest, a data or delete file)
+    /// as a location [`read`](Self::read) opens, or a refusal when this table may not reach it.
+    fn resolve(&self, raw: &str) -> Result<PathBuf>;
+    /// The bytes of the file at `location`.
+    fn read(&self, location: &Path) -> Result<Bytes>;
+    /// The bytes of the file at `location`, or `None` when there is no file there.
+    fn find(&self, location: &Path) -> Result<Option<Bytes>>;
+}
+
+/// A table on this machine, its files confined to `root` when there is one (`serve --root`).
+struct LocalFiles<'a> {
+    table_dir: &'a Path,
+    root: Option<&'a Path>,
+}
+
+impl TableFiles for LocalFiles<'_> {
+    fn table(&self) -> String {
+        self.table_dir.display().to_string()
+    }
+
+    fn metadata_dir(&self) -> String {
+        self.table_dir.join("metadata").display().to_string()
+    }
+
+    fn metadata_file(&self, name: &str) -> PathBuf {
+        self.table_dir.join("metadata").join(name)
+    }
+
+    fn metadata_names(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(self.table_dir.join("metadata"))? {
+            let path = entry?.path();
+            names.push(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        }
+        Ok(names)
+    }
+
+    /// Resolve a manifest/data/delete path relative to the table dir. When confined, refuse it if
+    /// it canonicalizes outside the root and return the **canonical** path, so the subsequent read
+    /// follows the already-validated target (a symlink swapped after the check can't redirect it)
+    /// and delete-file keys match data-file keys. The refusal message is path-free so the
+    /// client-facing 403 doesn't disclose the resolved filesystem path.
+    fn resolve(&self, raw: &str) -> Result<PathBuf> {
+        let p = resolve(raw, self.table_dir);
+        match self.root {
+            Some(r) => match std::fs::canonicalize(&p) {
+                Ok(c) if c.starts_with(r) => Ok(c),
+                _ => Err(EngineError::Forbidden(
+                    "iceberg: table references a file outside the server root".to_string(),
+                )),
+            },
+            None => Ok(p),
+        }
+    }
+
+    fn read(&self, location: &Path) -> Result<Bytes> {
+        Ok(Bytes::from(std::fs::read(location)?))
+    }
+
+    fn find(&self, location: &Path) -> Result<Option<Bytes>> {
+        if location.is_file() {
+            self.read(location).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// A table in an object store, read through `stores` within the call's deadline and cancellation.
+#[cfg(feature = "object-store")]
+struct StoreFiles<'a> {
+    /// The table's URI, with no trailing `/`.
+    table: &'a str,
+    stores: &'a crate::objstore::Stores,
+    ctx: &'a RequestContext,
+}
+
+#[cfg(feature = "object-store")]
+impl StoreFiles<'_> {
+    /// The object URI a location holds. Every location here was built from one, so it is UTF-8.
+    fn uri(location: &Path) -> std::borrow::Cow<'_, str> {
+        location.to_string_lossy()
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl TableFiles for StoreFiles<'_> {
+    fn table(&self) -> String {
+        self.table.to_string()
+    }
+
+    fn metadata_dir(&self) -> String {
+        format!("{}/metadata", self.table)
+    }
+
+    fn metadata_file(&self, name: &str) -> PathBuf {
+        PathBuf::from(format!("{}/metadata/{name}", self.table))
+    }
+
+    fn metadata_names(&self) -> Result<Vec<String>> {
+        self.ctx.check()?;
+        self.stores.names(&format!("{}/metadata/", self.table))
+    }
+
+    /// An object URI is read as written, and a relative path from the table's own location.
+    ///
+    /// Anything else is refused: a local path, a `file://` URI, any scheme that is not an object
+    /// store. A table in an object store is data someone else may have written, and following a
+    /// path in its metadata onto this machine's disk would let that data read local files. When
+    /// the table was mirrored to disk to be read, such a path did exactly that.
+    fn resolve(&self, raw: &str) -> Result<PathBuf> {
+        if crate::source::is_object_uri(raw) {
+            return Ok(PathBuf::from(raw));
+        }
+        if raw.contains("://") || raw.starts_with(['/', '\\']) || Path::new(raw).is_absolute() {
+            return Err(EngineError::Forbidden(format!(
+                "iceberg: {} names `{raw}`, which is not in an object store. A table in an \
+                 object store may only name objects, so Lakeleto does not follow a path in its \
+                 metadata onto this machine.",
+                self.table
+            )));
+        }
+        Ok(PathBuf::from(format!("{}/{raw}", self.table)))
+    }
+
+    fn read(&self, location: &Path) -> Result<Bytes> {
+        self.ctx.check()?;
+        self.stores.get(&Self::uri(location))
+    }
+
+    fn find(&self, location: &Path) -> Result<Option<Bytes>> {
+        self.ctx.check()?;
+        self.stores.find(&Self::uri(location))
+    }
+}
+
+/// The current local table's metadata file: what the tests below pin.
+#[cfg(test)]
 fn current_metadata(table_dir: &Path) -> Result<PathBuf> {
-    let mdir = table_dir.join("metadata");
-    if let Ok(hint) = std::fs::read_to_string(mdir.join("version-hint.text")) {
+    locate_metadata(&LocalFiles {
+        table_dir,
+        root: None,
+    })
+    .map(|(path, _)| path)
+}
+
+/// Locate the current `*.metadata.json` (via `version-hint.text`, else the highest version), and
+/// read it.
+fn locate_metadata(files: &dyn TableFiles) -> Result<(PathBuf, Bytes)> {
+    // A hint that is missing, or is not text, leaves the highest version to decide. One that is
+    // there but cannot be read is an error rather than a reason to guess: in an object store that
+    // is a timeout or a refusal, and the highest version need not be the one the hint names.
+    let hint = files
+        .find(&files.metadata_file("version-hint.text"))?
+        .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
+    if let Some(hint) = hint {
         let n = hint.trim();
         for cand in [format!("v{n}.metadata.json"), format!("{n}.metadata.json")] {
-            let p = mdir.join(cand);
-            if p.is_file() {
-                return Ok(p);
+            let p = files.metadata_file(&cand);
+            if let Some(bytes) = files.find(&p)? {
+                return Ok((p, bytes));
             }
         }
     }
@@ -718,29 +958,25 @@ fn current_metadata(table_dir: &Path) -> Result<PathBuf> {
     // Stable is not the same as correct: a uuid carries no ordering, so with a tie there is no
     // way to tell which of them is current. That is a table that needs a `version-hint.text` or
     // a catalog, and the read says so rather than quietly picking one.
-    let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(&mdir)? {
-        let p = entry?.path();
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if let Some(ver) = metadata_version(name) {
-            candidates.push((ver, p));
-        }
-    }
-    candidates.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.file_name().cmp(&b.1.file_name()))
-    });
+    let mut candidates: Vec<(u64, String)> = files
+        .metadata_names()?
+        .into_iter()
+        .filter_map(|name| Some((metadata_version(&name)?, name)))
+        .collect();
+    candidates.sort();
     let Some((top_version, chosen)) = candidates.pop() else {
         return Err(EngineError::UnsupportedFormat {
-            detail: format!("iceberg: no *.metadata.json under {}", mdir.display()),
+            detail: format!("iceberg: no *.metadata.json under {}", files.metadata_dir()),
         });
     };
-    let tied: Vec<&PathBuf> = candidates
+    let tied: Vec<&String> = candidates
         .iter()
         .rev()
         .take_while(|(v, _)| *v == top_version)
-        .map(|(_, p)| p)
+        .map(|(_, name)| name)
         .collect();
+    let chosen_path = files.metadata_file(&chosen);
+    let chosen_bytes = files.read(&chosen_path)?;
 
     // A tie is only a problem when the tied files disagree about what is current. Several
     // `<version>-<uuid>.metadata.json` naming the same `current-snapshot-id` describe one state,
@@ -756,16 +992,17 @@ fn current_metadata(table_dir: &Path) -> Result<PathBuf> {
     // choice this reader makes for deletion vectors: say what is missing, rather than answer
     // confidently from an unverified state.
     if !tied.is_empty() {
-        let snapshot_of = |p: &Path| -> Result<Option<i64>> {
-            let v: serde_json::Value = serde_json::from_reader(BufReader::new(File::open(p)?))
-                .map_err(|e| EngineError::UnsupportedFormat {
+        let snapshot_of = |bytes: &[u8], p: &Path| -> Result<Option<i64>> {
+            let v: serde_json::Value =
+                serde_json::from_slice(bytes).map_err(|e| EngineError::UnsupportedFormat {
                     detail: format!("iceberg: {} is not readable metadata: {e}", p.display()),
                 })?;
             Ok(v.get("current-snapshot-id").and_then(|x| x.as_i64()))
         };
-        let want = snapshot_of(&chosen)?;
+        let want = snapshot_of(&chosen_bytes, &chosen_path)?;
         for other in &tied {
-            if snapshot_of(other)? != want {
+            let other_path = files.metadata_file(other);
+            if snapshot_of(&files.read(&other_path)?, &other_path)? != want {
                 return Err(EngineError::UnsupportedFormat {
                     detail: format!(
                         "iceberg: {} holds {} metadata files at version {top_version} that name \
@@ -773,16 +1010,16 @@ fn current_metadata(table_dir: &Path) -> Result<PathBuf> {
                          metadata/version-hint.text to say which is current. Refusing rather than \
                          reading one at random — add metadata/version-hint.text, or read this \
                          table through its catalog.",
-                        mdir.display(),
+                        files.metadata_dir(),
                         tied.len() + 1,
-                        chosen.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-                        other.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+                        chosen,
+                        other,
                     ),
                 });
             }
         }
     }
-    Ok(chosen)
+    Ok((chosen_path, chosen_bytes))
 }
 
 /// Parse the version out of a metadata filename (`v3.metadata.json` / `3.metadata.json`).
@@ -796,8 +1033,8 @@ fn metadata_version(name: &str) -> Option<u64> {
 
 /// Manifest-list entries → `(manifest_path, content, sequence_number)` (content: 0 = data,
 /// 1 = deletes; v1 = 0). The sequence number is inherited by manifest entries that leave theirs null.
-fn read_manifest_list(path: &Path) -> Result<Vec<(String, i64, i64)>> {
-    let reader = Reader::new(BufReader::new(File::open(path)?)).map_err(|e| {
+fn read_manifest_list(bytes: &[u8], path: &Path) -> Result<Vec<(String, i64, i64)>> {
+    let reader = Reader::new(bytes).map_err(|e| {
         EngineError::Other(format!("iceberg: manifest-list {}: {e}", path.display()))
     })?;
     let mut out = Vec::new();
@@ -822,6 +1059,8 @@ struct ManifestEntry {
     content: i64,
     file_path: String,
     file_format: String,
+    /// data_file.file_size_in_bytes, when it is there and positive.
+    file_size: Option<u64>,
     /// Entry sequence number (nullable → inherit the manifest's).
     sequence_number: Option<i64>,
     /// data_file.equality_ids — the field-ids an equality-delete file matches on.
@@ -833,8 +1072,8 @@ struct ManifestEntry {
 }
 
 /// Read a manifest's entries (works for both data and delete manifests).
-fn read_manifest_entries(path: &Path) -> Result<Vec<ManifestEntry>> {
-    let reader = Reader::new(BufReader::new(File::open(path)?))
+fn read_manifest_entries(bytes: &[u8], path: &Path) -> Result<Vec<ManifestEntry>> {
+    let reader = Reader::new(bytes)
         .map_err(|e| EngineError::Other(format!("iceberg: manifest {}: {e}", path.display())))?;
     let mut out = Vec::new();
     for record in reader {
@@ -852,6 +1091,10 @@ fn read_manifest_entries(path: &Path) -> Result<Vec<ManifestEntry>> {
         let equality_ids = field(df, "equality_ids")
             .map(as_i32_list)
             .unwrap_or_default();
+        let file_size = field(df, "file_size_in_bytes")
+            .and_then(as_i64)
+            .and_then(|n| u64::try_from(n).ok())
+            .filter(|&n| n > 0);
         let stats = FileStats {
             record_count: field(df, "record_count").and_then(as_i64).unwrap_or(0),
             null_counts: field(df, "null_value_counts")
@@ -876,6 +1119,7 @@ fn read_manifest_entries(path: &Path) -> Result<Vec<ManifestEntry>> {
             content,
             file_path: file_path.to_string(),
             file_format,
+            file_size,
             sequence_number,
             equality_ids,
             stats,
@@ -909,11 +1153,21 @@ pub fn row_keys(batch: &RecordBatch, field_ids: &[i32]) -> Result<Vec<String>> {
     let by_id = field_id_index(&batch.schema());
     // Distinct sentinels so a NULL never collides with an empty string or a literal separator.
     let opts = FormatOptions::default().with_null("\u{0}∅");
+    // Each key column as it prints, so a `timestamptz` read as `UTC` encodes in every build.
+    let columns = field_ids
+        .iter()
+        .map(|id| {
+            by_id
+                .get(id)
+                .map(|&i| crate::zone::printable(batch.column(i)))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut formatters: Vec<Option<ArrayFormatter>> = Vec::with_capacity(field_ids.len());
-    for id in field_ids {
-        match by_id.get(id) {
-            Some(&i) => formatters.push(Some(
-                ArrayFormatter::try_new(batch.column(i), &opts).map_err(EngineError::arrow)?,
+    for column in &columns {
+        match column {
+            Some(column) => formatters.push(Some(
+                ArrayFormatter::try_new(column, &opts).map_err(EngineError::arrow)?,
             )),
             None => formatters.push(None), // column absent → treated as null
         }
@@ -937,9 +1191,8 @@ pub fn row_keys(batch: &RecordBatch, field_ids: &[i32]) -> Result<Vec<String>> {
 }
 
 /// Read an equality-delete Parquet file → the set of encoded keys over `field_ids`.
-fn read_equality_delete_keys(path: &Path, field_ids: &[i32]) -> Result<HashSet<String>> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)
-        .map_err(EngineError::parquet)?;
+fn read_equality_delete_keys(bytes: Bytes, field_ids: &[i32]) -> Result<HashSet<String>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(EngineError::parquet)?;
     let reader = builder.build().map_err(EngineError::parquet)?;
     let mut keys = HashSet::new();
     for batch in reader {
@@ -953,11 +1206,10 @@ fn read_equality_delete_keys(path: &Path, field_ids: &[i32]) -> Result<HashSet<S
 
 /// Read an Iceberg positional-delete Parquet file → `(referenced_data_file_path, position)`
 /// pairs. The file has a `file_path` (string) and a `pos` (long) column.
-fn read_positional_deletes(path: &Path) -> Result<Vec<(String, i64)>> {
+fn read_positional_deletes(bytes: Bytes, path: &Path) -> Result<Vec<(String, i64)>> {
     use arrow_array::{Array, Int64Array, StringArray};
 
-    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)
-        .map_err(EngineError::parquet)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(EngineError::parquet)?;
     let reader = builder.build().map_err(EngineError::parquet)?;
     let mut out = Vec::new();
     for batch in reader {
@@ -1514,18 +1766,9 @@ pub fn prune(plan: &TablePlan, filters: &[FilterSpec]) -> (TablePlan, usize) {
     )
 }
 
-/// Resolve an Iceberg path (strip a `file://` scheme; join relative paths to the table dir).
-///
-/// `origin` supports the object-store shim: when a table has been mirrored from an object-store URI
-/// (`s3://bucket/prefix/…`) into a local `table_dir`, the manifest/data URIs stored inside are
-/// absolute object URIs. Any that live under `origin` are remapped to the local mirror by stripping
-/// the prefix and joining the remainder to `table_dir`.
-fn resolve(raw: &str, table_dir: &Path, origin: Option<&str>) -> PathBuf {
-    if let Some(orig) = origin {
-        if let Some(rel) = raw.strip_prefix(orig) {
-            return table_dir.join(rel.trim_start_matches(['/', '\\']));
-        }
-    }
+/// Resolve a path in a local table's metadata (strip a `file://` scheme; join relative paths to the
+/// table dir).
+fn resolve(raw: &str, table_dir: &Path) -> PathBuf {
     let s = raw.strip_prefix("file://").unwrap_or(raw);
     let p = Path::new(s);
     if p.is_absolute() {
@@ -1628,6 +1871,32 @@ fn as_int_bytes_map(v: &Value) -> HashMap<i32, Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An equality-delete key over a `timestamptz` column encodes in every build, and alike for
+    /// `UTC`, which a delete file read from Parquet calls its zone, and `+00:00`, which the table's
+    /// rows are cast to: the same instant, the same key.
+    #[test]
+    fn a_timestamptz_key_is_the_same_for_utc_and_the_zero_offset() {
+        let keys = |zone: &str| {
+            let at = Field::new(
+                "at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some(zone.into())),
+                true,
+            )
+            .with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "7".to_string(),
+            )]));
+            let values = TimestampMicrosecondArray::from(vec![Some(1_704_164_645_123_456), None])
+                .with_timezone(zone);
+            let batch =
+                RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![at])), vec![Arc::new(values)])
+                    .unwrap();
+            row_keys(&batch, &[7]).unwrap()
+        };
+        assert_eq!(keys("UTC"), keys("+00:00"));
+        assert!(keys("UTC")[0].starts_with("2024-01-02T03:04:05.123456Z"));
+    }
 
     #[test]
     fn murmur3_matches_iceberg_spec_vectors() {
@@ -1898,6 +2167,20 @@ mod metadata_tie_tests {
         assert!(
             msg.contains("version-hint.text"),
             "and the remedy the reader needs: {msg}"
+        );
+    }
+
+    /// A table with no metadata file is refused with where it was looked for.
+    #[test]
+    fn a_table_with_no_metadata_names_where_it_looked() {
+        let dir = table_with(&[]);
+        let err = current_metadata(dir.path())
+            .expect_err("a directory with no metadata is not a table")
+            .to_string();
+        let mdir = dir.path().join("metadata");
+        assert!(
+            err.contains(&format!("no *.metadata.json under {}", mdir.display())),
+            "{err}"
         );
     }
 

@@ -15,16 +15,18 @@ RUN rustup target add x86_64-unknown-linux-musl && \
 WORKDIR /src
 COPY . .
 # Server profile: the HTTP/JSON API + embedded SPA (serve), SQL engine (sql), Iceberg reader
-# (iceberg), and BYO-credential object-store reads (object-store). The ee/ plane is separate and
-# is not built here.
+# (iceberg), BYO-credential object-store reads (object-store), Iceberg REST catalogs (catalog), the
+# MCP server for agents (mcp: `docker run -i --rm lakeleto:dev mcp`), and zstd, bzip2 and xz text
+# (compression, whose codecs `sql` already links).
+# The ee/ plane is separate and is not built here.
 RUN cargo build --release --bin lakeleto \
-        --features serve,sql,iceberg,object-store \
+        --features serve,sql,iceberg,object-store,catalog,mcp,compression \
         --target x86_64-unknown-linux-musl && \
     cp target/x86_64-unknown-linux-musl/release/lakeleto /lakeleto
 
 FROM gcr.io/distroless/static-debian12:nonroot
 LABEL org.opencontainers.image.source="https://github.com/lucheeseng827/lakeleto" \
-      org.opencontainers.image.description="Lakeleto — instant local lakehouse-table explorer (Parquet/CSV/Iceberg) in a single binary" \
+      org.opencontainers.image.description="Lakeleto — read-only lakehouse-table explorer (Parquet, CSV, JSON, Arrow, Iceberg, object stores) in a single binary" \
       org.opencontainers.image.licenses="Apache-2.0"
 COPY --from=build /lakeleto /usr/local/bin/lakeleto
 # `lakeleto serve` binds 127.0.0.1:8080 by default (env LAKELETO_ADDR). In a container pass

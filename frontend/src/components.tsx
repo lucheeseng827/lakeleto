@@ -1,6 +1,6 @@
 // Lakeleto design-system components — TSX ports of the Lakeleto Design System export.
 // Faithful to the shipped SPA: 1px hairlines, one accent, monospace data, CSS-var tokens.
-import { useEffect, useState, type CSSProperties, type ReactNode, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type KeyboardEvent } from "react";
 import type { Column, Filters, Sort, Row } from "./api";
 
 /** The Strata mark: a rounded tile of lake water with sediment bands — the table's rows.
@@ -261,14 +261,150 @@ const NESTED = /^(Struct|List|LargeList|FixedSizeList|ListView|LargeListView|Map
 const colWidth = (c: Column) => NESTED.test(c.data_type || "")
   ? Math.min(420, Math.max(260, c.name.length * 9 + 30))
   : Math.min(320, Math.max(90, c.name.length * 9 + 30));
-export function DataGrid({ columns = [], rows = [], sort = null, onSort, filters = {}, onFilter, showFilters = true, footer, style }: {
-  columns?: Column[]; rows?: Row[]; sort?: Sort | null; onSort?: (c: string) => void;
-  filters?: Filters; onFilter?: (c: string, v: string) => void; showFilters?: boolean; footer?: ReactNode; style?: CSSProperties;
+/** The tallest the grid's scroll area is drawn. Browsers stop growing an element somewhere past 17
+ *  million pixels (Firefox) or 33 million (Chrome, Safari), short of a 2-million-row table, so a
+ *  taller table is drawn this tall, and a position on the scrollbar maps onto its rows in
+ *  proportion. */
+const MAX_SCROLL_PX = 8_000_000;
+/** Rows drawn above and below the view, so a scroll shows rows rather than gaps. */
+const OVERSCAN = 8;
+/** The row-number column's width. */
+const GUTTER = 72;
+
+/** A table of `count` rows, of which only those in view are drawn. Its rows come from `row`, and
+ *  `onRange` says which are in view, so the caller can read them. */
+export function DataGrid({ columns = [], count, row, onRange, sort = null, onSort, filters = {}, onFilter, showFilters = true, onOpenRow, resetKey, footer, style }: {
+  columns?: Column[];
+  /** Rows the grid spans. */
+  count: number;
+  /** The row at `i`, or `undefined` while it is being read. */
+  row: (i: number) => Row | undefined;
+  /** The rows [start, end) are in view, or nearly. */
+  onRange?: (start: number, end: number) => void;
+  sort?: Sort | null; onSort?: (c: string) => void;
+  filters?: Filters; onFilter?: (c: string, v: string) => void; showFilters?: boolean;
+  /** Clicking a row's number opens it. */
+  onOpenRow?: (r: Row) => void;
+  /** A change takes the grid back to its first row. */
+  resetKey?: unknown;
+  footer?: ReactNode; style?: CSSProperties;
 }) {
+  const scroller = useRef<HTMLDivElement>(null);
+  const head = useRef<HTMLDivElement>(null);
+  const [rowH, setRowH] = useState(28);
+  const [viewH, setViewH] = useState(0);
+  const [headH, setHeadH] = useState(0);
+  const [scrollTop, setScrollTop] = useState(0);
+  // Where the view is, in rows' pixels: the scrollbar's position when the table fits the scroll
+  // area, and in proportion to it when the table is taller. Kept here rather than read back from
+  // the scrollbar, which rounds: in a scaled table a small scroll would round away.
+  const [pos, setPos] = useState(0);
+  const posRef = useRef(0);
+  /** A scroll position this grid set itself, so the scroll event it causes isn't taken for a drag. */
+  const expected = useRef<number | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [hoverRow, setHoverRow] = useState<number | null>(null);
   const width = (c: Column) => colWidth(c);
-  const totalWidth = columns.reduce((a, c) => a + width(c), 0);
+  const totalWidth = GUTTER + columns.reduce((a, c) => a + width(c), 0);
+
+  const contentH = count * rowH;
+  const spacerH = Math.min(contentH, MAX_SCROLL_PX);
+  const bodyH = Math.max(viewH - headH, rowH);
+  const maxScroll = Math.max(spacerH - bodyH, 0);
+  const maxContent = Math.max(contentH - bodyH, 0);
+  const toScroll = (p: number) => (maxContent > 0 ? (p / maxContent) * maxScroll : 0);
+  const toPos = (st: number) => (maxScroll > 0 ? (Math.min(st, maxScroll) / maxScroll) * maxContent : 0);
+  const at = Math.min(pos, maxContent);
+  const first = Math.min(Math.floor(at / rowH), Math.max(count - 1, 0));
+  // Row `first` is drawn where the view starts, less the part of it scrolled past.
+  const drawTop = Math.min(scrollTop, maxScroll) - (at - first * rowH);
+  const start = Math.max(0, first - OVERSCAN);
+  const end = Math.min(count, first + Math.ceil(bodyH / rowH) + 1 + OVERSCAN);
+  const lastShown = Math.min(count, Math.floor((at + bodyH - 1) / rowH) + 1);
+  const geom = useRef({ scaled: false, toScroll, toPos, maxContent, rowH, bodyH });
+  geom.current = { scaled: contentH > spacerH, toScroll, toPos, maxContent, rowH, bodyH };
+
+  const moveTo = useCallback((p: number) => {
+    const g = geom.current;
+    const next = Math.max(0, Math.min(p, g.maxContent));
+    posRef.current = next;
+    setPos(next);
+    const el = scroller.current;
+    if (el) {
+      expected.current = g.toScroll(next);
+      el.scrollTop = expected.current;
+      setScrollTop(el.scrollTop);
+    }
+  }, []);
+
+  const onScroll = () => {
+    const el = scroller.current;
+    if (!el) return;
+    const st = el.scrollTop;
+    setScrollTop(st);
+    if (expected.current != null && Math.abs(st - expected.current) <= 1) { expected.current = null; return; }
+    // The scrollbar moved by itself (a drag, the browser's own scrolling): it says where the view is.
+    expected.current = null;
+    posRef.current = geom.current.toPos(st);
+    setPos(posRef.current);
+  };
+
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const h = parseFloat(getComputedStyle(el).getPropertyValue("--row-height"));
+    if (h > 0) setRowH(h);
+    const measure = () => { setViewH(el.clientHeight); setHeadH(head.current?.offsetHeight ?? 0); };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    if (head.current) ro.observe(head.current);
+    return () => ro.disconnect();
+  }, []);
+
+  // A table that grows or shrinks moves the scrollbar under the view, not the view.
+  useLayoutEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const p = Math.min(posRef.current, maxContent);
+    const st = toScroll(p);
+    if (p !== posRef.current) { posRef.current = p; setPos(p); }
+    if (Math.abs(el.scrollTop - st) > 1) { expected.current = st; el.scrollTop = st; setScrollTop(el.scrollTop); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [count, rowH, bodyH]);
+
+  useLayoutEffect(() => { moveTo(0); }, [resetKey, moveTo]);
+
+  useEffect(() => { onRange?.(start, end); }, [start, end, onRange]);
+
+  // In a table taller than the scroll area, the scrollbar's pixels are several rows' worth, so the
+  // wheel and the keys move the view by the rows' pixels themselves.
+  useEffect(() => {
+    const el = scroller.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      const g = geom.current;
+      if (!g.scaled || e.ctrlKey) return;
+      e.preventDefault();
+      const unit = e.deltaMode === 1 ? g.rowH : e.deltaMode === 2 ? g.bodyH : 1;
+      const dx = e.deltaX || (e.shiftKey ? e.deltaY : 0);
+      const dy = e.shiftKey && !e.deltaX ? 0 : e.deltaY;
+      if (dy) moveTo(posRef.current + dy * unit);
+      if (dx) el.scrollLeft += dx * unit;
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [moveTo]);
+
+  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if ((e.target as HTMLElement).tagName === "INPUT") return;
+    const g = geom.current;
+    const page = Math.max(g.bodyH - g.rowH, g.rowH);
+    const step: Record<string, number> = { ArrowDown: g.rowH, ArrowUp: -g.rowH, PageDown: page, PageUp: -page };
+    if (e.key in step) { e.preventDefault(); moveTo(posRef.current + step[e.key]); }
+    else if (e.key === "Home" && !e.shiftKey) { e.preventDefault(); moveTo(0); }
+    else if (e.key === "End" && !e.shiftKey) { e.preventDefault(); moveTo(g.maxContent); }
+  };
 
   const copyCell = (key: string, v: unknown) => {
     navigator.clipboard?.writeText(cellText(v)).catch(() => { /* ignore */ });
@@ -280,76 +416,97 @@ export function DataGrid({ columns = [], rows = [], sort = null, onSort, filters
     overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
     fontFamily: "var(--font-mono)", fontSize: "var(--text-base)", position: "relative",
   };
+  // The row numbers stay in view as the columns scroll sideways.
+  const gutter: CSSProperties = {
+    flex: "0 0 auto", width: GUTTER, position: "sticky", left: 0, zIndex: 1, background: "var(--panel)",
+    borderRight: "var(--border-hairline)", textAlign: "right", padding: "0 8px", overflow: "hidden",
+    whiteSpace: "nowrap", fontFamily: "var(--font-mono)", fontSize: "var(--text-12)", color: "var(--muted)",
+  };
+  const rows: ReactNode[] = [];
+  for (let i = start; i < end; i++) {
+    const r = row(i);
+    rows.push(
+      <div key={i} onMouseEnter={() => setHoverRow(i)} onMouseLeave={() => setHoverRow((h) => (h === i ? null : h))}
+        style={{ position: "absolute", top: drawTop + (i - first) * rowH, left: 0, width: totalWidth, height: rowH, display: "flex", alignItems: "center", borderBottom: "var(--border-hairline)", background: hoverRow === i ? "var(--hover)" : "var(--bg)" }}>
+        <div role={r && onOpenRow ? "button" : undefined} tabIndex={r && onOpenRow ? 0 : undefined}
+          onClick={r && onOpenRow ? () => onOpenRow(r) : undefined}
+          onKeyDown={r && onOpenRow ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpenRow(r); } } : undefined}
+          title={r && onOpenRow ? "row details" : undefined}
+          style={{ ...gutter, lineHeight: `${rowH}px`, cursor: r && onOpenRow ? "pointer" : "default" }}>
+          {(i + 1).toLocaleString()}
+        </div>
+        {r ? columns.map((c) => {
+          const v = r[c.name];
+          const isNull = v === undefined || v === null;
+          const key = i + ":" + c.name;
+          const isCopied = copied === key;
+          return (
+            <div key={c.name} role="button" tabIndex={0} onClick={() => copyCell(key, v)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); copyCell(key, v); } }}
+              title="click to copy"
+              style={{
+                flex: "0 0 auto", width: width(c), padding: "0 8px", overflow: "hidden", textOverflow: "ellipsis",
+                whiteSpace: "nowrap", fontFamily: "var(--font-mono)", fontSize: "var(--text-base)",
+                lineHeight: `${rowH}px`, cursor: "pointer", color: isNull ? "var(--null)" : "var(--fg)",
+                outline: isCopied ? "2px solid var(--accent)" : "none", outlineOffset: "-2px",
+                background: isCopied ? "var(--sel)" : undefined,
+              }}>
+              {isNull ? "·" : cellText(v)}
+            </div>
+          );
+        }) : <div style={{ padding: "0 8px", color: "var(--muted)", fontFamily: "var(--font-mono)", fontSize: "var(--text-12)" }}>…</div>}
+      </div>,
+    );
+  }
 
   return (
-    // The header + body are `width: totalWidth` (sum of column widths), which can exceed the
-    // viewport. This root MUST own the horizontal scroll and clip to its flex box, else the wide
-    // grid paints OUTSIDE <main> and overlaps the side panels (Row detail / History). minWidth:0
-    // lets it shrink inside the flex row; overflowX scrolls the columns; the body keeps its own
-    // vertical scroll so the header row stays put.
-    <div style={{ display: "flex", flexDirection: "column", minHeight: 0, flex: "1 1 auto", minWidth: 0, overflowX: "auto", overflowY: "hidden", ...style }}>
-      <div style={{ overflow: "hidden", flex: "0 0 auto", borderBottom: "var(--border-hairline)", width: totalWidth }}>
-        <div style={{ display: "flex" }}>
-          {columns.map((c) => {
-            const arrow = sort && sort.col === c.name ? (sort.desc ? " ▼" : " ▲") : "";
-            return (
-              <div key={c.name} role="button" tabIndex={0} onClick={() => onSort && onSort(c.name)}
-                onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSort && onSort(c.name); } }}
-                title="click to sort"
-                style={{ ...gcell, width: width(c), background: "var(--panel)", fontWeight: "var(--weight-semibold)", cursor: "pointer", userSelect: "none", fontFamily: "var(--font-sans)" }}>
-                {c.name}<span style={{ color: "var(--accent)" }}>{arrow}</span>
-                <div style={{ color: "var(--muted)", fontSize: "var(--text-xs)", fontWeight: "var(--weight-normal)" }}>{c.data_type}</div>
-                <div style={{ position: "absolute", top: 0, right: 0, width: 7, height: "100%", cursor: "col-resize" }} />
-              </div>
-            );
-          })}
-        </div>
-        {showFilters && (
+    // One scroll area for both directions, so its vertical scrollbar is always at its right edge
+    // and the header, sticky at its top, scrolls sideways with the columns. minWidth/minHeight:0
+    // let it shrink inside <main> rather than paint over the side panels.
+    <div style={{ display: "flex", flexDirection: "column", minHeight: 0, flex: "1 1 auto", minWidth: 0, ...style }}>
+      <div ref={scroller} tabIndex={0} onScroll={onScroll} onKeyDown={onKeyDown} role="grid" aria-rowcount={count}
+        style={{ flex: "1 1 auto", minHeight: 0, overflow: "auto", outline: "none" }}>
+        <div ref={head} style={{ position: "sticky", top: 0, zIndex: 2, width: totalWidth, background: "var(--panel)", borderBottom: "var(--border-hairline)" }}>
           <div style={{ display: "flex" }}>
-            {columns.map((c) => (
-              <div key={c.name} style={{ ...gcell, width: width(c), background: "var(--panel)", padding: "3px 5px" }}>
-                <input value={filters[c.name] || ""} placeholder="filter…"
-                  title={"contains by default. Prefix:  >  <  >=  <=  =  !=  for comparisons; "
-                    + "~ contains, !~ does not contain, ^ starts with, $ ends with. "
-                    + "Type  in:a,b,c  for any of a list, or  null  /  !null  for empty cells."}
-                  onChange={(e) => onFilter && onFilter(c.name, e.target.value)}
-                  style={{ width: "100%", padding: "2px 5px", border: "var(--border-hairline)", borderRadius: "var(--radius-sm)", background: "var(--bg)", color: "var(--fg)", fontFamily: "var(--font-mono)", fontSize: "var(--text-12)" }} />
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div style={{ flex: "1 1 auto", overflow: "auto", minHeight: 0, width: totalWidth }}>
-        {rows.map((row, ri) => (
-          <div key={ri} onMouseEnter={() => setHoverRow(ri)} onMouseLeave={() => setHoverRow(null)}
-            style={{ display: "flex", height: "var(--row-height)", alignItems: "center", borderBottom: "var(--border-hairline)", background: hoverRow === ri ? "var(--hover)" : "transparent" }}>
+            <div style={{ ...gcell, ...gutter, padding: "var(--pad-cell)", fontFamily: "var(--font-sans)" }} title="row number; click one to see the row">#</div>
             {columns.map((c) => {
-              const v = row[c.name];
-              const isNull = v === undefined || v === null;
-              const key = ri + ":" + c.name;
-              const isCopied = copied === key;
+              const arrow = sort && sort.col === c.name ? (sort.desc ? " ▼" : " ▲") : "";
               return (
-                <div key={c.name} role="button" tabIndex={0} onClick={() => copyCell(key, v)}
-                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); copyCell(key, v); } }}
-                  title="click to copy"
-                  style={{
-                    flex: "0 0 auto", width: width(c), padding: "0 8px", overflow: "hidden", textOverflow: "ellipsis",
-                    whiteSpace: "nowrap", fontFamily: "var(--font-mono)", fontSize: "var(--text-base)",
-                    lineHeight: "var(--row-height)", cursor: "pointer", color: isNull ? "var(--null)" : "var(--fg)",
-                    outline: isCopied ? "2px solid var(--accent)" : "none", outlineOffset: "-2px",
-                    background: isCopied ? "var(--sel)" : undefined,
-                  }}>
-                  {isNull ? "·" : cellText(v)}
+                <div key={c.name} role="button" tabIndex={0} onClick={() => onSort && onSort(c.name)}
+                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSort && onSort(c.name); } }}
+                  title="click to sort"
+                  style={{ ...gcell, width: width(c), background: "var(--panel)", fontWeight: "var(--weight-semibold)", cursor: "pointer", userSelect: "none", fontFamily: "var(--font-sans)" }}>
+                  {c.name}<span style={{ color: "var(--accent)" }}>{arrow}</span>
+                  <div style={{ color: "var(--muted)", fontSize: "var(--text-xs)", fontWeight: "var(--weight-normal)" }}>{c.data_type}</div>
                 </div>
               );
             })}
           </div>
-        ))}
+          {showFilters && (
+            <div style={{ display: "flex" }}>
+              <div style={{ ...gutter, padding: "3px 5px" }} />
+              {columns.map((c) => (
+                <div key={c.name} style={{ ...gcell, width: width(c), background: "var(--panel)", padding: "3px 5px" }}>
+                  <input value={filters[c.name] || ""} placeholder="filter…"
+                    title={"contains by default. Prefix:  >  <  >=  <=  =  !=  for comparisons; "
+                      + "~ contains, !~ does not contain, ^ starts with, $ ends with. "
+                      + "Type  in:a,b,c  for any of a list, or  null  /  !null  for empty cells."}
+                    onChange={(e) => onFilter && onFilter(c.name, e.target.value)}
+                    style={{ width: "100%", padding: "2px 5px", border: "var(--border-hairline)", borderRadius: "var(--radius-sm)", background: "var(--bg)", color: "var(--fg)", fontFamily: "var(--font-mono)", fontSize: "var(--text-12)" }} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={{ position: "relative", height: spacerH, width: totalWidth }}>
+          {rows}
+        </div>
+        {count === 0 && <div style={{ padding: "var(--gutter)", color: "var(--muted)" }}>No rows.</div>}
       </div>
 
       {footer != null && (
         <div style={{ flex: "0 0 auto", padding: "5px 14px", borderTop: "var(--border-hairline)", color: "var(--muted)", fontSize: "var(--text-12)", display: "flex", gap: "var(--space-8)", alignItems: "center" }}>
+          {count > 0 && <span>rows {(first + 1).toLocaleString()}–{lastShown.toLocaleString()}</span>}
           {footer}
         </div>
       )}

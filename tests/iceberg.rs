@@ -217,6 +217,38 @@ fn plan_with_root_confines_files_to_root() {
 }
 
 #[test]
+fn the_root_check_refuses_an_iceberg_table_whose_metadata_names_files_outside_the_root() {
+    // The table dir is inside the root, so the entry check passes; the escape is in its metadata,
+    // which names a manifest list by an absolute path outside the root. `confine::members` has to
+    // re-plan the table with the root to see it.
+    let other = tempfile::tempdir().unwrap();
+    let tbl = build_table(other.path());
+    let root_dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(root_dir.path()).unwrap();
+    let escaping = root.join("escaping");
+    fs::create_dir_all(escaping.join("metadata")).unwrap();
+    for name in ["v1.metadata.json", "version-hint.text"] {
+        fs::copy(
+            tbl.join("metadata").join(name),
+            escaping.join("metadata").join(name),
+        )
+        .unwrap();
+    }
+    let source = Source::detect(&escaping).unwrap();
+    assert_eq!(source.format, Format::Iceberg);
+    let err = lakeleto::confine::members(Some(&root), &source).unwrap_err();
+    assert!(
+        matches!(err, lakeleto::error::EngineError::Forbidden(_)),
+        "expected Forbidden, got: {err:?}"
+    );
+
+    // Control: the table under a root that holds all its files passes.
+    let whole = std::fs::canonicalize(other.path()).unwrap();
+    let source = Source::detect(&tbl).unwrap();
+    assert!(lakeleto::confine::members(Some(&whole), &source).is_ok());
+}
+
+#[test]
 fn plan_with_root_preserves_positional_delete_matching() {
     // A table WITH positional deletes: under confinement the guard canonicalizes both the data
     // files and the delete-referenced paths, so deletes must still associate with their file (this
@@ -1700,4 +1732,41 @@ fn v2_tables_still_report_format_version_two() {
     let dir = tempfile::tempdir().unwrap();
     let tbl = build_table(dir.path());
     assert_eq!(lakeleto::iceberg::plan(&tbl).unwrap().format_version, 2);
+}
+
+/// A window longer than one batch takes every batch it spans, not just the first. The reader hands
+/// over 8,192 rows at a time, so a 10,000-row window is two batches.
+#[test]
+fn a_window_longer_than_a_batch_takes_every_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = dir.path().join("tbl");
+    let meta = tbl.join("metadata");
+    let data = tbl.join("data");
+    fs::create_dir_all(&meta).unwrap();
+    fs::create_dir_all(&data).unwrap();
+    let file = data.join("big.parquet");
+    write_parquet(
+        &file,
+        vec![id_field("x", DataType::Int64, false, 1)],
+        vec![Arc::new(Int64Array::from_iter_values(0..12_000)) as ArrayRef],
+    );
+    finalize_table(
+        &tbl,
+        &meta,
+        vec![stats_entry(&file, 12_000, &[(1, 0)], &[], &[], &[])],
+        serde_json::json!([{ "id": 1, "name": "x", "required": true, "type": "long" }]),
+    );
+    let source = Source::detect(&tbl).unwrap();
+    let rows = LocalReaderEngine::default()
+        .preview(&RequestContext::detached(), &source, 10_000)
+        .unwrap();
+    assert_eq!(rows.num_rows(), 10_000);
+    let last = rows.batches.last().unwrap();
+    let ids = last
+        .column_by_name("x")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ids.value(ids.len() - 1), 9_999);
 }

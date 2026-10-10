@@ -28,9 +28,7 @@ use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::SystemTime;
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SchemaRef};
@@ -39,12 +37,12 @@ use serde_json::value::RawValue;
 use serde_json::Value;
 
 use super::{
-    batch_size_for, collect, read_error, FileSchema, FormatReader, Input, Pass, ReadOptions,
-    SqlSupport,
+    batch_size_for, collect, read_error, Cache, FileSchema, FormatReader, Input, Pass, ReadOptions,
+    SqlSupport, Version,
 };
 use crate::context::RequestContext;
 use crate::error::{EngineError, Result};
-use crate::source::Format;
+use crate::source::{Codec, Format};
 
 /// The largest single JSON **document** held in memory to find its records in — as bytes, once
 /// per file version; the records then stream. Only that shape holds a document whole — NDJSON and
@@ -77,16 +75,20 @@ impl FormatReader for Json {
         &["json", "ndjson", "jsonl", "geojson"]
     }
 
-    fn sql(&self) -> SqlSupport {
+    fn sql(&self, _codec: Option<Codec>) -> SqlSupport {
         // Not DataFusion's JSON reader: it infers line by line — the failure this reader exists to
         // fix — and knows no records path, flattening or widening. Through this one, every layout
-        // reads in SQL as it does in the grid, streamed a pass per query.
+        // reads in SQL as it does in the grid, streamed a pass per query, compressed or not.
         SqlSupport::Streamed(pass)
     }
 
     /// An object is read as its bytes arrive: each read a request, a located records member a
     /// ranged one.
     fn streams_objects(&self) -> bool {
+        true
+    }
+
+    fn compressible(&self) -> bool {
         true
     }
 
@@ -333,7 +335,9 @@ fn classify(input: Input<'_>, explicit: Option<&str>) -> Result<Plan> {
             if !is_single_value(&mut *r)? || len(input)? > DOCUMENT_MAX_BYTES {
                 return Ok(Plan::Values);
             }
-            let doc = Document::read(input)?;
+            let Some(doc) = Document::read(input)? else {
+                return Ok(Plan::Values);
+            };
             Ok(match doc.records_member()? {
                 Some(member) => Plan::Member(member),
                 None => Plan::Parsed {
@@ -360,9 +364,12 @@ fn explicit_plan(
         return Ok(match first {
             Some(b'[') => Plan::Array,
             Some(b'{') if is_single_value(r)? && len(input)? <= DOCUMENT_MAX_BYTES => {
-                Plan::Parsed {
-                    path: None,
-                    row: Document::read(input)?.parse()?,
+                match Document::read(input)? {
+                    Some(doc) => Plan::Parsed {
+                        path: None,
+                        row: doc.parse()?,
+                    },
+                    None => Plan::Values,
                 }
             }
             _ => Plan::Values,
@@ -381,14 +388,18 @@ fn explicit_plan(
             ),
         });
     }
-    let size = len(input)?;
-    if size > DOCUMENT_MAX_BYTES {
-        return Err(EngineError::TooLarge(format!(
+    let too_large = |size: &str| {
+        EngineError::TooLarge(format!(
             "the JSON document is {size} bytes; finding the records at `{path}` holds it in \
              memory, which is limited to {DOCUMENT_MAX_BYTES} bytes"
-        )));
+        ))
+    };
+    let size = len(input)?;
+    if size > DOCUMENT_MAX_BYTES {
+        return Err(too_large(&size.to_string()));
     }
-    let doc = Document::read(input)?;
+    let doc = Document::read(input)?
+        .ok_or_else(|| too_large(&format!("more than {DOCUMENT_MAX_BYTES}")))?;
     let nothing = || EngineError::Query(format!("nothing at `{path}` in this JSON document"));
     let value = doc.locate(path)?.ok_or_else(nothing)?;
     match value.get().as_bytes().first() {
@@ -541,8 +552,10 @@ struct Document<'a> {
 }
 
 impl<'a> Document<'a> {
-    /// Read the whole of `input`. The caller has already checked its size.
-    fn read(input: Input<'a>) -> Result<Self> {
+    /// Read the whole of `input`, or `None` when it is more than [`DOCUMENT_MAX_BYTES`]. The caller
+    /// has already checked the size the input reports, but an object's bytes are counted as they
+    /// are read: a compressed one reports its compressed size.
+    fn read(input: Input<'a>) -> Result<Option<Self>> {
         let owned = |bytes: Vec<u8>| -> Result<Cow<'a, str>> {
             Ok(Cow::Owned(
                 String::from_utf8(bytes).map_err(|e| invalid(e.utf8_error()))?,
@@ -552,8 +565,14 @@ impl<'a> Document<'a> {
             Input::File(path) => owned(std::fs::read(path)?)?,
             Input::Bytes(bytes) => Cow::Borrowed(std::str::from_utf8(bytes).map_err(invalid)?),
             Input::Object(object) => {
-                let mut bytes = Vec::with_capacity(object.size() as usize);
-                object.open(None)?.read_to_end(&mut bytes)?;
+                let mut bytes = Vec::with_capacity(object.size().min(DOCUMENT_MAX_BYTES) as usize);
+                object
+                    .open(None)?
+                    .take(DOCUMENT_MAX_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > DOCUMENT_MAX_BYTES {
+                    return Ok(None);
+                }
                 owned(bytes)?
             }
         };
@@ -562,7 +581,7 @@ impl<'a> Document<'a> {
         } else {
             0
         };
-        Ok(Document { text, base })
+        Ok(Some(Document { text, base }))
     }
 
     fn body(&self) -> &str {
@@ -767,89 +786,21 @@ struct CacheKey {
     records_path: Option<String>,
 }
 
-/// One version of an input's bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Version {
-    /// A local file, as of its length and modification time.
-    File {
-        path: PathBuf,
-        len: u64,
-        modified: SystemTime,
-    },
-    /// An object, as one credential identity sees it, as of the version its store reports, which
-    /// its reads are pinned to.
-    Object {
-        uri: String,
-        identity: String,
-        size: u64,
-        version: String,
-    },
-}
-
 /// Files and objects: bytes an engine already holds have no version to key them by, and are read
 /// afresh.
 fn cache_key(input: Input<'_>, records_path: Option<&str>) -> Option<CacheKey> {
-    let version = match input {
-        Input::File(path) => {
-            let meta = std::fs::metadata(path).ok()?;
-            Version::File {
-                path: path.to_path_buf(),
-                len: meta.len(),
-                modified: meta.modified().ok()?,
-            }
-        }
-        Input::Object(object) => Version::Object {
-            uri: object.uri().to_string(),
-            identity: object.identity().to_string(),
-            size: object.size(),
-            version: object.version().to_string(),
-        },
-        Input::Bytes(_) => return None,
-    };
     Some(CacheKey {
-        version,
+        version: Version::of(input)?,
         records_path: records_path.map(str::to_string),
     })
 }
 
-/// One fact per file version. Enough entries for the files one person has open; clearing when
-/// full keeps it bounded without the bookkeeping an LRU would add for a map that is cheap to
-/// refill.
-struct Cache<V>(OnceLock<Mutex<HashMap<CacheKey, V>>>);
-
-const CACHE_ENTRIES: usize = 64;
-
-impl<V: Clone> Cache<V> {
-    const fn new() -> Self {
-        Cache(OnceLock::new())
-    }
-
-    fn map(&self) -> MutexGuard<'_, HashMap<CacheKey, V>> {
-        self.0
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn get(&self, key: &CacheKey) -> Option<V> {
-        self.map().get(key).cloned()
-    }
-
-    fn put(&self, key: CacheKey, value: V) {
-        let mut map = self.map();
-        if map.len() >= CACHE_ENTRIES {
-            map.clear();
-        }
-        map.insert(key, value);
-    }
-}
-
 /// Stream schemas: sampled, or widened since by [`read_rows`].
-static SCHEMAS: Cache<SchemaRef> = Cache::new();
+static SCHEMAS: Cache<CacheKey, SchemaRef> = Cache::new();
 
 /// Layouts: found once, since finding one reads the start of the input, and locating a records
 /// member reads its document whole.
-static LAYOUTS: Cache<Layout> = Cache::new();
+static LAYOUTS: Cache<CacheKey, Layout> = Cache::new();
 
 fn builder(schema: &SchemaRef, batch_size: usize) -> arrow_json::ReaderBuilder {
     arrow_json::ReaderBuilder::new(schema.clone())
@@ -1199,7 +1150,9 @@ mod tests {
         let text = r#"{"a/b": {"~k": [10, {"deep": [{"z": 1}]}, 30]}, "": {"": [1]},
                       "arr": [[{"q": 1}]], "0": "zero", "dup": 1, "dup": [{"d": 2}]}"#;
         let doc: Value = serde_json::from_str(text).unwrap();
-        let located = Document::read(Input::Bytes(text.as_bytes())).unwrap();
+        let located = Document::read(Input::Bytes(text.as_bytes()))
+            .unwrap()
+            .unwrap();
         for pointer in [
             "",
             "/",
@@ -1648,27 +1601,5 @@ mod tests {
         );
         assert!(matches!(read, Err(EngineError::Io(_))), "{:?}", read.err());
         assert_eq!(object.requests(), [None], "nor a read to infer a wider one");
-    }
-
-    #[test]
-    fn the_cache_keeps_every_file_until_it_is_full() {
-        // What a file's widened schema and located records rely on: another file's entry does not
-        // evict them, until the cache is full and starts again.
-        let key = |i: usize| CacheKey {
-            version: Version::File {
-                path: PathBuf::from(format!("/data/{i}.json")),
-                len: 1,
-                modified: SystemTime::UNIX_EPOCH,
-            },
-            records_path: None,
-        };
-        let cache: Cache<usize> = Cache::new();
-        for i in 0..CACHE_ENTRIES {
-            cache.put(key(i), i);
-        }
-        assert!((0..CACHE_ENTRIES).all(|i| cache.get(&key(i)) == Some(i)));
-        cache.put(key(CACHE_ENTRIES), CACHE_ENTRIES);
-        assert_eq!(cache.get(&key(0)), None, "full, so cleared");
-        assert_eq!(cache.get(&key(CACHE_ENTRIES)), Some(CACHE_ENTRIES));
     }
 }

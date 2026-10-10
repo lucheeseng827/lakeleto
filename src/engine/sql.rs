@@ -2,8 +2,9 @@
 //!
 //! Feature-gated (`--features sql`) because DataFusion is a heavy compile; the default
 //! build stays lean. When present it gives Lakeleto a real SQL planner over every format the local
-//! reader opens — Parquet and CSV/TSV natively, JSON streamed through this crate's reader a pass
-//! per query ([`streamed`]), Iceberg and Delta read through the local engine into memory —
+//! reader opens — Parquet files, CSV/TSV and Arrow IPC natively, JSON and compressed text streamed
+//! through this crate's reader a pass per query ([`streamed`]), Iceberg, Delta and Parquet
+//! directories read through the local engine into memory —
 //! `lakeleto query "SELECT ..."` — while `schema`/`head`/`profile` are expressed as SQL and
 //! funnel back through the *same* [`profile_columns`](super::profile_columns) helper the
 //! local engine uses, so stats never diverge between engines.
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::common::ScalarValue;
+use datafusion::datasource::file_format::options::ArrowReadOptions;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -36,6 +38,7 @@ use super::{
 };
 use crate::context::RequestContext;
 use crate::error::{EngineError, Result};
+use crate::format::codec::{Decompressed, Stored};
 use crate::format::{RemoteObject, SqlSupport};
 use crate::source::{Flatten, Format, Source};
 
@@ -154,6 +157,10 @@ pub struct DataFusionEngine {
     /// engine is built.
     #[cfg(feature = "object-store")]
     default_store_options: Option<crate::objstore::StoreOptions>,
+    /// The catalogs a `catalog://` table is read through, handed to the local reader that loads
+    /// it. The process's unless [`Self::with_catalogs`] says otherwise.
+    #[cfg(feature = "catalog")]
+    catalogs: std::sync::Arc<crate::catalog::Catalogs>,
 }
 
 impl DataFusionEngine {
@@ -163,7 +170,16 @@ impl DataFusionEngine {
         Self {
             #[cfg(feature = "object-store")]
             default_store_options: Some(crate::objstore::StoreOptions::from_env()),
+            #[cfg(feature = "catalog")]
+            catalogs: crate::catalog::Catalogs::configured(),
         }
+    }
+
+    /// This engine, reading `catalog://` tables through `catalogs` rather than the process's.
+    #[cfg(feature = "catalog")]
+    pub fn with_catalogs(mut self, catalogs: std::sync::Arc<crate::catalog::Catalogs>) -> Self {
+        self.catalogs = catalogs;
+        self
     }
 
     /// An engine that falls back to `options` rather than to the environment when a call names no
@@ -177,6 +193,8 @@ impl DataFusionEngine {
         let _ = runtime();
         Self {
             default_store_options: Some(options),
+            #[cfg(feature = "catalog")]
+            catalogs: crate::catalog::Catalogs::configured(),
         }
     }
 
@@ -192,6 +210,8 @@ impl DataFusionEngine {
         let _ = runtime();
         Self {
             default_store_options: None,
+            #[cfg(feature = "catalog")]
+            catalogs: crate::catalog::Catalogs::configured(),
         }
     }
 
@@ -316,14 +336,30 @@ impl DataFusionEngine {
         if !crate::engine::sql_registers(table.source.format) {
             return Err(EngineError::unsupported_format(table.source.format, "sql"));
         }
-        // DataFusion would read a `.csv.gz` as CSV, compressed bytes and all.
-        table.source.require_uncompressed()?;
-        let support = crate::format::reader(table.source.format).map(|reader| reader.sql());
+        // What this build cannot decompress, SQL refuses as the grid does.
+        table.source.require_decodable()?;
+        let support =
+            crate::format::reader(table.source.format).map(|reader| reader.sql(table.source.codec));
         if let Some(SqlSupport::Streamed(pass)) = support {
-            let at = if table.source.is_remote() {
-                At::Object(self.remote_object(ctx, &table.source)?)
-            } else {
-                At::File(table.source.path.clone())
+            let at = match table.source.codec {
+                // Decompressed as each pass reads it, under the same cap as the grid's reads: a
+                // pass that goes past it fails the query as `TooLarge` ([`retrying`]).
+                Some(codec) => {
+                    let stored = if table.source.is_remote() {
+                        Stored::Object(self.remote_object(ctx, &table.source)?)
+                    } else {
+                        Stored::File(table.source.path.clone())
+                    };
+                    At::Decompressed(Arc::new(Decompressed::new(
+                        stored,
+                        codec,
+                        crate::source::max_decompressed(),
+                    )?))
+                }
+                None if table.source.is_remote() => {
+                    At::Object(self.remote_object(ctx, &table.source)?)
+                }
+                None => At::File(table.source.path.clone()),
             };
             streamed::register(session, table, pass, at, streams)?;
             return match table.source.flatten {
@@ -368,6 +404,7 @@ impl DataFusionEngine {
                     .register_parquet(&table.name, &path, ParquetReadOptions::default())
                     .await
                     .map_err(|e| EngineError::Query(e.to_string())),
+                // Never compressed here: a compressed file is read in passes, above.
                 Format::Csv | Format::Tsv => session
                     .register_csv(
                         &table.name,
@@ -375,6 +412,18 @@ impl DataFusionEngine {
                         CsvReadOptions::default()
                             .delimiter(table.source.format.delimiter())
                             .file_extension(&ext),
+                    )
+                    .await
+                    .map_err(|e| EngineError::Query(e.to_string())),
+                // DataFusion's own reader, which reads the file framing and the stream framing.
+                Format::Arrow => session
+                    .register_arrow(
+                        &table.name,
+                        &path,
+                        ArrowReadOptions {
+                            file_extension: &ext,
+                            ..ArrowReadOptions::default()
+                        },
                     )
                     .await
                     .map_err(|e| EngineError::Query(e.to_string())),
@@ -447,6 +496,8 @@ impl DataFusionEngine {
         };
         #[cfg(not(feature = "object-store"))]
         let local = crate::engine::local::LocalReaderEngine::default();
+        #[cfg(feature = "catalog")]
+        let local = local.with_catalogs(self.catalogs.clone());
         let rb = local.preview(ctx, &table.source, usize::MAX)?; // full read (no row cap)
         let mem = MemTable::try_new(rb.schema.clone(), vec![rb.batches])
             .map_err(|e| EngineError::Query(e.to_string()))?;
@@ -798,7 +849,7 @@ impl Engine for DataFusionEngine {
             )
         })?;
         let scanned_rows = rb.num_rows() as u64;
-        let columns = profile_columns(&rb.schema, &rb.batches);
+        let columns = profile_columns(&rb.schema, &rb.batches)?;
         Ok(TableProfile {
             source: source.display(),
             engine: self.name().to_string(),

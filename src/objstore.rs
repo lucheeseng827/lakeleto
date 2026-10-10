@@ -36,12 +36,10 @@
 //! Each public read has a `_with` variant taking `&StoreOptions`; the historical signature is a
 //! thin wrapper over it.
 
-use std::collections::HashMap;
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Read};
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -63,7 +61,7 @@ use url::Url;
 
 use crate::error::{EngineError, Result};
 use crate::format::RemoteObject;
-use crate::source::{format_from_extension, DirEntry, DirListing};
+use crate::source::{format_from_name, DirEntry, DirListing};
 
 /// A shared multi-thread Tokio runtime for the (blocking) object-store calls. Lakeleto's
 /// [`Engine`](crate::engine::Engine) API is synchronous, so remote I/O is driven under
@@ -271,9 +269,10 @@ impl StoreOptions {
         for (key, value) in pairs {
             opts = opts.with_config(key, value);
         }
-        // Scope the mirror cache to the assumed role, not to the process. Two tenants reading one
-        // URI under two roles must not share a materialized copy; two reads under the SAME role
-        // legitimately may, which is what makes this a role ARN rather than a fresh private id.
+        // Scope the identity to the assumed role, not to the process. Two tenants reading one URI
+        // under two roles must not share what a read learned about an object; two reads under the
+        // SAME role legitimately may, which is what makes this a role ARN rather than a fresh
+        // private id.
         Ok(opts.with_scope(role_arn))
     }
 
@@ -313,9 +312,8 @@ impl StoreOptions {
     ///
     /// The label is opaque to this crate — a tenant id, a principal id, a workspace id, whatever
     /// the caller uses to mean "a different reader". It is never sent anywhere; its only job is
-    /// to separate cache entries (see [`materialize_prefix_with`]) so one identity's bytes are
-    /// never handed to another. Declaring it also makes the mirror reusable across processes,
-    /// which an undeclared identity deliberately is not.
+    /// to separate cache entries, such as where a JSON object's records lie, so what one identity
+    /// read is never handed to another.
     pub fn with_scope(mut self, scope: impl AsRef<str>) -> Self {
         self.scope = Some(Arc::from(scope.as_ref()));
         self
@@ -328,8 +326,8 @@ impl StoreOptions {
     /// the honest answer to "who is this?" is "unknown, so share with nobody"; otherwise the
     /// ambient environment; otherwise nothing at all.
     ///
-    /// It is never derived from the credentials themselves — this value reaches a filename, and
-    /// a filename derived from a secret is an offline oracle for that secret.
+    /// It is never derived from the credentials themselves: it keys caches and is printed by
+    /// `Debug`, and nothing that does either should be a function of a secret.
     pub fn scope_id(&self) -> &str {
         if let Some(scope) = &self.scope {
             return scope;
@@ -368,7 +366,7 @@ impl StoreOptions {
 /// OS-seeded per-process base plus a monotonic counter.
 ///
 /// `RandomState` is seeded from the OS once per process, so the base is neither predictable by a
-/// local onlooker nor repeated by the next run — the two properties the two callers need. It is
+/// local onlooker nor repeated by the next run — the two properties a private scope needs. It is
 /// deliberately not a hash of anything the caller supplied.
 fn unique_token() -> String {
     static BASE: OnceLock<u64> = OnceLock::new();
@@ -543,163 +541,6 @@ pub fn looks_like_iceberg_as(uri: &str, opts: &StoreOptions) -> Result<bool> {
     })
 }
 
-/// Mirror an object-store prefix (an Iceberg table directory) to a local temp directory, **once
-/// per process per reader** (memoized on credential identity *and* URI — see
-/// [`materialize_prefix_with`]). Returns the local mirror root.
-///
-/// The Iceberg reader is filesystem-based; this shim lets it read a table that lives in a bucket:
-/// download the whole prefix (metadata + Avro manifests + Parquet data), then plan against the
-/// mirror with [`crate::iceberg::plan_object`], which remaps the absolute object URIs stored in the
-/// metadata back to the mirror. Keys are laid out relative to the prefix (so `…/metadata/x.avro`
-/// mirrors to `<dest>/metadata/x.avro`), matching how `plan_object` strips the origin URI. Trades
-/// ranged reads for simplicity — appropriate for exploring a table, not a streaming path.
-pub fn materialize_prefix(uri: &str) -> Result<PathBuf> {
-    materialize_prefix_with(uri, &StoreOptions::from_env())
-}
-
-/// [`materialize_prefix`] with an explicit store configuration.
-///
-/// # Why the cache is keyed on identity, not on the URI
-///
-/// The memo used to be keyed on the URI string alone. With one ambient identity per process that
-/// was merely a cache; the moment a process can read as more than one principal it is a
-/// cross-principal read: the first caller to download `s3://acme/table` fixes the bytes every
-/// later caller sees, whatever credentials *they* presented, and the second principal's request
-/// is never signed at all. The per-caller credential would be configured, honoured on the miss,
-/// and then bypassed on every hit — the authorization decision defeated by the fast path.
-///
-/// So the key is `(scope, uri)`: [`StoreOptions::scope_id`] names the identity, and an identity
-/// that will not name itself gets a private scope shared with nobody. A different credential
-/// context can therefore never land on another's entry, on disk or in the map.
-pub fn materialize_prefix_with(uri: &str, opts: &StoreOptions) -> Result<PathBuf> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, String), PathBuf>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (opts.scope_id().to_string(), uri.to_string());
-    if let Some(p) = cache.lock().unwrap().get(&key) {
-        return Ok(p.clone());
-    }
-    let (store, prefix) = store_for_with(uri, opts)?;
-    let dest = mirror_dir(&key.0, uri)?;
-    private_dir_builder().recursive(true).create(&dest)?;
-    let prefix_str = prefix.as_ref().to_string();
-    runtime().block_on(async {
-        let mut listing = store.list(Some(&prefix));
-        let mut n = 0usize;
-        while let Some(meta) = listing.next().await {
-            let meta =
-                meta.map_err(|e| EngineError::Other(format!("object-store list {uri}: {e}")))?;
-            let key = meta.location.as_ref();
-            let rel = key
-                .strip_prefix(&prefix_str)
-                .unwrap_or(key)
-                .trim_start_matches('/');
-            let out = dest.join(rel);
-            if let Some(parent) = out.parent() {
-                private_dir_builder().recursive(true).create(parent)?;
-            }
-            let bytes = store
-                .get(&meta.location)
-                .await
-                .map_err(|e| {
-                    EngineError::Other(format!("object-store get {}: {e}", meta.location))
-                })?
-                .bytes()
-                .await
-                .map_err(|e| {
-                    EngineError::Other(format!("object-store read {}: {e}", meta.location))
-                })?;
-            std::fs::File::create(&out)?.write_all(&bytes)?;
-            n += 1;
-        }
-        if n == 0 {
-            return Err(EngineError::UnsupportedFormat {
-                detail: format!("no objects under `{uri}` (empty prefix or wrong path)"),
-            });
-        }
-        Ok::<(), EngineError>(())
-    })?;
-    cache.lock().unwrap().insert(key, dest.clone());
-    Ok(dest)
-}
-
-/// A `DirBuilder` that creates directories readable only by the user running the process.
-///
-/// A mirror holds the customer's *table data*. The old layout wrote it straight into
-/// `std::env::temp_dir()`, which on a shared host is world-readable (`/tmp`, mode 0777) — so any
-/// local user could read another user's, or another tenant's, table. `0700` is the fix, and it is
-/// applied to the mirror root, which gates the whole subtree: without execute permission on the
-/// root, the mode of the files beneath it cannot be reached. On non-unix targets this is a plain
-/// `DirBuilder`; Windows temp directories are already per-user.
-fn private_dir_builder() -> std::fs::DirBuilder {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-}
-
-/// The process-private root every mirror lives under.
-///
-/// Permissions alone would not be enough: the old directory name was a hash of the URI, so it was
-/// *predictable*, and on a shared `/tmp` another local user can pre-create a predictable name as a
-/// directory they own and world-writable — after which `create_dir_all` happily succeeds and the
-/// table data is written into their directory. The root is therefore created with `create_dir`,
-/// which fails rather than adopting an existing entry, under a name carrying a per-process OS-seeded
-/// random component. We never write into a directory we did not make.
-fn mirror_root() -> Result<&'static PathBuf> {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    if let Some(root) = ROOT.get() {
-        return Ok(root);
-    }
-    let made = create_private_root()?;
-    let winner = ROOT.get_or_init(|| made.clone());
-    if winner != &made {
-        // Another thread won the race; ours is still empty, so drop it rather than leak it.
-        let _ = std::fs::remove_dir(&made);
-    }
-    Ok(winner)
-}
-
-fn create_private_root() -> Result<PathBuf> {
-    /// A squatter can only lose this race by guessing an OS-seeded value, so a handful of
-    /// attempts is already generous; the bound exists so a pathological temp dir (full, or
-    /// read-only) reports an error instead of spinning forever.
-    const ATTEMPTS: usize = 8;
-    let base = std::env::temp_dir();
-    let mut last: Option<std::io::Error> = None;
-    for _ in 0..ATTEMPTS {
-        let candidate = base.join(format!("lakeleto-obj-{}", unique_token()));
-        match private_dir_builder().create(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
-            Err(e) => return Err(EngineError::Io(e)),
-        }
-    }
-    Err(EngineError::Other(format!(
-        "object-store: could not create a private mirror directory under {} ({})",
-        base.display(),
-        last.map(|e| e.to_string()).unwrap_or_default()
-    )))
-}
-
-/// Where the mirror of `uri`, read under credential scope `scope`, lives.
-///
-/// Both components are hashed, and hashed *separately* rather than over their concatenation, so
-/// no `(scope, uri)` pair can be re-split into a different pair with the same name. The hash is
-/// `DefaultHasher` — deterministic across processes, which is what makes a declared scope's mirror
-/// reusable — and it is applied to an identity label and a URI, never to credential material.
-fn mirror_dir(scope: &str, uri: &str) -> Result<PathBuf> {
-    Ok(mirror_root()?.join(format!("{}-{}", digest(scope), digest(uri))))
-}
-
-fn digest(s: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(s, &mut hasher);
-    format!("{:016x}", std::hash::Hasher::finish(&hasher))
-}
-
 /// Build a ranged Parquet reader, hinting the file size (from a cheap `head`) so the reader
 /// uses bounded range requests instead of suffix requests some stores don't support.
 async fn object_reader(store: Arc<dyn ObjectStore>, path: &ObjPath) -> Result<ParquetObjectReader> {
@@ -708,6 +549,114 @@ async fn object_reader(store: Arc<dyn ObjectStore>, path: &ObjPath) -> Result<Pa
         .await
         .map_err(|e| EngineError::Other(format!("head {path}: {e}")))?;
     Ok(ParquetObjectReader::new(store, path.clone()).with_file_size(meta.size))
+}
+
+/// Drive `future` to completion on the object-store runtime, from a thread that is not running one
+/// (an engine call on a `spawn_blocking` thread, or the CLI's).
+#[cfg(feature = "iceberg")]
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    runtime().block_on(future)
+}
+
+/// The stores one read reaches, under one identity: built once per bucket, and kept only for the
+/// read.
+///
+/// An Iceberg table is many objects (its metadata, manifest lists, manifests, and data and delete
+/// files), and a store built per object would open a client per object, so no request would reuse
+/// another's connection. A store per bucket, for the length of one read, keeps the connections
+/// pooled without keeping a store, or the credential it was built with, past the read. A
+/// process-wide cache would have to be keyed by identity, and an identity that declares no scope
+/// gets a fresh one per `StoreOptions` value, so such a cache would only grow.
+#[cfg(feature = "iceberg")]
+pub(crate) struct Stores {
+    opts: StoreOptions,
+    built: std::sync::Mutex<std::collections::HashMap<String, Arc<dyn ObjectStore>>>,
+}
+
+#[cfg(feature = "iceberg")]
+impl Stores {
+    /// Stores that read as `opts`.
+    pub(crate) fn new(opts: &StoreOptions) -> Stores {
+        Stores {
+            opts: opts.clone(),
+            built: Default::default(),
+        }
+    }
+
+    /// The store serving `uri`, and the object's path within it.
+    fn locate(&self, uri: &str) -> Result<(Arc<dyn ObjectStore>, ObjPath)> {
+        let url = parse_uri(uri)?;
+        // The scheme and authority name a bucket (or an Azure account's container) whatever the
+        // backend; the store built for one serves every key in it.
+        let bucket = url[..url::Position::BeforePath].to_string();
+        let mut built = self.built.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = built.get(&bucket) {
+            let (_, path) = ObjectStoreScheme::parse(&url)
+                .map_err(|e| EngineError::Other(format!("object-store `{uri}`: {e}")))?;
+            return Ok((store.clone(), path));
+        }
+        let (store, path) = store_for_with(uri, &self.opts)?;
+        built.insert(bucket, store.clone());
+        Ok((store, path))
+    }
+
+    /// The whole of the object at `uri`.
+    pub(crate) fn get(&self, uri: &str) -> Result<Bytes> {
+        self.fetch(uri)?
+            .map_err(|e| EngineError::Other(format!("object-store get {uri}: {e}")))
+    }
+
+    /// The whole of the object at `uri`, or `None` when there is no object there.
+    pub(crate) fn find(&self, uri: &str) -> Result<Option<Bytes>> {
+        match self.fetch(uri)? {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(EngineError::Other(format!("object-store get {uri}: {e}"))),
+        }
+    }
+
+    /// One `GET` of the object at `uri`: an error locating its store is the outer one, and the
+    /// store's own answer, a missing object included, the inner.
+    fn fetch(&self, uri: &str) -> Result<std::result::Result<Bytes, object_store::Error>> {
+        let (store, path) = self.locate(uri)?;
+        Ok(runtime().block_on(async move { store.get(&path).await?.bytes().await }))
+    }
+
+    /// The names of the objects directly under prefix `uri`, as a directory lists its files.
+    pub(crate) fn names(&self, uri: &str) -> Result<Vec<String>> {
+        let (store, prefix) = self.locate(uri)?;
+        let listing = runtime()
+            .block_on(async move { store.list_with_delimiter(Some(&prefix)).await })
+            .map_err(|e| EngineError::Other(format!("object-store list {uri}: {e}")))?;
+        Ok(listing
+            .objects
+            .into_iter()
+            .filter_map(|object| object.location.filename().map(str::to_string))
+            .collect())
+    }
+
+    /// A Parquet reader for the object at `uri`, which reads by ranged requests: the footer now,
+    /// then only the row groups and columns a read asks for.
+    ///
+    /// `size`, when the caller knows it (an Iceberg manifest records every data file's), saves the
+    /// `HEAD` that would otherwise find it. A reader is never left to find the size with a suffix
+    /// request, which some stores refuse.
+    pub(crate) fn parquet(
+        &self,
+        uri: &str,
+        size: Option<u64>,
+    ) -> Result<ParquetRecordBatchStreamBuilder<ParquetObjectReader>> {
+        let (store, path) = self.locate(uri)?;
+        runtime().block_on(async move {
+            let reader = match size {
+                Some(size) => ParquetObjectReader::new(store, path).with_file_size(size),
+                None => object_reader(store, &path).await?,
+            };
+            ParquetRecordBatchStreamBuilder::new(reader)
+                .await
+                .map_err(EngineError::parquet)
+        })
+    }
 }
 
 /// Schema + exact row count of a remote Parquet object (footer read only — a few KiB).
@@ -1052,7 +1001,8 @@ fn build_listing(dir: &str, base: &str, res: ListResult) -> DirListing {
         if name.starts_with('.') {
             continue; // hide dotfiles
         }
-        if let Some(fmt) = format_from_extension(std::path::Path::new(name)) {
+        // By the whole name, so a compressed file (`day.ndjson.zst`) is listed as what it holds.
+        if let Some((fmt, _)) = format_from_name(std::path::Path::new(name)) {
             entries.push(DirEntry {
                 name: name.to_string(),
                 path: format!("{base}{key}"),
@@ -1273,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn two_roles_do_not_share_a_mirror_scope() {
+    fn two_roles_do_not_share_a_scope() {
         // The cross-tenant read this seam exists to prevent: same URI, two roles, one cache.
         let a = StoreOptions::aws_assume_role_with_web_identity(
             "/t",
@@ -1290,7 +1240,7 @@ mod tests {
         )
         .unwrap();
         assert_ne!(a.scope_id(), b.scope_id());
-        // ...and the same role legitimately shares one, or every read re-downloads the table.
+        // ...and the same role legitimately shares one, so its reads can share a cache.
         let a2 = StoreOptions::aws_assume_role_with_web_identity(
             "/t",
             "arn:aws:iam::1:role/tenant-a",
@@ -1397,86 +1347,6 @@ mod tests {
             StoreOptions::empty().with_credentials(StoreCredentials::S3(static_s3_provider()));
         let err = store_for_url("gs://bucket/t.parquet", &opts).unwrap_err();
         assert!(err.to_string().contains("S3"), "{err}");
-    }
-
-    // --- the mirror cache ------------------------------------------------------------------
-
-    #[test]
-    fn mirror_dir_is_keyed_on_identity_as_well_as_uri() {
-        let uri = "s3://acme/table";
-        assert_ne!(
-            mirror_dir("tenant-a", uri).unwrap(),
-            mirror_dir("tenant-b", uri).unwrap()
-        );
-        assert_ne!(
-            mirror_dir("tenant-a", uri).unwrap(),
-            mirror_dir("tenant-a", "s3://acme/other").unwrap()
-        );
-        assert_eq!(
-            mirror_dir("tenant-a", uri).unwrap(),
-            mirror_dir("tenant-a", uri).unwrap()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_mirror_root_is_readable_only_by_this_user() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = mirror_root().unwrap();
-        let mode = std::fs::metadata(root).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "mirror root {root:?} is not user-private");
-        // It also lives *under* the shared temp dir rather than being it.
-        assert!(root.starts_with(std::env::temp_dir()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_materialized_mirror_is_readable_only_by_this_user() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("m.txt"), b"table data").unwrap();
-        let uri = format!("file://{}", dir.path().display());
-        let mirror =
-            materialize_prefix_with(&uri, &StoreOptions::empty().with_scope("perm-check")).unwrap();
-        let mode = std::fs::metadata(&mirror).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "mirror {mirror:?} is world-readable");
-    }
-
-    #[test]
-    fn materialize_prefix_never_serves_one_identity_from_another() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("data.txt");
-        std::fs::write(&file, b"tenant-a bytes").unwrap();
-        let uri = format!("file://{}", dir.path().display());
-
-        let a = StoreOptions::empty().with_scope("mirror-tenant-a");
-        let b = StoreOptions::empty().with_scope("mirror-tenant-b");
-
-        let mirror_a = materialize_prefix_with(&uri, &a).unwrap();
-        assert_eq!(
-            std::fs::read(mirror_a.join("data.txt")).unwrap(),
-            b"tenant-a bytes"
-        );
-
-        // Same URI, different credential identity. Change the source first so a stale hit is
-        // detectable: under the old URI-only key, B would have been handed A's bytes without a
-        // single request signed as B.
-        std::fs::write(&file, b"tenant-b bytes").unwrap();
-        let mirror_b = materialize_prefix_with(&uri, &b).unwrap();
-        assert_ne!(mirror_a, mirror_b);
-        assert_eq!(
-            std::fs::read(mirror_b.join("data.txt")).unwrap(),
-            b"tenant-b bytes"
-        );
-
-        // ...while the memo still memoizes *within* one identity (the point of having it).
-        std::fs::write(&file, b"changed again").unwrap();
-        let again = materialize_prefix_with(&uri, &a).unwrap();
-        assert_eq!(again, mirror_a);
-        assert_eq!(
-            std::fs::read(again.join("data.txt")).unwrap(),
-            b"tenant-a bytes"
-        );
     }
 
     #[test]

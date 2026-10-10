@@ -122,6 +122,47 @@ fn footer_profile_matches_scan_without_scanning() {
     assert_eq!(name.null_count, 1);
 }
 
+/// A column with no values has no min or max from the footer, as it has none from a scan: its
+/// statistics are all null, and a null is no value to print.
+#[test]
+fn footer_profile_of_an_all_null_column_has_no_min_or_max() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sparse.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("nothing", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None, None])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let source = Source::detect(&path).unwrap();
+    let engine = LocalReaderEngine::default();
+    let ctx = RequestContext::detached();
+    for scan_limit in [0, 10_000] {
+        let profile = engine.profile(&ctx, &source, scan_limit).unwrap();
+        let nothing = profile
+            .columns
+            .iter()
+            .find(|c| c.name == "nothing")
+            .unwrap();
+        assert_eq!(nothing.null_count, 2, "scan {scan_limit}");
+        assert_eq!(
+            (nothing.min.as_deref(), nothing.max.as_deref()),
+            (None, None),
+            "scan {scan_limit}"
+        );
+    }
+}
+
 #[test]
 fn csv_detect_and_read() {
     let dir = tempfile::tempdir().unwrap();
@@ -1669,14 +1710,18 @@ fn sql_flattens_a_parquet_struct_as_the_local_engine_does() {
 // ---- compressed files -------------------------------------------------------------------------
 
 /// A `.csv.gz` used to fail detection as an unknown extension, and with `--format csv` it read as a
-/// table of compressed bytes. It is now named for what it is and refused as such — by every read,
-/// and by SQL, which would otherwise hand DataFusion the bytes as CSV.
+/// table of compressed bytes. It reads as the CSV it holds, detected or named — in every read, and
+/// in SQL — and one whose bytes are not the gzip its name says fails as such, naming the file,
+/// rather than being read as text.
 #[test]
-fn a_compressed_file_is_refused_by_name_not_misread() {
+fn a_compressed_file_reads_as_what_it_holds_and_a_corrupt_one_says_so() {
+    use std::io::Write;
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.csv.gz");
-    // gzip's magic bytes, then noise: what a real .csv.gz starts like.
-    std::fs::write(&path, b"\x1f\x8b\x08\x00 compressed rows").unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(b"id,name\n1,ada\n2,grace\n").unwrap();
+    std::fs::write(&path, gz.finish().unwrap()).unwrap();
     let ctx = RequestContext::detached();
     let engine = LocalReaderEngine::default();
     for source in [
@@ -1684,26 +1729,28 @@ fn a_compressed_file_is_refused_by_name_not_misread() {
         Source::resolve(&path, Some("csv")).unwrap(),
     ] {
         assert_eq!(source.codec, Some(lakeleto::Codec::Gzip));
-        let errors = [
-            engine.schema(&ctx, &source).err(),
-            engine.preview(&ctx, &source, 5).err(),
-            engine
-                .scan(&ctx, &source, &lakeleto::engine::ScanSpec::default())
-                .err(),
-        ];
-        for err in errors {
-            let err = err.expect("a compressed file is refused").to_string();
-            assert!(err.contains("gzip-compressed"), "{err}");
-        }
+        let schema = engine.schema(&ctx, &source).unwrap();
+        let names: Vec<_> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["id", "name"]);
+        assert_eq!(engine.preview(&ctx, &source, 5).unwrap().num_rows(), 2);
         #[cfg(feature = "sql")]
         {
-            let err = lakeleto::engine::sql::DataFusionEngine::new()
+            let sql = lakeleto::engine::sql::DataFusionEngine::new()
                 .schema(&ctx, &source)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("gzip-compressed"), "{err}");
+                .unwrap();
+            assert_eq!(sql.columns.len(), 2);
         }
     }
+
+    // gzip's magic bytes, then noise: what a real .csv.gz starts like, and is not.
+    let corrupt = dir.path().join("bad.csv.gz");
+    std::fs::write(&corrupt, b"\x1f\x8b\x08\x00 compressed rows").unwrap();
+    let err = engine
+        .preview(&ctx, &Source::detect(&corrupt).unwrap(), 5)
+        .err()
+        .expect("not gzip")
+        .to_string();
+    assert!(err.contains("bad.csv.gz is not valid gzip"), "{err}");
 }
 
 // ---- SQL over JSON ------------------------------------------------------------------------------

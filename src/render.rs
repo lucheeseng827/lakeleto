@@ -24,38 +24,119 @@ pub enum Output {
     /// because a TSV pastes into a spreadsheet without the delimiter guessing that trips CSV up
     /// on any column holding a comma, and because Lakeleto already *reads* TSV.
     Tsv,
+    /// Parquet, Snappy-compressed, for DuckDB, Polars, pandas or Spark (feature `parquet-out`).
+    Parquet,
+    /// Arrow IPC file (`.arrow`, Feather v2): `pandas.read_feather`, `polars.read_ipc`.
+    Arrow,
+    /// Arrow IPC stream (`.arrows`), the one to pipe: `polars.read_ipc_stream(sys.stdin.buffer)`.
+    Arrows,
+}
+
+/// Whether this build writes Parquet: the `parquet-out` feature, which the release builds have.
+/// The writer is about half a megabyte of the default build, so `-o parquet` parses in every build
+/// and one without the feature refuses with [`no_parquet_writer`], before reading anything.
+pub const WRITES_PARQUET: bool = cfg!(feature = "parquet-out");
+
+/// The refusal for `-o parquet` in a build without `parquet-out`, naming the way to get it.
+pub fn no_parquet_writer() -> EngineError {
+    EngineError::Other(
+        "this build writes no Parquet: `-o parquet` needs the `parquet-out` feature \
+         (`cargo install lakeleto --features parquet-out`), which the release binaries and the \
+         image have. `-o arrow` writes a file pandas, Polars and pyarrow read as well"
+            .to_string(),
+    )
+}
+
+impl Output {
+    /// Bytes rather than text, so written to a file or a pipe and never to a terminal, and only
+    /// for rows: a schema or a profile is a description, which these formats have no shape for.
+    pub fn is_binary(self) -> bool {
+        matches!(self, Output::Parquet | Output::Arrow | Output::Arrows)
+    }
+
+    /// The format a file name asks for, by its extension, which is what `--out` falls back on when
+    /// no `-o` is given. `None` for an extension that names none of them.
+    ///
+    /// `.arrow`, `.feather` and `.ipc` are the IPC *file* format and `.arrows` the *stream* format:
+    /// the Arrow project's own convention, and the one a reader of those names expects.
+    pub fn for_path(path: &std::path::Path) -> Option<Output> {
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        Some(match ext.as_str() {
+            "parquet" => Output::Parquet,
+            "arrow" | "feather" | "ipc" => Output::Arrow,
+            "arrows" => Output::Arrows,
+            "csv" => Output::Csv,
+            "tsv" => Output::Tsv,
+            "json" => Output::Json,
+            "ndjson" | "jsonl" => Output::Ndjson,
+            _ => return None,
+        })
+    }
+
+    /// The name `-o` takes, for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Output::Table => "table",
+            Output::Json => "json",
+            Output::Ndjson => "ndjson",
+            Output::Csv => "csv",
+            Output::Tsv => "tsv",
+            Output::Parquet => "parquet",
+            Output::Arrow => "arrow",
+            Output::Arrows => "arrows",
+        }
+    }
 }
 
 // ---- row batches ----------------------------------------------------------------------
 
-/// Render a [`RowBatch`] in the requested output format.
+/// Render a [`RowBatch`] in the requested output format, as text. The binary formats are bytes,
+/// not a `String`: [`stream_rows`] writes them.
 pub fn rows(rb: &RowBatch, output: Output) -> Result<String> {
     match output {
-        Output::Table => Ok(rows_table(rb)),
+        Output::Table => rows_table(rb),
         Output::Json => rows_json(rb, false),
         Output::Ndjson => rows_json(rb, true),
         Output::Csv => rows_delimited(rb, b','),
         Output::Tsv => rows_delimited(rb, b'\t'),
+        Output::Parquet | Output::Arrow | Output::Arrows => Err(EngineError::Other(format!(
+            "`{}` output is binary and is written with `stream_rows`, not rendered as text",
+            output.name()
+        ))),
     }
 }
 
 /// Write a [`RowStream`] in `output`'s format, one batch at a time, without ever holding the whole
 /// result. Returns the number of rows written.
 ///
-/// **Three of the five formats stream; two cannot, and the reason is the format, not the plumbing.**
+/// **Every format but `Table` streams, and the exception is the format's, not the plumbing's.**
 /// CSV, TSV and NDJSON are line-oriented — a row's bytes depend on nothing after it — and a JSON
-/// array is `[`, comma-separated values, `]`, which an incremental writer handles. `Table` aligns
-/// columns, and a column's width is a property of every row in the result, so the last row can widen
-/// the first; rendering it means having them all. That is not a limitation worth hiding behind a
-/// streaming signature, so `Table` collects and says so here.
+/// array is `[`, comma-separated values, `]`, which an incremental writer handles. The Arrow IPC
+/// formats write each batch as a message. Parquet holds the row group in progress, which is the
+/// format's unit, and writes it out when it fills (the writer's default, 1 Mi rows). `Table`
+/// aligns columns, and a column's width is a property of every row in the result, so the last row
+/// can widen the first; rendering it means having them all. That is not a limitation worth hiding
+/// behind a streaming signature, so `Table` collects and says so here.
 ///
 /// Empty results match the buffered [`rows`] renderer byte for byte: a stream that yields no batches
-/// at all emits `[]` for JSON and nothing for the rest, rather than a bare `[` or a lone header.
-pub fn stream_rows<W: std::io::Write>(
+/// at all emits `[]` for JSON and nothing for the rest, rather than a bare `[` or a lone header. The
+/// binary formats have no buffered twin; an empty one is still a whole file, with the schema in it.
+///
+/// `Send` because the Parquet writer requires it of what it writes to.
+pub fn stream_rows<W: std::io::Write + Send>(
     stream: crate::engine::RowStream,
     output: Output,
     out: &mut W,
 ) -> Result<usize> {
+    match output {
+        #[cfg(feature = "parquet-out")]
+        Output::Parquet => return stream_parquet(stream, out),
+        #[cfg(not(feature = "parquet-out"))]
+        Output::Parquet => return Err(no_parquet_writer()),
+        Output::Arrow => return stream_ipc(stream, IpcFormat::File, out),
+        Output::Arrows => return stream_ipc(stream, IpcFormat::Stream, out),
+        _ => {}
+    }
     let delimiter = match output {
         Output::Csv => Some(b','),
         Output::Tsv => Some(b'\t'),
@@ -65,12 +146,13 @@ pub fn stream_rows<W: std::io::Write>(
     if matches!(output, Output::Table) {
         let rb = stream.collect_batch()?;
         let rows = rb.num_rows();
-        out.write_all(rows_table(&rb).as_bytes())
+        out.write_all(rows_table(&rb)?.as_bytes())
             .map_err(|e| EngineError::Other(e.to_string()))?;
         return Ok(rows);
     }
 
-    let mut iter = stream;
+    // Text from here on, so each batch is relabelled as it prints (see `crate::zone`).
+    let mut iter = stream.map(|b| b.and_then(|b| crate::zone::printable_batch(&b)));
     let Some(first) = iter.next() else {
         // No batches at all. The buffered renderer emits `[]` here and nothing for the others;
         // matching it exactly is what lets a caller switch paths without changing its output.
@@ -117,7 +199,7 @@ pub fn stream_rows<W: std::io::Write>(
     Ok(rows)
 }
 
-fn rows_table(rb: &RowBatch) -> String {
+fn rows_table(rb: &RowBatch) -> Result<String> {
     let opts = FormatOptions::default().with_null("·");
     let headers: Vec<String> = rb
         .schema
@@ -129,6 +211,7 @@ fn rows_table(rb: &RowBatch) -> String {
 
     let mut cells: Vec<Vec<String>> = Vec::new();
     for batch in &rb.batches {
+        let batch = crate::zone::printable_batch(batch)?;
         let fmts: Vec<Option<ArrayFormatter>> = (0..ncols)
             .map(|c| ArrayFormatter::try_new(batch.column(c).as_ref(), &opts).ok())
             .collect();
@@ -159,20 +242,23 @@ fn rows_table(rb: &RowBatch) -> String {
         render_row(&mut out, row, &widths);
     }
     out.push_str(&format!("\n{} row(s)\n", rb.num_rows()));
-    out
+    Ok(out)
+}
+
+/// The properties Lakeleto writes Parquet with: Snappy, which every Parquet reader decodes and is
+/// the one codec the default build links.
+fn parquet_props() -> parquet::file::properties::WriterProperties {
+    parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build()
 }
 
 /// Row batch → Parquet bytes (Snappy), for `export-current-view`.
 pub fn to_parquet(rb: &RowBatch) -> Result<Vec<u8>> {
     use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
-    use parquet::file::properties::WriterProperties;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
     let mut buf = Vec::new();
     {
-        let mut writer = ArrowWriter::try_new(&mut buf, rb.schema.clone(), Some(props))
+        let mut writer = ArrowWriter::try_new(&mut buf, rb.schema.clone(), Some(parquet_props()))
             .map_err(EngineError::parquet)?;
         for b in &rb.batches {
             writer.write(b).map_err(EngineError::parquet)?;
@@ -218,6 +304,143 @@ pub fn to_arrow_ipc(rb: &RowBatch) -> Result<Vec<u8>> {
         w.finish().map_err(EngineError::arrow)?;
     }
     Ok(buf)
+}
+
+/// Which of Arrow IPC's two framings [`stream_ipc`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpcFormat {
+    /// The file format: `ARROW1` magic and a footer indexing the batches, which is what `.arrow`
+    /// and Feather v2 name. Written front to back, so it goes to a pipe too, but its readers seek
+    /// to the footer.
+    File,
+    /// The stream format: messages one after another, which a reader takes from a pipe as they
+    /// arrive. The same bytes `/v1/rows` serves as `application/vnd.apache.arrow.stream`.
+    Stream,
+}
+
+/// Write a stream as Parquet. The writer holds the row group in progress and nothing else.
+#[cfg(feature = "parquet-out")]
+fn stream_parquet<W: std::io::Write + Send>(
+    stream: crate::engine::RowStream,
+    out: &mut W,
+) -> Result<usize> {
+    let schema = stream.schema().clone();
+    let mut w = parquet::arrow::ArrowWriter::try_new(out, schema, Some(parquet_props()))
+        .map_err(EngineError::parquet)?;
+    let rows = drain_checked(stream, "a Parquet file", |b| {
+        w.write(b).map_err(EngineError::parquet)
+    })?;
+    w.close().map_err(EngineError::parquet)?;
+    Ok(rows)
+}
+
+/// Write a stream in one of the Arrow IPC framings, uncompressed for the reason [`to_arrow_ipc`]
+/// gives: a codec in the bytes is one every reader then has to have compiled in.
+fn stream_ipc<W: std::io::Write>(
+    stream: crate::engine::RowStream,
+    format: IpcFormat,
+    out: &mut W,
+) -> Result<usize> {
+    let schema = stream.schema().clone();
+    match format {
+        IpcFormat::File => {
+            // The file format holds one dictionary per column for the whole file, and the writer
+            // refuses a second, while a result read from Parquet (a pandas or Polars categorical)
+            // can change its dictionary at every row group. So dictionary columns are written as
+            // their values here: a type every reader takes the same way, where keeping the
+            // dictionary would fail the write at the second row group. The stream format and
+            // Parquet both take a new dictionary, and keep theirs.
+            let plain = without_dictionaries(&schema);
+            let mut w = arrow_ipc::writer::FileWriter::try_new(out, plain.as_ref())
+                .map_err(EngineError::arrow)?;
+            let rows = drain_checked(stream, "an Arrow IPC file", |b| {
+                if plain == schema {
+                    w.write(b).map_err(EngineError::arrow)
+                } else {
+                    w.write(&cast_batch(b, &plain)?).map_err(EngineError::arrow)
+                }
+            })?;
+            w.finish().map_err(EngineError::arrow)?;
+            Ok(rows)
+        }
+        IpcFormat::Stream => {
+            let mut w = arrow_ipc::writer::StreamWriter::try_new(out, schema.as_ref())
+                .map_err(EngineError::arrow)?;
+            let rows = drain_checked(stream, "an Arrow IPC stream", |b| {
+                w.write(b).map_err(EngineError::arrow)
+            })?;
+            w.finish().map_err(EngineError::arrow)?;
+            Ok(rows)
+        }
+    }
+}
+
+/// `schema` with every dictionary type replaced by its value type, at any depth; the same schema
+/// when it has none.
+fn without_dictionaries(schema: &arrow_schema::SchemaRef) -> arrow_schema::SchemaRef {
+    use arrow_schema::{DataType, FieldRef};
+    fn plain_type(dt: &DataType) -> DataType {
+        match dt {
+            DataType::Dictionary(_, values) => plain_type(values),
+            DataType::List(f) => DataType::List(plain_field(f)),
+            DataType::LargeList(f) => DataType::LargeList(plain_field(f)),
+            DataType::FixedSizeList(f, n) => DataType::FixedSizeList(plain_field(f), *n),
+            DataType::Struct(fields) => DataType::Struct(fields.iter().map(plain_field).collect()),
+            DataType::Map(f, sorted) => DataType::Map(plain_field(f), *sorted),
+            other => other.clone(),
+        }
+    }
+    fn plain_field(f: &FieldRef) -> FieldRef {
+        std::sync::Arc::new(f.as_ref().clone().with_data_type(plain_type(f.data_type())))
+    }
+    let fields: Vec<FieldRef> = schema.fields().iter().map(plain_field).collect();
+    if fields.iter().zip(schema.fields()).all(|(a, b)| a == b) {
+        return schema.clone();
+    }
+    std::sync::Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
+}
+
+/// `batch` with each column cast to `schema`'s type for it.
+fn cast_batch(
+    batch: &arrow_array::RecordBatch,
+    schema: &arrow_schema::SchemaRef,
+) -> Result<arrow_array::RecordBatch> {
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(column.clone())
+            } else {
+                arrow_cast::cast(column, field.data_type()).map_err(EngineError::arrow)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    arrow_array::RecordBatch::try_new_with_options(schema.clone(), columns, &options)
+        .map_err(EngineError::arrow)
+}
+
+/// Hand each batch of `stream` to `write` once it has passed [`ensure_batch_matches`] against the
+/// stream's declared schema, and count the rows. `what` names the output for the refusal.
+fn drain_checked(
+    stream: crate::engine::RowStream,
+    what: &str,
+    mut write: impl FnMut(&arrow_array::RecordBatch) -> Result<()>,
+) -> Result<usize> {
+    let schema = stream.schema().clone();
+    let mut rows = 0;
+    for (i, batch) in stream.enumerate() {
+        let batch = batch?;
+        ensure_batch_matches(&schema, i, &batch, what)?;
+        rows += batch.num_rows();
+        write(&batch)?;
+    }
+    Ok(rows)
 }
 
 /// One field, rendered for an error message: `name: DataType (nullable|not null)`.
@@ -270,40 +493,55 @@ fn describe_field(f: &arrow_schema::Field) -> String {
 /// array actually contains nulls — is a property of the data, not of the schema, so this check
 /// could not see it without scanning every value on every response. It is deliberately out of
 /// scope.
+///
+/// The CLI's binary outputs ([`stream_rows`] with `-o parquet|arrow|arrows`) run the same check on
+/// every batch as it streams past. Parquet's writer would refuse most mismatches itself, but not
+/// in these words, and one rule for all four writers is easier to trust than four.
 fn ensure_batches_match_schema(rb: &RowBatch) -> Result<()> {
-    let want = rb.schema.fields();
     for (i, batch) in rb.batches.iter().enumerate() {
-        let got = batch.schema_ref().fields();
-        if want.len() != got.len() {
+        ensure_batch_matches(&rb.schema, i, batch, "an Arrow IPC stream")?;
+    }
+    Ok(())
+}
+
+/// [`ensure_batches_match_schema`]'s check for one batch, `i`, about to be written as `what`.
+fn ensure_batch_matches(
+    schema: &arrow_schema::Schema,
+    i: usize,
+    batch: &arrow_array::RecordBatch,
+    what: &str,
+) -> Result<()> {
+    let want = schema.fields();
+    let got = batch.schema_ref().fields();
+    if want.len() != got.len() {
+        return Err(EngineError::Arrow(format!(
+            "batch {i} has {} column(s) but the result declares {}: [{}] vs [{}] — \
+             refusing to write {what}, which would encode the batch positionally against \
+             the declared schema and hand the reader wrong data",
+            got.len(),
+            want.len(),
+            got.iter()
+                .map(|f| describe_field(f))
+                .collect::<Vec<_>>()
+                .join(", "),
+            want.iter()
+                .map(|f| describe_field(f))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )));
+    }
+    for (c, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+        // Name and type only — see the decision note above. Nullability and metadata are
+        // deliberately not compared: neither changes how a byte is interpreted, and both
+        // drift legitimately between a declared schema and the plan that produced it.
+        if w.name() != g.name() || w.data_type() != g.data_type() {
             return Err(EngineError::Arrow(format!(
-                "batch {i} has {} column(s) but the row batch declares {}: [{}] vs [{}] — \
-                 refusing to write an Arrow IPC stream, which would encode the batch \
-                 positionally against the declared schema and hand the reader wrong data",
-                got.len(),
-                want.len(),
-                got.iter()
-                    .map(|f| describe_field(f))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                want.iter()
-                    .map(|f| describe_field(f))
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                "batch {i}, column {c}: the batch has `{}` but the result declares `{}` — \
+                 refusing to write {what}, which would encode the batch positionally against \
+                 the declared schema and hand the reader wrong data",
+                describe_field(g),
+                describe_field(w),
             )));
-        }
-        for (c, (w, g)) in want.iter().zip(got.iter()).enumerate() {
-            // Name and type only — see the decision note above. Nullability and metadata are
-            // deliberately not compared: neither changes how a byte is interpreted, and both
-            // drift legitimately between a declared schema and the plan that produced it.
-            if w.name() != g.name() || w.data_type() != g.data_type() {
-                return Err(EngineError::Arrow(format!(
-                    "batch {i}, column {c}: the batch has `{}` but the row batch declares `{}` — \
-                     refusing to write an Arrow IPC stream, which would encode the batch \
-                     positionally against the declared schema and hand the reader wrong data",
-                    describe_field(g),
-                    describe_field(w),
-                )));
-            }
         }
     }
     Ok(())
@@ -475,7 +713,8 @@ pub fn row_values(rb: &RowBatch) -> Result<Vec<serde_json::Value>> {
     {
         let mut w = arrow_json::ArrayWriter::new(&mut buf);
         for b in &rb.batches {
-            w.write(b).map_err(EngineError::arrow)?;
+            w.write(&crate::zone::printable_batch(b)?)
+                .map_err(EngineError::arrow)?;
         }
         w.finish().map_err(EngineError::arrow)?;
     }
@@ -490,13 +729,15 @@ fn rows_json(rb: &RowBatch, line_delimited: bool) -> Result<String> {
     if line_delimited {
         let mut w = arrow_json::LineDelimitedWriter::new(&mut buf);
         for b in &rb.batches {
-            w.write(b).map_err(EngineError::arrow)?;
+            w.write(&crate::zone::printable_batch(b)?)
+                .map_err(EngineError::arrow)?;
         }
         w.finish().map_err(EngineError::arrow)?;
     } else {
         let mut w = arrow_json::ArrayWriter::new(&mut buf);
         for b in &rb.batches {
-            w.write(b).map_err(EngineError::arrow)?;
+            w.write(&crate::zone::printable_batch(b)?)
+                .map_err(EngineError::arrow)?;
         }
         w.finish().map_err(EngineError::arrow)?;
     }
@@ -518,7 +759,8 @@ fn rows_delimited(rb: &RowBatch, delimiter: u8) -> Result<String> {
             .with_delimiter(delimiter)
             .build(&mut buf);
         for b in &rb.batches {
-            w.write(&nested_as_json(b)?).map_err(EngineError::arrow)?;
+            w.write(&nested_as_json(&crate::zone::printable_batch(b)?)?)
+                .map_err(EngineError::arrow)?;
         }
     }
     String::from_utf8(buf).map_err(|e| EngineError::Other(e.to_string()))
@@ -678,6 +920,275 @@ pub fn profile(p: &TableProfile, output: Output) -> Result<String> {
     Ok(out)
 }
 
+// ---- info -----------------------------------------------------------------------------
+
+/// What `lakeleto info` and `GET /v1/info` say about a source. One type for both, so the CLI's
+/// `-o json` and the API answer in the same shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceInfo {
+    /// The source as it was named.
+    pub path: String,
+    /// The detected format. `None` when the source is resolved elsewhere: with `--remote-url`,
+    /// the server detects the format and reads the bytes.
+    pub format: Option<String>,
+    /// The engine that read the schema.
+    pub engine: String,
+    /// The file's size, from the filesystem; `GET /v1/info` also asks an object store for an
+    /// object's. `None` when neither knows it, as for a catalog table.
+    pub size_bytes: Option<u64>,
+    /// The row count, where the format records one, as a Parquet footer or an Iceberg snapshot
+    /// does.
+    pub row_count: Option<u64>,
+    /// The number of columns.
+    pub columns: usize,
+    /// Whose credentials read a catalog table's files: `vended`, `catalog` or `ambient`. Omitted
+    /// for every other source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<String>,
+}
+
+/// Render a [`SourceInfo`] as `output` asks:
+/// - **`table`** (the default): the `name : value` lines `lakeleto info` has always printed;
+/// - **`json`**: the object `GET /v1/info` returns, and **`ndjson`** the same on one line;
+/// - **`csv`** and **`tsv`**: a header and one row, with the same columns whatever the source,
+///   so the rows for many files line up under one header.
+///
+/// The binary formats are rows, and a description has no shape in them; the CLI refuses them
+/// before it reads anything.
+pub fn info(i: &SourceInfo, output: Output) -> Result<String> {
+    let json = |text: serde_json::Result<String>| {
+        text.map(|t| t + "\n")
+            .map_err(|e| EngineError::Other(e.to_string()))
+    };
+    match output {
+        Output::Table => Ok(info_lines(i)),
+        Output::Json => json(serde_json::to_string_pretty(i)),
+        Output::Ndjson => json(serde_json::to_string(i)),
+        Output::Csv | Output::Tsv => rows(&info_row(i)?, output),
+        Output::Parquet | Output::Arrow | Output::Arrows => Err(EngineError::Other(format!(
+            "`-o {}` writes rows, and `info` prints a description: use `-o json`",
+            output.name()
+        ))),
+    }
+}
+
+/// The `name : value` lines.
+fn info_lines(i: &SourceInfo) -> String {
+    let mut out = format!("path   : {}\n", i.path);
+    // An unresolved source has no format *here*: the server resolved the reference and read the
+    // bytes. Printing the placeholder's name ("unknown") would read like a failed detection
+    // rather than a deliberate absence.
+    let format = i.format.as_deref().unwrap_or("(resolved by the server)");
+    out.push_str(&format!("format : {format}\n"));
+    out.push_str(&format!("engine : {}\n", i.engine));
+    let size = i.size_bytes.map(human_bytes);
+    out.push_str(&format!("size   : {}\n", size.as_deref().unwrap_or("?")));
+    let rows = i.row_count.map(|n| n.to_string());
+    out.push_str(&format!(
+        "rows   : {}\n",
+        rows.as_deref().unwrap_or("unknown")
+    ));
+    out.push_str(&format!("columns: {}\n", i.columns));
+    if let Some(credentials) = &i.credentials {
+        out.push_str(&format!("creds  : {}\n", describe_credentials(credentials)));
+    }
+    out
+}
+
+/// What the `creds` line says for the credentials a catalog table was read with.
+fn describe_credentials(source: &str) -> &'static str {
+    match source {
+        "vended" => "vended by the catalog for this table",
+        "catalog" => "the storage keys configured for the catalog",
+        _ => "this machine's own (the catalog vended none)",
+    }
+}
+
+/// A size in bytes, in the largest power-of-1024 unit it reaches.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// A [`SourceInfo`] as one row, for the CSV and TSV writers.
+fn info_row(i: &SourceInfo) -> Result<RowBatch> {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let text = |v: Option<&str>| Arc::new(StringArray::from(vec![v])) as ArrayRef;
+    let count = |v: Option<u64>| Arc::new(UInt64Array::from(vec![v])) as ArrayRef;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("path", DataType::Utf8, false),
+        Field::new("format", DataType::Utf8, true),
+        Field::new("engine", DataType::Utf8, false),
+        Field::new("size_bytes", DataType::UInt64, true),
+        Field::new("row_count", DataType::UInt64, true),
+        Field::new("columns", DataType::UInt64, false),
+        Field::new("credentials", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            text(Some(&i.path)),
+            text(i.format.as_deref()),
+            text(Some(&i.engine)),
+            count(i.size_bytes),
+            count(i.row_count),
+            count(Some(i.columns as u64)),
+            text(i.credentials.as_deref()),
+        ],
+    )
+    .map_err(EngineError::arrow)?;
+    Ok(RowBatch {
+        schema,
+        batches: vec![batch],
+    })
+}
+
+#[cfg(test)]
+mod info_tests {
+    use super::*;
+
+    /// A local Parquet file, with a comma in its name for the CSV writer to quote.
+    fn parquet() -> SourceInfo {
+        SourceInfo {
+            path: "data/events, 2026.parquet".to_string(),
+            format: Some("parquet".to_string()),
+            engine: "local".to_string(),
+            size_bytes: Some(1024 * 1024 * 3 / 2),
+            row_count: Some(1000),
+            columns: 4,
+            credentials: None,
+        }
+    }
+
+    /// A catalog table read through a server: no format here, no size and no row count.
+    fn served() -> SourceInfo {
+        SourceInfo {
+            path: "catalog://prod/sales/orders".to_string(),
+            format: None,
+            engine: "remote".to_string(),
+            size_bytes: None,
+            row_count: None,
+            columns: 2,
+            credentials: Some("catalog".to_string()),
+        }
+    }
+
+    /// The default output is the lines `lakeleto info` has always printed.
+    #[test]
+    fn the_default_is_the_lines_info_always_printed() {
+        assert_eq!(
+            info(&parquet(), Output::Table).unwrap(),
+            "path   : data/events, 2026.parquet\nformat : parquet\nengine : local\n\
+             size   : 1.5 MiB\nrows   : 1000\ncolumns: 4\n"
+        );
+        assert_eq!(
+            info(&served(), Output::Table).unwrap(),
+            "path   : catalog://prod/sales/orders\nformat : (resolved by the server)\n\
+             engine : remote\nsize   : ?\nrows   : unknown\ncolumns: 2\n\
+             creds  : the storage keys configured for the catalog\n"
+        );
+    }
+
+    /// `info` tells the three sources of a catalog table's credentials apart, so keys configured
+    /// for the catalog are never reported as this machine's own.
+    #[test]
+    fn info_says_whose_credentials_read_a_catalog_table() {
+        let creds = |source: &str| {
+            let mut i = served();
+            i.credentials = Some(source.to_string());
+            info(&i, Output::Table).unwrap()
+        };
+        let line = |text: &str| format!("\ncreds  : {text}\n");
+        assert!(creds("vended").ends_with(&line("vended by the catalog for this table")));
+        assert!(creds("catalog").ends_with(&line("the storage keys configured for the catalog")));
+        assert!(creds("ambient").ends_with(&line("this machine's own (the catalog vended none)")));
+    }
+
+    /// `-o json` is the object `GET /v1/info` returns and `-o ndjson` the same on one line. A
+    /// source that is not a catalog table has no `credentials` key, and what is not known is null.
+    #[test]
+    fn json_is_the_object_v1_info_returns() {
+        let pretty = info(&parquet(), Output::Json).unwrap();
+        assert!(pretty.ends_with("}\n"), "{pretty}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&pretty).unwrap(),
+            serde_json::json!({
+                "path": "data/events, 2026.parquet",
+                "format": "parquet",
+                "engine": "local",
+                "size_bytes": 1_572_864,
+                "row_count": 1000,
+                "columns": 4,
+            })
+        );
+        let line = info(&served(), Output::Ndjson).unwrap();
+        assert_eq!(line.matches('\n').count(), 1, "{line}");
+        assert!(line.ends_with('\n'), "{line}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap(),
+            serde_json::json!({
+                "path": "catalog://prod/sales/orders",
+                "format": null,
+                "engine": "remote",
+                "size_bytes": null,
+                "row_count": null,
+                "columns": 2,
+                "credentials": "catalog",
+            })
+        );
+    }
+
+    /// `-o csv` and `-o tsv` are a header and one row, with the same columns for every source:
+    /// what is not known is an empty cell.
+    #[test]
+    fn csv_and_tsv_are_a_header_and_one_row() {
+        assert_eq!(
+            info(&parquet(), Output::Csv).unwrap(),
+            "path,format,engine,size_bytes,row_count,columns,credentials\n\
+             \"data/events, 2026.parquet\",parquet,local,1572864,1000,4,\n"
+        );
+        assert_eq!(
+            info(&served(), Output::Tsv).unwrap(),
+            "path\tformat\tengine\tsize_bytes\trow_count\tcolumns\tcredentials\n\
+             catalog://prod/sales/orders\t\tremote\t\t\t2\tcatalog\n"
+        );
+    }
+
+    /// A size is in the largest power-of-1024 unit it reaches, up to TiB.
+    #[test]
+    fn a_size_is_in_the_largest_unit_it_reaches() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024 * 3 / 2), "1.5 MiB");
+        assert_eq!(human_bytes(1 << 40), "1.0 TiB");
+        assert_eq!(human_bytes(u64::MAX), "16777216.0 TiB");
+    }
+
+    /// The binary formats are rows, and a description has no shape in them.
+    #[test]
+    fn the_binary_formats_are_refused() {
+        for output in [Output::Parquet, Output::Arrow, Output::Arrows] {
+            let err = info(&parquet(), output).unwrap_err().to_string();
+            assert!(err.contains("use `-o json`"), "{output:?}: {err}");
+        }
+    }
+}
+
 // ---- small table primitives -----------------------------------------------------------
 
 fn render_row(out: &mut String, cells: &[String], widths: &[usize]) {
@@ -757,6 +1268,29 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// Lakeleto's Parquet is Snappy-compressed, as its docs say: the codec every reader decodes,
+    /// and the one the default build links. The writer's own default is no compression.
+    #[test]
+    fn parquet_is_written_with_snappy() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let rb = RowBatch {
+            schema: schema(),
+            batches: vec![batch(vec![1, 2, 3])],
+        };
+        let bytes = bytes::Bytes::from(to_parquet(&rb).unwrap());
+        let reader = SerializedFileReader::new(bytes).unwrap();
+        let columns = reader.metadata().row_group(0).columns();
+        assert_eq!(columns.len(), 3);
+        for column in columns {
+            assert_eq!(
+                column.compression(),
+                parquet::basic::Compression::SNAPPY,
+                "{}",
+                column.column_path()
+            );
+        }
     }
 
     #[test]
@@ -1483,6 +2017,287 @@ mod stream_tests {
         }
     }
 
+    // ---- the binary formats -----------------------------------------------------------------
+
+    /// The binary formats this build writes: Parquet only with `parquet-out`.
+    fn binary() -> Vec<Output> {
+        let mut formats = vec![Output::Arrow, Output::Arrows];
+        if super::WRITES_PARQUET {
+            formats.push(Output::Parquet);
+        }
+        formats
+    }
+
+    /// `rb` written in `output` by [`stream_rows`], and the rows it counted.
+    fn written(rb: &RowBatch, output: Output) -> (Vec<u8>, usize) {
+        let stream = RowStream::from_batch(RowBatch {
+            schema: rb.schema.clone(),
+            batches: rb.batches.clone(),
+        });
+        let mut out = Vec::new();
+        let rows_written = stream_rows(stream, output, &mut out).unwrap();
+        (out, rows_written)
+    }
+
+    /// What a reader of the format gets back from its bytes, using each format's own reader.
+    fn read_back(bytes: Vec<u8>, output: Output) -> RowBatch {
+        use arrow_array::RecordBatchReader;
+        match output {
+            Output::Parquet => {
+                let reader =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                        bytes::Bytes::from(bytes),
+                    )
+                    .unwrap()
+                    .build()
+                    .unwrap();
+                RowBatch {
+                    schema: reader.schema(),
+                    batches: reader.collect::<Result<Vec<_>, _>>().unwrap(),
+                }
+            }
+            Output::Arrow => {
+                let reader =
+                    arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(bytes), None)
+                        .unwrap();
+                RowBatch {
+                    schema: reader.schema(),
+                    batches: reader.collect::<Result<Vec<_>, _>>().unwrap(),
+                }
+            }
+            Output::Arrows => super::from_arrow_ipc(&bytes).unwrap(),
+            other => unreachable!("{other:?} is text"),
+        }
+    }
+
+    /// Every row in one batch, so a comparison does not depend on where a writer cut them.
+    fn concat(rb: &RowBatch) -> RecordBatch {
+        arrow_select::concat::concat_batches(&rb.schema, &rb.batches).unwrap()
+    }
+
+    /// Several batches, in each binary format, read back as the rows and types written.
+    #[test]
+    fn binary_outputs_read_back_as_the_rows_and_types_written() {
+        let rb = batches(4, 3);
+        for output in binary() {
+            let (bytes, rows_written) = written(&rb, output);
+            assert_eq!(rows_written, 12, "{output:?} miscounted rows");
+            let back = read_back(bytes, output);
+            assert_eq!(
+                back.schema.fields(),
+                rb.schema.fields(),
+                "{output:?} schema"
+            );
+            assert_eq!(
+                concat(&back).columns(),
+                concat(&rb).columns(),
+                "{output:?} rows"
+            );
+        }
+    }
+
+    /// An empty result is still a whole file with the schema in it, not zero bytes a reader
+    /// rejects.
+    #[test]
+    fn an_empty_binary_output_is_a_whole_file_with_the_schema() {
+        let empty = RowBatch {
+            schema: schema(),
+            batches: Vec::new(),
+        };
+        for output in binary() {
+            let (bytes, rows_written) = written(&empty, output);
+            assert_eq!(rows_written, 0);
+            let back = read_back(bytes, output);
+            assert_eq!(back.schema.fields(), empty.schema.fields(), "{output:?}");
+            assert_eq!(back.num_rows(), 0, "{output:?}");
+        }
+    }
+
+    /// Lists, structs and maps are the binary formats' own, so they come back as they went in,
+    /// where CSV has to write them as JSON text.
+    #[test]
+    fn nested_columns_survive_the_binary_formats_whole() {
+        let one = super::tests::nested_rows();
+        let rb = RowBatch {
+            schema: one.schema.clone(),
+            batches: vec![one.batches[0].slice(0, 2), one.batches[0].slice(2, 1)],
+        };
+        for output in binary() {
+            let (bytes, rows_written) = written(&rb, output);
+            assert_eq!(rows_written, 3, "{output:?} miscounted rows");
+            let back = read_back(bytes, output);
+            assert_eq!(
+                back.schema.fields(),
+                one.schema.fields(),
+                "{output:?} schema"
+            );
+            assert_eq!(
+                concat(&back).columns(),
+                one.batches[0].columns(),
+                "{output:?} rows"
+            );
+        }
+    }
+
+    /// Each `-o` value is pinned to the framing it names: `arrow` is the IPC file format a
+    /// `.arrow` reader seeks a footer in, `arrows` the stream a pipe reader takes as it comes.
+    #[test]
+    fn each_binary_format_has_its_own_framing() {
+        let rb = batches(1, 2);
+        if super::WRITES_PARQUET {
+            let (parquet, _) = written(&rb, Output::Parquet);
+            assert!(parquet.starts_with(b"PAR1") && parquet.ends_with(b"PAR1"));
+        }
+        let (file, _) = written(&rb, Output::Arrow);
+        assert!(file.starts_with(b"ARROW1") && file.ends_with(b"ARROW1"));
+        let (stream, _) = written(&rb, Output::Arrows);
+        assert_eq!(
+            &stream[..4],
+            &[0xff; 4],
+            "a stream opens with a continuation marker"
+        );
+        assert!(
+            stream.windows(6).all(|w| w != b"ARROW1"),
+            "no file magic in a stream"
+        );
+    }
+
+    /// A dictionary that changes between batches, as one read from a Parquet file's row groups
+    /// can, is written by every binary format. The IPC file format allows one dictionary per
+    /// column, so it writes the values instead, at any depth; the others keep the dictionary.
+    #[test]
+    fn a_dictionary_that_changes_between_batches_still_writes() {
+        use arrow_array::types::Int32Type;
+        use arrow_array::{DictionaryArray, StructArray};
+
+        let dict = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let inner = Field::new("city", dict.clone(), true);
+        let sch: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("city", dict.clone(), true),
+            Field::new("addr", DataType::Struct(vec![inner.clone()].into()), true),
+        ]));
+        let batch = |cities: Vec<&str>| {
+            let top: DictionaryArray<Int32Type> = cities.clone().into_iter().collect();
+            let nested: DictionaryArray<Int32Type> = cities.into_iter().collect();
+            let addr = StructArray::try_new(
+                vec![inner.clone()].into(),
+                vec![Arc::new(nested) as ArrayRef],
+                None,
+            )
+            .unwrap();
+            RecordBatch::try_new(sch.clone(), vec![Arc::new(top) as ArrayRef, Arc::new(addr)])
+                .unwrap()
+        };
+        let rb = RowBatch {
+            schema: sch.clone(),
+            batches: vec![batch(vec!["KL", "SG", "KL"]), batch(vec!["Tokyo", "Seoul"])],
+        };
+        // Each column's values as text, whatever its encoding.
+        let values = |rb: &RowBatch| -> Vec<Vec<Option<String>>> {
+            let all = concat(rb);
+            let addr = all
+                .column(1)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            [all.column(0), addr.column(0)]
+                .into_iter()
+                .map(|c| {
+                    let s = arrow_cast::cast(c.as_ref(), &DataType::Utf8).unwrap();
+                    let s = s.as_any().downcast_ref::<StringArray>().unwrap();
+                    s.iter().map(|v| v.map(str::to_string)).collect()
+                })
+                .collect()
+        };
+        for output in binary() {
+            let (bytes, rows_written) = written(&rb, output);
+            assert_eq!(rows_written, 5, "{output:?}");
+            let back = read_back(bytes, output);
+            assert_eq!(values(&back), values(&rb), "{output:?}");
+            let top = back.schema.field(0).data_type().clone();
+            if output == Output::Arrow {
+                assert_eq!(top, DataType::Utf8, "the file format writes the values");
+                assert_eq!(
+                    back.schema.field(1).data_type(),
+                    &DataType::Struct(vec![Field::new("city", DataType::Utf8, true)].into()),
+                    "and does so inside a struct too"
+                );
+            } else {
+                assert_eq!(top, dict, "{output:?} keeps the dictionary");
+            }
+        }
+    }
+
+    /// A batch wider than the declared schema is refused by every binary writer, named.
+    #[test]
+    fn binary_outputs_refuse_a_batch_that_does_not_match_the_schema() {
+        let declared = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        for (output, what) in [
+            (Output::Parquet, "a Parquet file"),
+            (Output::Arrow, "an Arrow IPC file"),
+            (Output::Arrows, "an Arrow IPC stream"),
+        ] {
+            if !binary().contains(&output) {
+                continue;
+            }
+            let stream =
+                RowStream::new(declared.clone(), batches(1, 2).batches.into_iter().map(Ok));
+            let mut out = Vec::new();
+            let err = stream_rows(stream, output, &mut out)
+                .expect_err("a batch wider than the schema must be refused")
+                .to_string();
+            assert!(
+                err.contains("batch 0") && err.contains(what),
+                "{output:?}: {err}"
+            );
+        }
+    }
+
+    /// Without `parquet-out` there is no writer to reach: the refusal names the feature instead.
+    #[cfg(not(feature = "parquet-out"))]
+    #[test]
+    fn a_build_without_parquet_out_refuses_parquet_and_says_how() {
+        let stream = RowStream::from_batch(batches(1, 2));
+        let mut out = Vec::new();
+        let err = stream_rows(stream, Output::Parquet, &mut out)
+            .expect_err("no Parquet writer in this build")
+            .to_string();
+        assert!(err.contains("--features parquet-out"), "{err}");
+        assert!(out.is_empty(), "nothing is written before the refusal");
+    }
+
+    /// [`rows`] renders text, and says so for the binary formats.
+    #[test]
+    fn the_text_renderer_refuses_the_binary_formats() {
+        for output in [Output::Parquet, Output::Arrow, Output::Arrows] {
+            assert!(rows(&batches(1, 1), output).is_err(), "{output:?}");
+        }
+    }
+
+    /// [`Output::for_path`]: case-insensitive, and `None` for what names no format.
+    #[test]
+    fn a_file_name_picks_the_format_by_its_extension() {
+        use std::path::Path;
+        for (name, want) in [
+            ("out.parquet", Some(Output::Parquet)),
+            ("OUT.PARQUET", Some(Output::Parquet)),
+            ("out.arrow", Some(Output::Arrow)),
+            ("out.feather", Some(Output::Arrow)),
+            ("out.ipc", Some(Output::Arrow)),
+            ("out.arrows", Some(Output::Arrows)),
+            ("out.csv", Some(Output::Csv)),
+            ("out.tsv", Some(Output::Tsv)),
+            ("out.json", Some(Output::Json)),
+            ("out.ndjson", Some(Output::Ndjson)),
+            ("out.jsonl", Some(Output::Ndjson)),
+            ("out.txt", None),
+            ("out", None),
+            ("tables.parquet/out", None),
+        ] {
+            assert_eq!(Output::for_path(Path::new(name)), want, "{name}");
+        }
+    }
+
     /// An error partway through a stream reaches the caller instead of being written as rows.
     #[test]
     fn an_error_mid_stream_propagates_rather_than_truncating_silently() {
@@ -1500,5 +2315,148 @@ mod stream_tests {
         let err = stream_rows(stream, Output::Csv, &mut out)
             .expect_err("the error must surface, not be swallowed");
         assert!(err.to_string().contains("boom"), "{err}");
+    }
+}
+
+/// Zoned timestamps in text: a column labelled `UTC`, as pandas, pyarrow and Polars label tz-aware
+/// UTC data, prints in every build exactly as the release binaries print it, and a zone the build
+/// cannot print is refused rather than left blank. See `crate::zone`.
+#[cfg(test)]
+mod time_zone_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    use super::{from_arrow_ipc, row_values, rows, stream_rows, Output};
+    use crate::engine::{RowBatch, RowStream};
+    use crate::zone::has_tz_database;
+
+    const TEXT: [Output; 5] = [
+        Output::Table,
+        Output::Csv,
+        Output::Tsv,
+        Output::Json,
+        Output::Ndjson,
+    ];
+
+    fn ts_type(zone: &str) -> DataType {
+        DataType::Timestamp(TimeUnit::Microsecond, Some(zone.into()))
+    }
+
+    /// Three rows: 2024-01-02T03:04:05.123456Z, 2024-06-30T23:59:59Z and a null, in `zone`.
+    fn zoned(zone: &str) -> RowBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", ts_type(zone), true),
+        ]));
+        let ts = TimestampMicrosecondArray::from(vec![
+            Some(1_704_164_645_123_456),
+            Some(1_719_791_999_000_000),
+            None,
+        ])
+        .with_timezone(zone);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(ts),
+            ],
+        )
+        .unwrap();
+        RowBatch {
+            schema,
+            batches: vec![batch],
+        }
+    }
+
+    fn streamed(rb: &RowBatch, output: Output) -> crate::error::Result<String> {
+        let mut out = Vec::new();
+        let rb = RowBatch {
+            schema: rb.schema.clone(),
+            batches: rb.batches.clone(),
+        };
+        stream_rows(RowStream::from_batch(rb), output, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// `head`'s table and CSV, as the release binaries print a `UTC` column.
+    #[test]
+    fn utc_prints_as_the_release_binaries_print_it() {
+        let rb = zoned("UTC");
+        assert_eq!(
+            rows(&rb, Output::Table).unwrap(),
+            "| id | ts                          | \n\
+             |----|-----------------------------|\n\
+             | 1  | 2024-01-02T03:04:05.123456Z | \n\
+             | 2  | 2024-06-30T23:59:59Z        | \n\
+             | 3  | ·                           | \n\
+             \n3 row(s)\n"
+        );
+        assert_eq!(
+            rows(&rb, Output::Csv).unwrap(),
+            "id,ts\n1,2024-01-02T03:04:05.123456Z\n2,2024-06-30T23:59:59Z\n3,\n"
+        );
+    }
+
+    /// Every text format, buffered and streamed, and the JSON values `/v1/rows` answers with,
+    /// print `UTC` as they print `+00:00`, which arrow-cast resolves in every build.
+    #[test]
+    fn utc_prints_as_the_zero_offset_in_every_text_format() {
+        let (utc, offset) = (zoned("UTC"), zoned("+00:00"));
+        for output in TEXT {
+            let want = rows(&offset, output).unwrap();
+            assert!(want.contains("2024-06-30T23:59:59Z"), "{want}");
+            assert_eq!(rows(&utc, output).unwrap(), want, "{}", output.name());
+            assert_eq!(streamed(&utc, output).unwrap(), want, "{}", output.name());
+        }
+        let values = row_values(&utc).unwrap();
+        assert_eq!(values, row_values(&offset).unwrap());
+        assert_eq!(values[0]["ts"], "2024-01-02T03:04:05.123456Z");
+    }
+
+    /// A zone this build cannot print fails every text format, naming it, where the table used to
+    /// print the column blank; a build that can prints the zone's own time.
+    #[test]
+    fn a_zone_this_build_cannot_print_is_refused_not_left_blank() {
+        let rb = zoned("Europe/Paris");
+        let mut printed = TEXT
+            .iter()
+            .map(|&output| rows(&rb, output))
+            .chain(TEXT.iter().map(|&output| streamed(&rb, output)))
+            .collect::<Vec<_>>();
+        printed.push(row_values(&rb).map(|v| serde_json::Value::Array(v).to_string()));
+        for text in printed {
+            match text {
+                Ok(text) => {
+                    assert!(has_tz_database(), "{text}");
+                    assert!(text.contains("2024-01-02T04:04:05.123456+01:00"), "{text}");
+                }
+                Err(e) => {
+                    assert!(!has_tz_database(), "{e}");
+                    assert!(e.to_string().contains("`Europe/Paris`"), "{e}");
+                }
+            }
+        }
+    }
+
+    /// Only text is relabelled: Arrow output keeps the zone the rows came with, and needs no
+    /// database to, so it is also how a build without one writes a column it cannot print.
+    #[test]
+    fn arrow_output_keeps_the_zone() {
+        for zone in ["UTC", "Europe/Paris"] {
+            for output in [Output::Arrow, Output::Arrows] {
+                let mut out = Vec::new();
+                stream_rows(RowStream::from_batch(zoned(zone)), output, &mut out).unwrap();
+                let back = if output == Output::Arrows {
+                    from_arrow_ipc(&out).unwrap().schema
+                } else {
+                    arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(out), None)
+                        .unwrap()
+                        .schema()
+                };
+                assert_eq!(back.field(1).data_type(), &ts_type(zone), "{zone}");
+            }
+        }
     }
 }

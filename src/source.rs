@@ -8,6 +8,11 @@
 //!
 //! [`list_dir`] labels directories in the same order, so the file browser and the reader never
 //! disagree about what a directory is.
+//!
+//! Both are [`PathCatalog`]'s, behind the [`Catalog`] trait: [`Source::detect_in`] and
+//! [`list_dir`] hand their work to it, so a reference that is not a location can be resolved
+//! through the same seam.
+//!
 //! Format is decoupled from Engine on purpose: the same `Source` is handed to whichever
 //! engine the user picked (`local`, `sql`, `remote`), so format sniffing lives in one place.
 
@@ -16,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use crate::catalog::{Catalog, PathCatalog, TableHandle};
 use crate::context::RequestContext;
 use crate::error::{EngineError, Result};
 
@@ -31,6 +37,9 @@ pub enum Format {
     /// `--format tsv` / `?format=tsv` override selects tab even for a differently-named file.
     Tsv,
     Json,
+    /// Arrow IPC: the file format (`.arrow`, `.feather`, `.ipc`) and the stream format (`.arrows`),
+    /// told apart by their first bytes.
+    Arrow,
     Iceberg,
     /// A Delta Lake table — a directory with a `_delta_log/` transaction log over Parquet data.
     Delta,
@@ -58,6 +67,7 @@ impl Format {
             Format::Csv => "csv",
             Format::Tsv => "tsv",
             Format::Json => "json",
+            Format::Arrow => "arrow",
             Format::Iceberg => "iceberg",
             Format::Delta => "delta",
             Format::Database => "database",
@@ -72,6 +82,7 @@ impl Format {
             "csv" => Some(Format::Csv),
             "tsv" => Some(Format::Tsv),
             "json" | "ndjson" | "jsonl" | "geojson" => Some(Format::Json),
+            "arrow" | "arrows" | "feather" | "ipc" => Some(Format::Arrow),
             "iceberg" => Some(Format::Iceberg),
             "delta" | "deltalake" => Some(Format::Delta),
             "database" | "db" | "sqlite" | "postgres" | "postgresql" | "mysql" => {
@@ -217,6 +228,10 @@ pub fn redact_uri_password(s: &str) -> std::borrow::Cow<'_, str> {
 /// Whether [`Source::detect`] may spend a network round-trip to classify a remote prefix, and
 /// whose credentials it may spend it as.
 ///
+/// A [`PathCatalog`] carries one, and asks it the same question when it lists an object-store
+/// prefix: the call's vended identity first, and under [`RemoteProbe::VendedOnly`] no listing as
+/// the process. A listing is what the caller asked for, so [`RemoteProbe::Never`] allows one.
+///
 /// `detect` is the one identity-bearing operation in the crate that sits **outside** the
 /// [`Engine`](crate::engine::Engine) seam. An extensionless `s3://…/table` gives its format away
 /// only by being probed — one `list` for a `metadata/` child — and a probe is a read, so it is
@@ -298,9 +313,9 @@ impl Flatten {
 }
 
 /// How a file's bytes are compressed on top of its format: `t.ndjson.zst` is JSON, compressed with
-/// zstd. Orthogonal to [`Format`], so every text format gains a codec at once when its decoder
-/// lands — and only a text format can have one: Parquet compresses inside its own container and
-/// is read by seeking, which a compressed stream cannot do.
+/// zstd. Orthogonal to [`Format`], so every text format reads with every codec — and only a text
+/// format can have one: Parquet and Arrow compress inside their own containers and are read by
+/// seeking, which a compressed stream cannot do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     Gzip,
@@ -309,7 +324,32 @@ pub enum Codec {
     Xz,
 }
 
+/// The most bytes one read decompresses a file to, unless [`set_max_decompressed`] says otherwise:
+/// 4 GiB. It stops a small file that inflates without end, not a big file: a read that needs
+/// fewer bytes, such as the grid's first window, stops long before it.
+pub const DEFAULT_MAX_DECOMPRESSED: u64 = 4 * 1024 * 1024 * 1024;
+
+static MAX_DECOMPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_MAX_DECOMPRESSED);
+
+/// Set the most bytes one read decompresses a file to, for this process: the CLI's
+/// `--max-decompressed`. A read past it fails with [`EngineError::TooLarge`].
+pub fn set_max_decompressed(bytes: u64) {
+    MAX_DECOMPRESSED.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The most bytes one read decompresses a file to — see [`set_max_decompressed`].
+pub fn max_decompressed() -> u64 {
+    MAX_DECOMPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Codec {
+    /// Whether this build decompresses it: gzip always, and zstd, bzip2 and xz with the
+    /// `compression` feature.
+    pub fn decodable(&self) -> bool {
+        matches!(self, Codec::Gzip) || cfg!(feature = "compression")
+    }
+
     /// The codec a file extension names (case-insensitive).
     pub fn from_extension(ext: &str) -> Option<Codec> {
         match ext.to_ascii_lowercase().as_str() {
@@ -342,9 +382,8 @@ pub struct Source {
     pub path: PathBuf,
     pub format: Format,
     /// How the file is compressed, from its name's last extension (`t.csv.gz`); `None` for a
-    /// file read as it is. Detected so that a compressed file is named for what it is — and refused
-    /// as such — rather than misread as its own bytes. Decoding it is Phase 2 of
-    /// `docs/FORMATS-PLAN.md`.
+    /// file read as it is. A text reader reads a compressed file's decompressed bytes, and a build
+    /// without a codec's decoder refuses the file rather than misread its compressed bytes.
     pub codec: Option<Codec>,
     /// Where inside a JSON document to read records from, as a JSON Pointer (`/data`,
     /// `/response/items`) — the caller's explicit choice, overriding the reader's own detection of
@@ -374,111 +413,19 @@ impl Source {
 
     /// [`detect`](Self::detect) with an explicit identity and probe posture.
     ///
-    /// Only the object-store branch consults either: a local path is classified by stat'ing it and
-    /// reading its first bytes, which needs no credentials and reaches nobody else's data.
-    #[cfg_attr(not(feature = "object-store"), allow(unused_variables))]
+    /// This is [`PathCatalog`]'s [`load_table`](Catalog::load_table), as a [`Source`]. The
+    /// classification lives on the catalog, so detection runs through the [`Catalog`] seam
+    /// whichever caller asks. Only the object-store branch consults the context or the posture: a
+    /// local path is classified by stat'ing it and reading its first bytes, which needs no
+    /// credentials and reaches nobody else's data.
     pub fn detect_in(
         path: impl AsRef<Path>,
         ctx: &RequestContext,
         probe: RemoteProbe,
     ) -> Result<Source> {
-        let path = path.as_ref().to_path_buf();
-
-        // Database connection URI (sqlite://… / postgres://… / mysql://…): a live DB, never a file.
-        // Classify without touching the filesystem — the `database` engine parses the URI.
-        if path.to_str().is_some_and(is_database_uri) {
-            return Ok(Source::with_format(path, Format::Database));
-        }
-
-        // Object-store URI (s3://…): classify by the key's extension without touching the
-        // filesystem. Magic-byte sniffing would require fetching, so an unknown extension
-        // needs an explicit `--format`.
-        if path.to_str().is_some_and(is_object_uri) {
-            if let Some((format, codec)) = format_from_name(&path) {
-                return Ok(Source::with_format(path, format).with_codec(codec));
-            }
-            // No data-file extension: a bare prefix is likely an Iceberg table — one cheap probe
-            // for a `metadata/` child. (Only object stores; a network round-trip, so gated behind
-            // the feature and reached only when the name gives nothing away.)
-            //
-            // Whose round-trip it is, is `probe`'s to decide — see [`RemoteProbe`]. The identity
-            // resolves the same way an engine's does: the call's, else this caller's fallback,
-            // else no probe.
-            #[cfg(feature = "object-store")]
-            {
-                let identity: Option<std::borrow::Cow<'_, crate::objstore::StoreOptions>> =
-                    match (probe, ctx.store_options()) {
-                        (RemoteProbe::Never, _) => None,
-                        (_, Some(vended)) => Some(std::borrow::Cow::Borrowed(vended)),
-                        (RemoteProbe::Ambient, None) => Some(std::borrow::Cow::Owned(
-                            crate::objstore::StoreOptions::from_env(),
-                        )),
-                        // Refused, and said so rather than falling through to the generic message
-                        // below. The two are a different problem with a different fix: that one
-                        // means the name gave nothing away, this one means nobody would tell us
-                        // whose credentials to find out with. Only one of them is the operator's.
-                        (RemoteProbe::VendedOnly, None) => {
-                            return Err(EngineError::UnsupportedFormat {
-                                detail: format!(
-                                    "cannot infer the format of {} from its name, and no \
-                                     credentials were vended for this call — probing it would \
-                                     read as the server rather than as you. Declare the format \
-                                     (`parquet`/`csv`/`json`/`iceberg`) on this location.",
-                                    path.display()
-                                ),
-                            });
-                        }
-                    };
-                if let (Some(opts), Some(uri)) = (identity, path.to_str()) {
-                    // `?`, not a swallowed `false`: an identity that cannot address this URI is a
-                    // fact about the caller, and reporting it as "not an Iceberg table" would send
-                    // them to fix their `--format` instead of their credentials.
-                    if crate::objstore::looks_like_iceberg_as(uri, &opts)? {
-                        return Ok(Source::with_format(path, Format::Iceberg));
-                    }
-                }
-            }
-            return Err(EngineError::UnsupportedFormat {
-                detail: format!(
-                    "cannot infer the format of {} from its name — pass \
-                     `--format parquet|csv|json|iceberg`",
-                    path.display()
-                ),
-            });
-        }
-
-        if path.is_dir() {
-            // A Delta Lake table has a `_delta_log/` transaction log. Check this BEFORE the plain
-            // parquet-dir fallback — a Delta table's data files are Parquet, so without this it
-            // would be misread as a raw parquet dataset (ignoring the log: stale/removed rows).
-            if path.join("_delta_log").is_dir() {
-                return Ok(Source::with_format(path, Format::Delta));
-            }
-            // An Iceberg table is a directory containing a `metadata/` catalog dir.
-            if path.join("metadata").is_dir() {
-                return Ok(Source::with_format(path, Format::Iceberg));
-            }
-            // Otherwise a directory of `.parquet` files (incl. Hive-partitioned subdirs, and the
-            // `foo.parquet/part-*.parquet` split-file shape) is read as one multi-file dataset.
-            if !list_parquet_files(&path).is_empty() {
-                return Ok(Source::with_format(path, Format::Parquet));
-            }
-            return Err(EngineError::UnsupportedFormat {
-                detail: format!(
-                    "{} is a directory but not an Iceberg table (no metadata/ subdir) and \
-                     contains no .parquet files",
-                    path.display()
-                ),
-            });
-        }
-
-        if let Some((format, codec)) = format_from_name(&path) {
-            return Ok(Source::with_format(path, format).with_codec(codec));
-        }
-
-        // No/unknown extension: sniff the magic bytes.
-        let format = sniff_magic(&path)?;
-        Ok(Source::with_format(path, format))
+        PathCatalog::new(probe)
+            .load_table(ctx, path.as_ref())
+            .map(TableHandle::into_source)
     }
 
     /// Build a source with an explicit format (used by `--format` overrides and tests).
@@ -492,18 +439,14 @@ impl Source {
         }
     }
 
-    /// Refuse a compressed source with an error that says so — until decoders exist, the one
-    /// honest answer. Without it, a `.csv.gz` read as CSV is a table of binary garbage.
-    pub fn require_uncompressed(&self) -> Result<()> {
+    /// Refuse a source compressed with a codec this build does not decompress, naming the feature
+    /// that does. Read anyway, a `.csv.zst` would be a table of binary garbage.
+    pub fn require_decodable(&self) -> Result<()> {
         match self.codec {
-            None => Ok(()),
-            Some(codec) => Err(EngineError::UnsupportedFormat {
-                detail: format!(
-                    "{} is {codec}-compressed, and Lakeleto does not decompress files yet — \
-                     decompress it first",
-                    self.display()
-                ),
-            }),
+            Some(codec) if !codec.decodable() => {
+                Err(crate::format::codec::undecodable(&self.display(), codec))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -584,27 +527,16 @@ impl Source {
 
     /// [`resolve`](Self::resolve) with an explicit identity and probe posture.
     ///
-    /// An explicit `format` short-circuits before any probe, which is what makes
-    /// [`RemoteProbe::VendedOnly`] a cost a caller can always avoid: naming the format is the
-    /// answer to being refused a probe.
+    /// This is [`PathCatalog::resolve`]. An explicit `format` short-circuits before any probe,
+    /// which is what makes [`RemoteProbe::VendedOnly`] a cost a caller can always avoid: naming the
+    /// format is the answer to being refused a probe.
     pub fn resolve_in(
         path: impl AsRef<Path>,
         format: Option<&str>,
         ctx: &RequestContext,
         probe: RemoteProbe,
     ) -> Result<Source> {
-        match format {
-            // The name still says how the bytes are compressed, whatever format they hold.
-            Some(f) => Format::parse(f)
-                .map(|fmt| {
-                    let codec = codec_of(path.as_ref());
-                    Source::with_format(path, fmt).with_codec(codec)
-                })
-                .ok_or_else(|| EngineError::UnsupportedFormat {
-                    detail: format!("unknown format `{f}` (expected parquet/csv/tsv/json/iceberg)"),
-                }),
-            None => Source::detect_in(path, ctx, probe),
-        }
+        PathCatalog::new(probe).resolve(ctx, path.as_ref(), format)
     }
 
     /// This source rendered for a **human**: an API response body, a run record, a log line, an
@@ -641,6 +573,13 @@ impl Source {
     /// than on the local filesystem. The reading itself needs `--features object-store`.
     pub fn is_remote(&self) -> bool {
         self.path.to_str().is_some_and(is_object_uri)
+    }
+
+    /// Is this a table a catalog serves, named by a `catalog://` reference?
+    pub fn is_catalog(&self) -> bool {
+        self.path
+            .to_str()
+            .is_some_and(crate::catalog::is_catalog_uri)
     }
 }
 
@@ -734,85 +673,29 @@ pub fn hive_partitions(file: &Path, root: &Path) -> Vec<(String, String)> {
 
 /// List a directory for the file browser: subdirectories and Parquet/CSV/JSON files (plus
 /// Iceberg-table dirs), dirs first, then files, each alphabetical. Non-data files are hidden.
+///
+/// This is [`PathCatalog`]'s [`list`](Catalog::list) under the offline binary's posture, as
+/// [`Source::detect`] is its `load_table`: an object-store prefix is listed as the process
+/// environment.
 pub fn list_dir(dir: &str) -> Result<DirListing> {
-    // Object-store prefixes are browsed through the object-store backend, not the filesystem.
-    if is_object_uri(dir) {
-        #[cfg(feature = "object-store")]
-        return crate::objstore::list_prefix(dir);
-        #[cfg(not(feature = "object-store"))]
-        return Err(EngineError::UnsupportedFormat {
-            detail: format!(
-                "{dir} is an object-store URI — rebuild with `--features object-store` to browse it"
-            ),
-        });
-    }
-    let base = Path::new(dir);
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(base)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') {
-            continue; // hide dotfiles/dirs
-        }
-        let meta = entry.metadata().ok();
-        if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
-            // Same order as `Source::detect`, and for the same reason: a Delta table's data files
-            // are Parquet and it may also carry a `metadata/` dir, so checking `_delta_log` second
-            // would label a table in the browser as something the reader then opens as Delta.
-            let format = if path.join("_delta_log").is_dir() {
-                Some(Format::Delta.as_str().to_string())
-            } else if path.join("metadata").is_dir() {
-                Some(Format::Iceberg.as_str().to_string())
-            } else {
-                None
-            };
-            entries.push(DirEntry {
-                name,
-                path: path.display().to_string(),
-                kind: "dir",
-                format,
-                size: None,
-            });
-        } else if let Some(fmt) = format_from_extension(&path) {
-            entries.push(DirEntry {
-                name,
-                path: path.display().to_string(),
-                kind: "file",
-                format: Some(fmt.as_str().to_string()),
-                size: meta.map(|m| m.len()),
-            });
-        }
-    }
-    // Dirs first, then files; alphabetical within each group.
-    entries.sort_by(|a, b| {
-        (a.kind == "file").cmp(&(b.kind == "file")).then_with(|| {
-            a.name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase())
-        })
-    });
-    Ok(DirListing {
-        dir: base.display().to_string(),
-        parent: base.parent().map(|p| p.display().to_string()),
-        entries,
-    })
+    PathCatalog::new(RemoteProbe::Ambient).list(&RequestContext::detached(), Path::new(dir))
 }
 
 /// The format and codec a file's name gives: `t.csv` is CSV, `t.csv.gz` gzip-compressed CSV. Only a
-/// registry format takes a codec (see [`Codec`]), so `t.parquet.gz` names nothing and is sniffed
-/// like any unknown name.
-fn format_from_name(path: &Path) -> Option<(Format, Option<Codec>)> {
+/// text format takes a codec (see [`Codec`]), so `t.parquet.gz` names nothing and is sniffed like
+/// any unknown name.
+pub(crate) fn format_from_name(path: &Path) -> Option<(Format, Option<Codec>)> {
     let Some(codec) = codec_of(path) else {
         return Some((format_from_extension(path)?, None));
     };
     let format = format_from_extension(Path::new(path.file_stem()?))?;
-    crate::format::reader(format)?;
-    Some((format, Some(codec)))
+    crate::format::reader(format)?
+        .compressible()
+        .then_some((format, Some(codec)))
 }
 
 /// The codec a name's last extension gives, if any.
-fn codec_of(path: &Path) -> Option<Codec> {
+pub(crate) fn codec_of(path: &Path) -> Option<Codec> {
     Codec::from_extension(path.extension()?.to_str()?)
 }
 
@@ -825,22 +708,23 @@ pub(crate) fn format_from_extension(path: &Path) -> Option<Format> {
     }
 }
 
-fn sniff_magic(path: &Path) -> Result<Format> {
+pub(crate) fn sniff_magic(path: &Path) -> Result<Format> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut head = [0u8; 4];
-    match file.read_exact(&mut head) {
-        Ok(()) if &head == b"PAR1" => return Ok(Format::Parquet),
-        Ok(()) => {}
-        // Fewer than 4 bytes: too short to be Parquet — fall through to the error below.
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
-        // A real IO error (permissions, etc.) should surface, not be misread as "not parquet".
-        Err(e) => return Err(EngineError::Io(e)),
+    let file = std::fs::File::open(path)?;
+    let mut head = Vec::with_capacity(6);
+    // A real IO error (permissions, etc.) should surface, not be misread as "not parquet"; fewer
+    // bytes than a magic number falls through to the error below.
+    file.take(6).read_to_end(&mut head)?;
+    if head.starts_with(b"PAR1") {
+        return Ok(Format::Parquet);
+    }
+    if head.starts_with(b"ARROW1") {
+        return Ok(Format::Arrow);
     }
     Err(EngineError::UnsupportedFormat {
         detail: format!(
-            "cannot infer the format of {} (unknown extension and not a Parquet file); \
-             pass a .parquet/.csv/.json path",
+            "cannot infer the format of {} (unknown extension, and neither a Parquet nor an \
+             Arrow file); pass a .parquet/.csv/.json/.arrow path",
             path.display()
         ),
     })
@@ -888,6 +772,15 @@ mod tests {
         assert_eq!(Format::Unknown.as_str(), "unknown");
     }
 
+    /// Arrow is asked for by any name its files go by, and calls itself `arrow`.
+    #[test]
+    fn arrow_is_asked_for_by_every_name_its_files_go_by() {
+        for name in ["arrow", "arrows", "feather", "ipc"] {
+            assert_eq!(Format::parse(name), Some(Format::Arrow), "{name}");
+        }
+        assert_eq!(Format::Arrow.as_str(), "arrow");
+    }
+
     #[test]
     fn extension_detection() {
         assert_eq!(
@@ -923,12 +816,14 @@ mod tests {
         // Parquet compresses inside its container; a codec around one names nothing.
         assert_eq!(name("t.parquet.gz"), None);
         assert_eq!(name("t.gz"), None);
-        // The browser's plain lookup still hides them until they can be read.
+        // The last extension alone names no format: the whole name does.
         assert_eq!(format_from_extension(Path::new("t.csv.gz")), None);
     }
 
+    /// A compressed file is detected by its name, read when this build decodes its codec, and
+    /// refused up front, naming the feature, when it does not.
     #[test]
-    fn a_compressed_file_is_detected_as_such_and_refused_by_name() {
+    fn a_compressed_file_is_detected_and_refused_only_without_its_decoder() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.csv.gz");
         std::fs::write(&path, b"\x1f\x8b not really gzip").unwrap();
@@ -937,11 +832,21 @@ mod tests {
             (source.format, source.codec),
             (Format::Csv, Some(Codec::Gzip))
         );
-        let err = source.require_uncompressed().unwrap_err().to_string();
         assert!(
-            err.ends_with("t.csv.gz is gzip-compressed, and Lakeleto does not decompress files yet — decompress it first"),
-            "{err}"
+            source.require_decodable().is_ok(),
+            "gzip decodes in every build"
         );
+        let zstd = Source::with_format(dir.path().join("t.csv.zst"), Format::Csv)
+            .with_codec(Some(Codec::Zstd));
+        let refused = zstd.require_decodable();
+        assert_eq!(refused.is_ok(), cfg!(feature = "compression"));
+        if let Err(e) = refused {
+            let e = e.to_string();
+            assert!(
+                e.contains("t.csv.zst is zstd-compressed") && e.contains("--features compression"),
+                "{e}"
+            );
+        }
         // An explicit format keeps the codec the name gives.
         let explicit = Source::resolve(&path, Some("tsv")).unwrap();
         assert_eq!(explicit.codec, Some(Codec::Gzip));

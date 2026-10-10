@@ -20,11 +20,12 @@ use parquet::arrow::ProjectionMask;
 use super::flatten::{flatten_rows, flatten_schema};
 use super::{
     apply_scan, build_table_schema, filter_batches, profile_columns, project_rows,
-    truncate_batches, window_batches, Capabilities, ColumnProfile, Engine, FilterSpec, RowBatch,
-    ScanResult, ScanSpec, TableProfile, TableSchema,
+    truncate_batches, Capabilities, ColumnProfile, Engine, FilterSpec, RowBatch, ScanResult,
+    ScanSpec, TableProfile, TableSchema,
 };
 use crate::context::RequestContext;
 use crate::error::{EngineError, Result};
+use crate::format::codec::{Decompressed, Stored};
 use crate::format::{self, FileSchema, FormatReader, Input, ReadOptions, RemoteObject};
 use crate::source::{Format, Source};
 
@@ -50,6 +51,11 @@ pub struct LocalReaderEngine {
     /// [`Self::without_ambient_identity`].
     #[cfg(feature = "object-store")]
     default_store_options: Option<crate::objstore::StoreOptions>,
+    /// The catalogs a `catalog://` source is read through. [`Default`] is the process's
+    /// ([`Catalogs::configured`](crate::catalog::Catalogs::configured)), read the first time a
+    /// catalog reference is.
+    #[cfg(feature = "catalog")]
+    catalogs: Arc<crate::catalog::Catalogs>,
 }
 
 impl Default for LocalReaderEngine {
@@ -60,11 +66,17 @@ impl Default for LocalReaderEngine {
             scan_cap: 200_000,
             #[cfg(feature = "object-store")]
             default_store_options: Some(crate::objstore::StoreOptions::from_env()),
+            #[cfg(feature = "catalog")]
+            catalogs: crate::catalog::Catalogs::configured(),
         }
     }
 }
 
 impl LocalReaderEngine {
+    /// What this engine calls itself in `/v1/engines` and `lakeleto engines`: the reader built
+    /// into every build. Not a list of crates, which read as the formats it opens.
+    pub const LABEL: &'static str = "local (built-in reader)";
+
     /// This engine, defaulting to `opts` rather than to the environment when a call names no
     /// identity of its own.
     ///
@@ -87,6 +99,13 @@ impl LocalReaderEngine {
     #[cfg(feature = "object-store")]
     pub fn without_ambient_identity(mut self) -> Self {
         self.default_store_options = None;
+        self
+    }
+
+    /// This engine, reading `catalog://` sources through `catalogs` rather than the process's.
+    #[cfg(feature = "catalog")]
+    pub fn with_catalogs(mut self, catalogs: Arc<crate::catalog::Catalogs>) -> Self {
+        self.catalogs = catalogs;
         self
     }
 
@@ -116,33 +135,94 @@ impl LocalReaderEngine {
 }
 
 impl LocalReaderEngine {
-    /// Resolve the Iceberg read plan for `source`. A local table plans directly; an object-store
-    /// table (`s3://…`) is first mirrored to a local temp dir (once per process) and planned
-    /// against the mirror, with the absolute object URIs in its metadata remapped to the mirror.
+    /// Resolve the Iceberg read plan for `source`, and where its data files are read from.
+    ///
+    /// A local table plans from disk. A table in an object store plans through the store, as the
+    /// call's identity: its metadata and manifests are fetched, and its data files are then read
+    /// by ranged requests through the same stores, so nothing is copied to disk.
     #[cfg(feature = "iceberg")]
     fn iceberg_plan(
         &self,
         #[cfg_attr(not(feature = "object-store"), allow(unused_variables))] ctx: &RequestContext,
         source: &Source,
-    ) -> Result<crate::iceberg::TablePlan> {
+    ) -> Result<(crate::iceberg::TablePlan, DataFiles)> {
+        #[cfg(feature = "catalog")]
+        if source.is_catalog() {
+            let (plan, files, _) = self.catalog_plan(ctx, source)?;
+            return Ok((plan, files));
+        }
         #[cfg(feature = "object-store")]
         if source.is_remote() {
             let uri = source.path.to_string_lossy();
-            let local = crate::objstore::materialize_prefix_with(
-                uri.as_ref(),
-                self.identity(ctx, uri.as_ref())?,
-            )?;
-            return crate::iceberg::plan_object(&local, uri.as_ref());
+            let stores = crate::objstore::Stores::new(self.identity(ctx, uri.as_ref())?);
+            let plan = crate::iceberg::plan_in_store(uri.as_ref(), &stores, ctx)?;
+            return Ok((plan, DataFiles::Store(stores)));
         }
-        crate::iceberg::plan(&source.path)
+        Ok((crate::iceberg::plan(&source.path)?, DataFiles::Local))
     }
 
-    /// The exact row count when the format carries one cheaply (a Parquet footer, Iceberg/Delta
-    /// metadata). The registry's formats are text and never do, so they are answered without
-    /// opening the file: on every grid scroll, there is no count to learn from one.
+    /// Plan a table a catalog serves: load it through the catalog, as the call, and plan from the
+    /// metadata the catalog handed over. Also says whose credentials read the files, for a table in
+    /// an object store: `vended`, `catalog` or `ambient`.
+    ///
+    /// A table whose metadata is in an object store is read through stores built from the
+    /// credentials the catalog decided on. One whose metadata is on this machine, which a catalog
+    /// serving its own disk hands out, is planned from disk.
+    #[cfg(feature = "catalog")]
+    fn catalog_plan(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+    ) -> Result<(crate::iceberg::TablePlan, DataFiles, Option<&'static str>)> {
+        use crate::catalog::TableStorage;
+        let reference = crate::catalog::CatalogRef::parse(&source.path.to_string_lossy())?;
+        let handle = self.catalogs.load_table(ctx, &reference)?;
+        let metadata = handle.metadata.as_deref().ok_or_else(|| {
+            EngineError::Other(format!("{reference}: the catalog handed over no metadata"))
+        })?;
+        let location = handle.location.to_string_lossy().into_owned();
+        let table = table_root(metadata, &location);
+        if crate::source::is_object_uri(&location) {
+            let options: std::borrow::Cow<'_, crate::objstore::StoreOptions> = match &handle.storage
+            {
+                Some(TableStorage::Vended(o) | TableStorage::Catalog(o)) => {
+                    std::borrow::Cow::Borrowed(o)
+                }
+                Some(TableStorage::Ambient(pairs)) => std::borrow::Cow::Owned(
+                    self.identity(ctx, &location)?
+                        .clone()
+                        .with_config_pairs(pairs.clone()),
+                ),
+                None => std::borrow::Cow::Borrowed(self.identity(ctx, &location)?),
+            };
+            let credentials = handle
+                .storage
+                .as_ref()
+                .map_or("ambient", TableStorage::source);
+            let stores = crate::objstore::Stores::new(&options);
+            let plan = crate::iceberg::plan_metadata_in_store(&table, metadata, &stores, ctx)
+                .map_err(|e| read_with(e, &reference, credentials))?;
+            return Ok((plan, DataFiles::Store(stores), Some(credentials)));
+        }
+        let dir = local_path(&table).ok_or_else(|| EngineError::UnsupportedFormat {
+            detail: format!(
+                "{reference} is at {location}, which is neither on this machine nor in an object \
+                 store Lakeleto reads"
+            ),
+        })?;
+        let plan = crate::iceberg::plan_metadata_local(&dir, metadata)?;
+        Ok((plan, DataFiles::Local, None))
+    }
+
+    /// The exact row count when the format carries one cheaply (a Parquet or Arrow footer,
+    /// Iceberg/Delta metadata). A registry format that does not count rows — the text formats — is
+    /// answered without opening the file: on every grid scroll, there is no count to learn from one.
     fn row_count(&self, ctx: &RequestContext, source: &Source) -> Result<Option<u64>> {
-        if format::reader(source.format).is_some() {
-            return Ok(None);
+        if let Some(reader) = format::reader(source.format) {
+            if !reader.counts_rows() {
+                return Ok(None);
+            }
+            return self.with_input(ctx, source, reader, |input| reader.row_count(input));
         }
         Ok(self.open_schema(ctx, source)?.1)
     }
@@ -160,8 +240,9 @@ impl LocalReaderEngine {
     /// Hand a registry format's input to `f`: the file itself, or for an object-store source the
     /// object, under the call's identity — read as it arrives by a reader that
     /// [streams objects](FormatReader::streams_objects), so a read stops fetching where it stops
-    /// reading, and otherwise fetched whole. A compressed file is refused here, before a byte is
-    /// read — which is where its decoder will go.
+    /// reading, and otherwise fetched whole. A compressed file, local or remote, is handed over as
+    /// its decompressed bytes, decompressed as they are read ([`Decompressed`]); a codec this build
+    /// does not decode is refused here, before a byte is read.
     fn with_input<T>(
         &self,
         ctx: &RequestContext,
@@ -169,7 +250,16 @@ impl LocalReaderEngine {
         reader: &dyn FormatReader,
         f: impl FnOnce(Input<'_>) -> Result<T>,
     ) -> Result<T> {
-        source.require_uncompressed()?;
+        source.require_decodable()?;
+        if let Some(codec) = source.codec {
+            let stored = if source.is_remote() {
+                Stored::Object(Arc::from(self.remote_object(ctx, source)?))
+            } else {
+                Stored::File(source.path.clone())
+            };
+            let object = Decompressed::new(stored, codec, crate::source::max_decompressed())?;
+            return f(Input::Object(&object)).map_err(|e| object.or_too_large(e));
+        }
         if source.is_remote() {
             if reader.streams_objects() {
                 let object = self.remote_object(ctx, source)?;
@@ -213,7 +303,8 @@ impl LocalReaderEngine {
         source: &Source,
     ) -> Result<(SchemaRef, Option<u64>)> {
         if let Some(reader) = format::reader(source.format) {
-            return Ok((self.file_schema(ctx, source, reader)?.schema, None));
+            let schema = self.file_schema(ctx, source, reader)?.schema;
+            return Ok((schema, self.row_count(ctx, source)?));
         }
         if source.is_remote() && !matches!(source.format, Format::Iceberg) {
             return self.remote_schema(ctx, source);
@@ -233,38 +324,8 @@ impl LocalReaderEngine {
             }
             #[cfg(feature = "iceberg")]
             Format::Iceberg => {
-                let plan = self.iceberg_plan(ctx, source)?;
-                let first = plan
-                    .files
-                    .first()
-                    .ok_or_else(|| EngineError::UnsupportedFormat {
-                        detail: format!("iceberg table {} has no data files", source.display()),
-                    })?;
-                let base = ParquetRecordBatchReaderBuilder::try_new(File::open(&first.path)?)
-                    .map_err(EngineError::parquet)?
-                    .schema()
-                    .clone();
-                // Report the current (evolved) schema when the metadata declares one.
-                let schema = match &plan.schema {
-                    Some(is) => crate::iceberg::target_schema(is, &base)?,
-                    None => base,
-                };
-                // Equality deletes remove rows by value — their exact count isn't known without
-                // scanning the data, so report the count as unknown when any are present.
-                if !plan.equality_deletes.is_empty() {
-                    return Ok((schema, None));
-                }
-                // Live row count = sum of file footers minus the positions each file deletes.
-                let mut total: i64 = 0;
-                for f in &plan.files {
-                    let phys = ParquetRecordBatchReaderBuilder::try_new(File::open(&f.path)?)
-                        .map_err(EngineError::parquet)?
-                        .metadata()
-                        .file_metadata()
-                        .num_rows();
-                    total += (phys - f.deletes.len() as i64).max(0);
-                }
-                Ok((schema, (total >= 0).then_some(total as u64)))
+                let (plan, files) = self.iceberg_plan(ctx, source)?;
+                self.iceberg_schema_and_count(ctx, source, &plan, &files)
             }
             #[cfg(feature = "delta")]
             Format::Delta => {
@@ -348,9 +409,9 @@ impl LocalReaderEngine {
         projection: Option<&[String]>,
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>)> {
         if let Some(reader) = format::reader(source.format) {
-            let through = Some(offset.saturating_add(limit));
-            let (schema, batches) = self.file_rows(ctx, source, reader, through)?;
-            return Ok((schema, window_batches(batches, offset, limit)));
+            return self.with_input(ctx, source, reader, |input| {
+                reader.window(ctx, input, &self.read_options(source), offset, limit)
+            });
         }
         if source.is_remote() && !matches!(source.format, Format::Iceberg) {
             return self.remote_window(ctx, source, offset, limit);
@@ -395,8 +456,8 @@ impl LocalReaderEngine {
             }
             #[cfg(feature = "iceberg")]
             Format::Iceberg => {
-                let plan = self.iceberg_plan(ctx, source)?;
-                self.read_iceberg(ctx, source, &plan, offset, limit, None)
+                let (plan, files) = self.iceberg_plan(ctx, source)?;
+                self.read_iceberg(ctx, source, &plan, &files, offset, limit, None)
             }
             #[cfg(feature = "delta")]
             Format::Delta => {
@@ -536,11 +597,13 @@ impl LocalReaderEngine {
     /// current schema by evolution-aware projection. When `filters` is set (a filtered scan over a
     /// delete-free table), non-matching Parquet row groups are skipped *within* each file.
     #[cfg(feature = "iceberg")]
+    #[allow(clippy::too_many_arguments)]
     fn read_iceberg(
         &self,
         ctx: &RequestContext,
         source: &Source,
         plan: &crate::iceberg::TablePlan,
+        files: &DataFiles,
         offset: usize,
         limit: usize,
         filters: Option<&[FilterSpec]>,
@@ -548,9 +611,9 @@ impl LocalReaderEngine {
         // Deletes shift positions so they take the slower read-from-start path; delete-free
         // tables keep the footer-skip fast path (with row-group skipping when filtered).
         let (base_schema, batches) = if plan.has_deletes() {
-            self.read_iceberg_with_deletes(ctx, source, plan, offset, limit)?
+            self.read_iceberg_with_deletes(ctx, source, plan, files, offset, limit)?
         } else {
-            self.read_iceberg_plain(ctx, source, plan, offset, limit, filters)?
+            self.read_iceberg_plain(ctx, source, plan, files, offset, limit, filters)?
         };
         // Schema evolution: when the metadata declares a current schema, unify every file to it
         // (match by field-id, cast promoted types, null-fill added columns).
@@ -626,8 +689,8 @@ impl LocalReaderEngine {
             // Null count is exact only when every row group reported it.
             let null_complete = !nulls.is_empty() && nulls.null_count() == 0;
             let null_count: u64 = nulls.iter().flatten().sum();
-            let min = array_extreme_str(&mins, false);
-            let max = array_extreme_str(&maxes, true);
+            let min = array_extreme_str(&mins, false)?;
+            let max = array_extreme_str(&maxes, true)?;
             if null_complete || min.is_some() || max.is_some() {
                 any_stats = true;
             }
@@ -677,15 +740,15 @@ impl LocalReaderEngine {
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>, usize)> {
         #[cfg(feature = "iceberg")]
         if source.format == Format::Iceberg && !filters.is_empty() {
-            let plan = self.iceberg_plan(ctx, source)?;
+            let (plan, files) = self.iceberg_plan(ctx, source)?;
             let (pruned, skipped) = crate::iceberg::prune(&plan, filters);
             if skipped > 0 && pruned.files.is_empty() {
                 // Every file pruned out → an empty result under the table's schema (not an error).
-                let schema = self.iceberg_schema_only(&plan)?;
+                let schema = self.iceberg_schema_only(&plan, &files)?;
                 return Ok((schema, Vec::new(), 0));
             }
             let (schema, batches) =
-                self.read_iceberg(ctx, source, &pruned, 0, cap, Some(filters))?;
+                self.read_iceberg(ctx, source, &pruned, &files, 0, cap, Some(filters))?;
             let scanned = batches.iter().map(|b| b.num_rows()).sum();
             return Ok((schema, batches, scanned));
         }
@@ -695,34 +758,111 @@ impl LocalReaderEngine {
         Ok((schema, batches, scanned))
     }
 
+    /// An Iceberg plan's schema and live row count. A table with no data files has no footer to
+    /// read a schema from, and says so.
+    #[cfg(feature = "iceberg")]
+    fn iceberg_schema_and_count(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        plan: &crate::iceberg::TablePlan,
+        files: &DataFiles,
+    ) -> Result<(SchemaRef, Option<u64>)> {
+        if plan.files.is_empty() {
+            return Err(EngineError::UnsupportedFormat {
+                detail: format!("iceberg table {} has no data files", source.display()),
+            });
+        }
+        let schema = self.iceberg_schema_only(plan, files)?;
+        Ok((schema, self.iceberg_count(ctx, plan, files)?))
+    }
+
     /// The current (evolved) Arrow schema of an Iceberg plan, read from the first file's footer.
     #[cfg(feature = "iceberg")]
-    fn iceberg_schema_only(&self, plan: &crate::iceberg::TablePlan) -> Result<SchemaRef> {
+    fn iceberg_schema_only(
+        &self,
+        plan: &crate::iceberg::TablePlan,
+        files: &DataFiles,
+    ) -> Result<SchemaRef> {
         let first = plan
             .files
             .first()
             .ok_or_else(|| EngineError::UnsupportedFormat {
                 detail: "iceberg table has no data files".to_string(),
             })?;
-        let base = ParquetRecordBatchReaderBuilder::try_new(File::open(&first.path)?)
-            .map_err(EngineError::parquet)?
-            .schema()
-            .clone();
+        let base = files.open(first)?.schema().clone();
         match &plan.schema {
             Some(is) => crate::iceberg::target_schema(is, &base),
             None => Ok(base),
         }
     }
 
+    /// An Iceberg plan's live row count: each data file's rows, less the positions its deletes
+    /// remove. A file's rows are the count its manifest records, else its footer's, so a table
+    /// whose manifests record them all is counted without opening a file.
+    ///
+    /// `None` when the table has equality deletes: which rows those remove is known only by
+    /// reading the data.
+    #[cfg(feature = "iceberg")]
+    fn iceberg_count(
+        &self,
+        ctx: &RequestContext,
+        plan: &crate::iceberg::TablePlan,
+        files: &DataFiles,
+    ) -> Result<Option<u64>> {
+        if !plan.equality_deletes.is_empty() {
+            return Ok(None);
+        }
+        let mut total: i64 = 0;
+        for f in &plan.files {
+            let rows = match f.manifest_rows() {
+                Some(rows) => rows as i64,
+                None => {
+                    // One check per file opened — an Iceberg snapshot can name thousands.
+                    ctx.check()?;
+                    files.open(f)?.metadata().file_metadata().num_rows()
+                }
+            };
+            total += (rows - f.deletes.len() as i64).max(0);
+        }
+        Ok((total >= 0).then_some(total as u64))
+    }
+
+    /// A plain window of `source`, and the table's exact row count when it carries one cheaply
+    /// (Parquet carries an exact total in its footer; CSV does not).
+    ///
+    /// An Iceberg table is planned once for both: for a table in an object store, planning is
+    /// requests for its metadata and manifests, which the window and the count would otherwise
+    /// each make.
+    fn window_and_count(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        spec: &ScanSpec,
+        proj: Option<&[String]>,
+    ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>, Option<u64>)> {
+        #[cfg(feature = "iceberg")]
+        if source.format == Format::Iceberg {
+            let (plan, files) = self.iceberg_plan(ctx, source)?;
+            let (schema, batches) =
+                self.read_iceberg(ctx, source, &plan, &files, spec.offset, spec.limit, None)?;
+            return Ok((schema, batches, self.iceberg_count(ctx, &plan, &files)?));
+        }
+        let (schema, batches) = self.read_window(ctx, source, spec.offset, spec.limit, proj)?;
+        Ok((schema, batches, self.row_count(ctx, source)?))
+    }
+
     /// Read a delete-free Iceberg table: walk the current snapshot's data files, skipping whole
     /// files by their footer row counts and pushing the residual offset/limit into the Parquet
     /// reader (row-group skipping). Returns raw (physical, pre-projection) batches.
     #[cfg(feature = "iceberg")]
+    #[allow(clippy::too_many_arguments)]
     fn read_iceberg_plain(
         &self,
         ctx: &RequestContext,
         source: &Source,
         plan: &crate::iceberg::TablePlan,
+        files: &DataFiles,
         offset: usize,
         limit: usize,
         filters: Option<&[FilterSpec]>,
@@ -734,15 +874,28 @@ impl LocalReaderEngine {
         for f in &plan.files {
             // One check per data file — an Iceberg snapshot can name thousands.
             ctx.check()?;
-            let mut builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&f.path)?)
-                .map_err(EngineError::parquet)?;
+            // The window is full and the schema known, so the files after it are not opened: in
+            // an object store, opening one is a request for its footer.
+            if remaining == 0 && schema.is_some() {
+                break;
+            }
+            // Nor is a file wholly before the window whose manifest records its rows. The first
+            // file is opened whatever, for the schema.
+            if let (Some(_), Some(rows)) = (&schema, f.manifest_rows()) {
+                let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+                if to_skip >= rows {
+                    to_skip -= rows;
+                    continue;
+                }
+            }
+            let file = files.open(f)?;
             if schema.is_none() {
-                schema = Some(builder.schema().clone());
+                schema = Some(file.schema().clone());
             }
             if remaining == 0 {
                 break;
             }
-            let frows = builder.metadata().file_metadata().num_rows().max(0) as usize;
+            let frows = file.metadata().file_metadata().num_rows().max(0) as usize;
             if to_skip >= frows {
                 to_skip -= frows; // whole file is before the window — skip it
                 continue;
@@ -751,31 +904,28 @@ impl LocalReaderEngine {
             // footer-skip path above never fires and positions aren't disturbed).
             let selected = filters.and_then(|f| {
                 crate::iceberg::select_row_groups(
-                    builder.metadata(),
-                    builder.schema(),
+                    file.metadata(),
+                    file.schema(),
                     plan.schema.as_ref(),
                     f,
                 )
             });
-            let bs = remaining.clamp(1, self.batch_size);
-            builder = builder.with_batch_size(bs);
-            if to_skip > 0 {
-                builder = builder.with_offset(to_skip);
-            }
-            builder = builder.with_limit(remaining);
-            if let Some(selected) = selected {
-                builder = builder.with_row_groups(selected);
-            }
-            let reader = builder.build().map_err(EngineError::parquet)?;
+            let want = remaining;
             let mut got = 0usize;
-            for b in reader {
-                let b = b.map_err(EngineError::arrow)?;
-                got += b.num_rows();
-                batches.push(b);
-                if got >= remaining {
-                    break;
-                }
-            }
+            file.read(
+                ctx,
+                RowsToRead {
+                    batch_size: remaining.clamp(1, self.batch_size),
+                    offset: to_skip,
+                    limit: Some(remaining),
+                    row_groups: selected,
+                },
+                |b| {
+                    got += b.num_rows();
+                    batches.push(b);
+                    Ok(got < want)
+                },
+            )?;
             remaining = remaining.saturating_sub(got);
             to_skip = 0;
         }
@@ -796,6 +946,7 @@ impl LocalReaderEngine {
         ctx: &RequestContext,
         source: &Source,
         plan: &crate::iceberg::TablePlan,
+        files: &DataFiles,
         offset: usize,
         limit: usize,
     ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>)> {
@@ -806,13 +957,16 @@ impl LocalReaderEngine {
         for entry in &plan.files {
             // One check per data file — an Iceberg snapshot can name thousands.
             ctx.check()?;
-            let mut builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&entry.path)?)
-                .map_err(EngineError::parquet)?;
+            // The window is covered and the schema known, so the files after it are not opened.
+            if got >= want && schema.is_some() {
+                break;
+            }
+            let file = files.open(entry)?;
             if schema.is_none() {
-                schema = Some(builder.schema().clone());
+                schema = Some(file.schema().clone());
             }
             if got >= want {
-                continue; // schema captured from the first file; window already covered
+                break; // schema captured from the first file; window already covered
             }
             // An equality delete applies to this file only when BOTH halves of the spec's rule
             // hold: a strictly higher sequence number (so rows re-inserted after a delete
@@ -839,28 +993,32 @@ impl LocalReaderEngine {
                     d.applies_to_partition(&entry.partition)
                 })
                 .collect();
-            builder = builder.with_batch_size(self.batch_size);
-            let reader = builder.build().map_err(EngineError::parquet)?;
             let mut phys = 0i64;
-            for b in reader {
-                let b = b.map_err(EngineError::arrow)?;
-                let rows = b.num_rows();
-                let live = drop_positions(b, phys, &entry.deletes)?;
-                phys += rows as i64;
-                let live = apply_equality_deletes(live, &eq)?;
-                got += live.num_rows();
-                if live.num_rows() > 0 {
-                    logical.push(live);
-                }
-                if got >= want {
-                    break;
-                }
-            }
+            file.read(
+                ctx,
+                RowsToRead {
+                    batch_size: self.batch_size,
+                    offset: 0,
+                    limit: None,
+                    row_groups: None,
+                },
+                |b| {
+                    let rows = b.num_rows();
+                    let live = drop_positions(b, phys, &entry.deletes)?;
+                    phys += rows as i64;
+                    let live = apply_equality_deletes(live, &eq)?;
+                    got += live.num_rows();
+                    if live.num_rows() > 0 {
+                        logical.push(live);
+                    }
+                    Ok(got < want)
+                },
+            )?;
         }
         let schema = schema.ok_or_else(|| EngineError::UnsupportedFormat {
             detail: format!("iceberg table {} has no data files", source.display()),
         })?;
-        Ok((schema, window_batches(logical, offset, limit)))
+        Ok((schema, super::window_batches(logical, offset, limit)))
     }
 
     // --- object-store (s3://, gs://, az://) reads ------------------------------------------
@@ -1024,21 +1182,31 @@ fn unify_batch(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordBatch> {
 }
 
 /// The min (`want_max=false`) or max (`want_max=true`) of a per-row-group statistics array,
-/// formatted exactly as [`profile_columns`] formats scanned values (same `ArrayFormatter`), so a
-/// footer-derived profile reads identically to a scanned one. `None` when the array is all-null.
-fn array_extreme_str(arr: &ArrayRef, want_max: bool) -> Option<String> {
+/// formatted exactly as [`profile_columns`] formats scanned values (same `ArrayFormatter`, same
+/// time zones), so a footer-derived profile reads identically to a scanned one. `None` when the
+/// array is all-null; an error, as for a scanned profile, when it is in a time zone this build
+/// cannot print.
+fn array_extreme_str(arr: &ArrayRef, want_max: bool) -> Result<Option<String>> {
     if arr.is_empty() || arr.null_count() == arr.len() {
-        return None;
+        return Ok(None);
     }
     // Sort with nulls last so the first index is the extreme non-null value.
     let opts = SortOptions {
         descending: want_max,
         nulls_first: false,
     };
-    let idx = sort_to_indices(arr, Some(opts), None).ok()?;
-    let pos = *idx.values().first()? as usize;
-    let fmt = ArrayFormatter::try_new(arr.as_ref(), &FormatOptions::default()).ok()?;
-    Some(fmt.value(pos).to_string())
+    let Some(pos) = sort_to_indices(arr, Some(opts), None)
+        .ok()
+        .and_then(|idx| idx.values().first().copied())
+    else {
+        return Ok(None);
+    };
+    let arr = crate::zone::printable(arr)?;
+    Ok(
+        ArrayFormatter::try_new(arr.as_ref(), &FormatOptions::default())
+            .ok()
+            .map(|fmt| fmt.value(pos as usize).to_string()),
+    )
 }
 
 /// Error for an object-store URI in a binary built without `--features object-store`.
@@ -1050,6 +1218,180 @@ fn remote_unavailable(source: &Source) -> EngineError {
              rebuild with `cargo build --features object-store`",
             source.display()
         ),
+    }
+}
+
+/// A catalog table's root, which relative paths in its metadata resolve against: the `location`
+/// its metadata names, when that is where its metadata file is (both in an object store, or both
+/// on this machine), else the directory above the metadata file's `metadata/` directory.
+#[cfg(feature = "catalog")]
+fn table_root(metadata: &[u8], metadata_location: &str) -> String {
+    let in_store = crate::source::is_object_uri;
+    let named = serde_json::from_slice::<serde_json::Value>(metadata)
+        .ok()
+        .and_then(|m| m.get("location")?.as_str().map(str::to_string))
+        .filter(|l| in_store(l) == in_store(metadata_location));
+    named.unwrap_or_else(|| {
+        let dir = metadata_location
+            .rsplit_once('/')
+            .map_or(metadata_location, |(dir, _)| dir);
+        dir.strip_suffix("/metadata").unwrap_or(dir).to_string()
+    })
+}
+
+/// A location on this machine as a path: a `file://` URI or a path. `None` for any other scheme.
+#[cfg(feature = "catalog")]
+fn local_path(location: &str) -> Option<std::path::PathBuf> {
+    if location.starts_with("file:") {
+        return url::Url::parse(location).ok()?.to_file_path().ok();
+    }
+    (!location.contains("://")).then(|| std::path::PathBuf::from(location))
+}
+
+/// `e`, saying which credentials the failed read used, since a failure to read a catalog table's
+/// files is so often about whose credentials those were.
+#[cfg(feature = "catalog")]
+fn read_with(
+    e: EngineError,
+    reference: &crate::catalog::CatalogRef,
+    credentials: &str,
+) -> EngineError {
+    let used = match credentials {
+        "vended" => "credentials the catalog vended",
+        "catalog" => "the storage keys configured for the catalog",
+        _ => "this machine's own credentials, since the catalog vended none",
+    };
+    let note = format!("(reading {reference} with {used})");
+    match e {
+        EngineError::Forbidden(m) => EngineError::Forbidden(format!("{m} {note}")),
+        EngineError::Other(m) => EngineError::Other(format!("{m} {note}")),
+        EngineError::Remote(m) => EngineError::Remote(format!("{m} {note}")),
+        other => other,
+    }
+}
+
+/// Where an Iceberg plan's data files are read from: this machine, or the object store the table
+/// is in, by ranged requests, as the identity that planned it.
+#[cfg(feature = "iceberg")]
+enum DataFiles {
+    Local,
+    #[cfg(feature = "object-store")]
+    Store(crate::objstore::Stores),
+}
+
+#[cfg(feature = "iceberg")]
+impl DataFiles {
+    /// Open one of the plan's data files: its footer is read, its rows are not yet.
+    fn open(&self, file: &crate::iceberg::DataFileEntry) -> Result<ParquetFile> {
+        match self {
+            DataFiles::Local => Ok(ParquetFile::Local(
+                ParquetRecordBatchReaderBuilder::try_new(File::open(&file.path)?)
+                    .map_err(EngineError::parquet)?,
+            )),
+            #[cfg(feature = "object-store")]
+            DataFiles::Store(stores) => Ok(ParquetFile::Remote(
+                stores.parquet(&file.path.to_string_lossy(), file.size)?,
+            )),
+        }
+    }
+}
+
+/// A Parquet data file opened for reading: from disk, or from an object store by ranged requests,
+/// which fetch only the row groups and columns a read asks for.
+#[cfg(feature = "iceberg")]
+enum ParquetFile {
+    Local(ParquetRecordBatchReaderBuilder<File>),
+    #[cfg(feature = "object-store")]
+    Remote(
+        parquet::arrow::ParquetRecordBatchStreamBuilder<
+            parquet::arrow::async_reader::ParquetObjectReader,
+        >,
+    ),
+}
+
+/// Which of a Parquet file's rows to read, set on its reader the same way wherever the file is.
+#[cfg(feature = "iceberg")]
+struct RowsToRead {
+    batch_size: usize,
+    offset: usize,
+    limit: Option<usize>,
+    row_groups: Option<Vec<usize>>,
+}
+
+#[cfg(feature = "iceberg")]
+impl RowsToRead {
+    fn apply<T>(
+        self,
+        mut builder: parquet::arrow::arrow_reader::ArrowReaderBuilder<T>,
+    ) -> parquet::arrow::arrow_reader::ArrowReaderBuilder<T> {
+        builder = builder.with_batch_size(self.batch_size);
+        if self.offset > 0 {
+            builder = builder.with_offset(self.offset);
+        }
+        if let Some(limit) = self.limit {
+            builder = builder.with_limit(limit);
+        }
+        if let Some(row_groups) = self.row_groups {
+            builder = builder.with_row_groups(row_groups);
+        }
+        builder
+    }
+}
+
+#[cfg(feature = "iceberg")]
+impl ParquetFile {
+    fn schema(&self) -> &SchemaRef {
+        match self {
+            ParquetFile::Local(builder) => builder.schema(),
+            #[cfg(feature = "object-store")]
+            ParquetFile::Remote(builder) => builder.schema(),
+        }
+    }
+
+    fn metadata(&self) -> &Arc<parquet::file::metadata::ParquetMetaData> {
+        match self {
+            ParquetFile::Local(builder) => builder.metadata(),
+            #[cfg(feature = "object-store")]
+            ParquetFile::Remote(builder) => builder.metadata(),
+        }
+    }
+
+    /// Read `rows`, handing each batch to `each` until it returns `false` or the rows run out.
+    ///
+    /// The call's deadline and cancellation are checked before each batch: from an object store,
+    /// a batch can be a ranged request for a row group, so a read that stopped being wanted stops
+    /// requesting rather than finishing the file.
+    fn read(
+        self,
+        ctx: &RequestContext,
+        rows: RowsToRead,
+        mut each: impl FnMut(RecordBatch) -> Result<bool>,
+    ) -> Result<()> {
+        match self {
+            ParquetFile::Local(builder) => {
+                for batch in rows.apply(builder).build().map_err(EngineError::parquet)? {
+                    ctx.check()?;
+                    if !each(batch.map_err(EngineError::arrow)?)? {
+                        break;
+                    }
+                }
+            }
+            #[cfg(feature = "object-store")]
+            ParquetFile::Remote(builder) => {
+                use futures::StreamExt;
+                let mut stream = rows.apply(builder).build().map_err(EngineError::parquet)?;
+                loop {
+                    ctx.check()?;
+                    let Some(batch) = crate::objstore::block_on(stream.next()) else {
+                        break;
+                    };
+                    if !each(batch.map_err(EngineError::parquet)?)? {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1117,7 +1459,7 @@ impl Engine for LocalReaderEngine {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
-            engine: "local (arrow/parquet/csv reader)".to_string(),
+            engine: Self::LABEL.to_string(),
             formats: crate::engine::readable_formats(),
             sql: false,
             profile: true,
@@ -1136,8 +1478,20 @@ impl Engine for LocalReaderEngine {
             // `{"data": [...]}` is never silent.
             let file = self.file_schema(ctx, source, reader)?;
             let schema = flatten_schema(&file.schema, source.flatten)?;
-            let mut ts = build_table_schema(source, self.name(), None, &schema);
+            let row_count = self.row_count(ctx, source)?;
+            let mut ts = build_table_schema(source, self.name(), row_count, &schema);
             ts.records_path = file.records_path;
+            return Ok(ts);
+        }
+        #[cfg(feature = "catalog")]
+        if source.is_catalog() {
+            // Through the catalog, which also says whose credentials read the files: every read
+            // of a catalog table reports it.
+            let (plan, files, credentials) = self.catalog_plan(ctx, source)?;
+            let (schema, row_count) = self.iceberg_schema_and_count(ctx, source, &plan, &files)?;
+            let schema = flatten_schema(&schema, source.flatten)?;
+            let mut ts = build_table_schema(source, self.name(), row_count, &schema);
+            ts.credentials = credentials.map(str::to_string);
             return Ok(ts);
         }
         let (schema, row_count) = self.open_schema(ctx, source)?;
@@ -1169,7 +1523,7 @@ impl Engine for LocalReaderEngine {
         let (schema, batches) = self.read_batches(ctx, source, Some(scan_limit))?;
         let (schema, batches) = flatten_rows(schema, batches, source.flatten)?;
         let scanned_rows = batches.iter().map(|b| b.num_rows() as u64).sum();
-        let columns = profile_columns(&schema, &batches);
+        let columns = profile_columns(&schema, &batches)?;
         Ok(TableProfile {
             source: source.display(),
             engine: self.name().to_string(),
@@ -1187,11 +1541,10 @@ impl Engine for LocalReaderEngine {
             // pushed into the Parquet reader), then reorder to the requested column order.
             // A flattened column's name is its Parquet leaf path (`user.geo.lat`), which is what
             // the reader's projection matches on, so pushing it down still selects that column.
-            let (schema, batches) = self.read_window(ctx, source, spec.offset, spec.limit, proj)?;
+            let (schema, batches, total) = self.window_and_count(ctx, source, spec, proj)?;
             let (schema, batches) = flatten_rows(schema, batches, source.flatten)?;
             let returned: usize = batches.iter().map(|b| b.num_rows()).sum();
-            // Parquet carries an exact total in its footer; CSV does not (cheaply).
-            let total = self.row_count(ctx, source)?.map(|n| n as usize);
+            let total = total.map(|n| n as usize);
             Ok(ScanResult {
                 batch: project_rows(RowBatch { schema, batches }, proj)?,
                 matched_rows: total.unwrap_or(spec.offset + returned),
@@ -1232,7 +1585,7 @@ impl Engine for LocalReaderEngine {
         let (schema, batches) = flatten_rows(schema, batches, source.flatten)?;
         let scanned_rows = scanned as u64;
         let (fschema, fbatches) = filter_batches(&schema, &batches, filters)?;
-        let columns = profile_columns(&fschema, &fbatches);
+        let columns = profile_columns(&fschema, &fbatches)?;
         let matched: u64 = fbatches.iter().map(|b| b.num_rows() as u64).sum();
         Ok(TableProfile {
             source: source.display(),
@@ -1387,5 +1740,83 @@ mod identity_tests {
             .schema(&RequestContext::detached(), &source)
             .expect("a local read must not need a credential identity");
         assert_eq!(schema.columns.len(), 2);
+    }
+}
+
+#[cfg(all(test, feature = "catalog"))]
+mod catalog_tests {
+    use super::*;
+    use crate::catalog::CatalogRef;
+
+    /// Relative paths in a catalog table's metadata resolve against the `location` it names when
+    /// that is in the same place as the metadata file, and otherwise against the directory above
+    /// the metadata file's `metadata/`.
+    #[test]
+    fn a_catalog_tables_root_is_where_its_metadata_says_when_that_is_reachable() {
+        let named = br#"{"location": "s3://b/warehouse/db/orders"}"#;
+        assert_eq!(
+            table_root(named, "s3://b/staging/orders/metadata/v2.metadata.json"),
+            "s3://b/warehouse/db/orders"
+        );
+        // A catalog serving its own disk names a store location this machine doesn't read.
+        assert_eq!(
+            table_root(named, "/srv/wh/db/orders/metadata/v2.metadata.json"),
+            "/srv/wh/db/orders"
+        );
+        assert_eq!(
+            table_root(b"{}", "s3://b/w/t/metadata/v2.metadata.json"),
+            "s3://b/w/t"
+        );
+    }
+
+    #[test]
+    fn a_local_location_is_a_path_and_a_store_location_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(dir.path()).unwrap().to_string();
+        assert_eq!(local_path(&url).as_deref(), Some(dir.path()));
+        assert_eq!(
+            local_path("/srv/wh/t").as_deref(),
+            Some(std::path::Path::new("/srv/wh/t"))
+        );
+        assert_eq!(local_path("s3://b/w/t"), None);
+    }
+
+    /// A failed read of a catalog table's files says whose credentials it used.
+    #[test]
+    fn a_failed_read_says_whose_credentials_it_used() {
+        let reference = CatalogRef::parse("catalog://lab/db/orders").unwrap();
+        let note = |credentials: &str| {
+            read_with(
+                EngineError::Forbidden("Access Denied".to_string()),
+                &reference,
+                credentials,
+            )
+            .to_string()
+        };
+        assert!(
+            note("vended").contains(
+                "Access Denied (reading catalog://lab/db/orders with credentials the catalog \
+                 vended)"
+            ),
+            "{}",
+            note("vended")
+        );
+        assert!(
+            note("catalog").contains("with the storage keys configured for the catalog)"),
+            "{}",
+            note("catalog")
+        );
+        assert!(
+            note("ambient").contains("with this machine's own credentials"),
+            "{}",
+            note("ambient")
+        );
+        let missing = read_with(
+            EngineError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "gone")),
+            &reference,
+            "vended",
+        );
+        assert!(matches!(missing, EngineError::Io(_)), "{missing}");
+        assert!(!missing.to_string().contains("reading"), "{missing}");
     }
 }
