@@ -3,6 +3,7 @@
 // full-pane views composed from the design-system primitives.
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import type { QueryResp, RunRecord, RunResponse, Row, WsConnection } from "./api";
+import { displayPath } from "./api";
 import { Button, cellText, Chip, TextInput, Textarea } from "./components";
 import { type OpenTab } from "./workspace";
 
@@ -50,10 +51,10 @@ export function LauncherView({ connections, onOpenPath, onNewQuery, onBrowse }: 
             </div>
           ) : (
             connections.map((c) => (
-              <button key={c.id} style={connRow} title={`open a SQL tab on ${c.path}`} onClick={() => onNewQuery(c)}>
+              <button key={c.id} style={connRow} title={`open a SQL tab on ${displayPath(c.path)}`} onClick={() => onNewQuery(c)}>
                 <span style={{ color: "var(--accent)" }}>λ</span>
                 <span style={{ fontWeight: "var(--weight-semibold)" }}>{c.label}</span>
-                <span style={{ color: "var(--muted)", fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{c.path}</span>
+                <span style={{ color: "var(--muted)", fontSize: "var(--text-xs)", fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{displayPath(c.path)}</span>
               </button>
             ))
           )}
@@ -295,7 +296,7 @@ export function RunnerModal({ open, title, sharedSql, jobs, exec, onOpenResult, 
                       <input type="checkbox" checked={!!selected[j.id]} disabled={running} onChange={(e) => setSelected((s) => ({ ...s, [j.id]: e.target.checked }))} />
                     </td>
                     <td style={{ padding: "4px 8px", borderBottom: "var(--border-hairline)", whiteSpace: "nowrap" }}>{j.label}</td>
-                    <td style={{ padding: "4px 8px", borderBottom: "var(--border-hairline)", color: "var(--muted)", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={sharedSql != null ? j.path : j.sql}>{sharedSql != null ? j.path : j.sql.replace(/\s+/g, " ")}</td>
+                    <td style={{ padding: "4px 8px", borderBottom: "var(--border-hairline)", color: "var(--muted)", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={sharedSql != null ? displayPath(j.path) : j.sql}>{sharedSql != null ? displayPath(j.path) : j.sql.replace(/\s+/g, " ")}</td>
                     <td style={{ padding: "4px 8px", borderBottom: "var(--border-hairline)", whiteSpace: "nowrap" }}>
                       {!res && <span style={{ color: "var(--muted)" }}>—</span>}
                       {res?.status === "running" && <span style={{ color: "var(--muted)" }}>running…</span>}

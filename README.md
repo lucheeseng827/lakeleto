@@ -7,7 +7,7 @@ see the schema, a clean row preview, and per-column profiles **near-instantly** 
 upload, no server, offline. A single static binary that runs on your laptop or inside a
 locked-down CI runner. (`.tsv` is read tab-delimited; `--format tsv` forces it for any name.)
 
-> **Status: v0.4.0 — released 2026-10-10 (lakeleto).** *Low-Med MVP, "fastest to lovable,"
+> **Status: v0.4.1 — released 2026-11-04 (lakeleto).** *Low-Med MVP, "fastest to lovable,"
 > engine is a commodity → pure UX.* The MVP
 > ships the lean, pure-Rust **local reader** engine (Parquet, CSV/TSV, JSON and Arrow IPC) behind a
 > single [`Engine`](src/engine/mod.rs) trait, with `schema` / `head` / `profile` / `info`
@@ -15,7 +15,7 @@ locked-down CI runner. (`.tsv` is read tab-delimited; `--format tsv` forces it f
 > opt-in DataFusion **SQL** engine (`--features sql`, read-only), a self-contained **Iceberg**
 > reader (`--features iceberg`), **BYO-credential `s3://`/`gs://`/`az://` reads**
 > (`--features object-store`), and the **Lakeleto Cloud** engine seam (`--features
-> remote`). Last updated 2026-10-10.
+> remote`). Last updated 2026-11-04.
 
 ## Why it exists
 

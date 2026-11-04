@@ -5,7 +5,7 @@
 // export/import. Open tabs + grid state persist through the store, so a reload restores the
 // workbench. Falls back to an offline localStorage store + sample tables when no server answers.
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { connectLakeleto, isDatabaseUri, isJsonSource, type Backend, type Conn, type Row, type RunRecord, type Workspace, type WorkspaceBundle, type WsConnection, type WsMeta, type WsSavedQuery } from "./api";
+import { connectLakeleto, displayPath, isDatabaseUri, isJsonSource, type Backend, type Conn, type Row, type RunRecord, type Workspace, type WorkspaceBundle, type WsConnection, type WsMeta, type WsSavedQuery } from "./api";
 import { Banner, Button, Chip } from "./components";
 import { TableView } from "./TableView";
 import { buildDoc, docToTabs, HistoryPanel, newDataTab, newLauncherTab, newTabId, resolveVars, ResultView, Sidebar, TabStrip, WorkspaceBar, basename, type OpenTab } from "./workspace";
@@ -31,6 +31,13 @@ function tableNameFor(path: string): string {
 }
 
 const qs = new URLSearchParams(location.search);
+// `lakeleto open <file>` starts the server and points the browser at `/?path=<file>`. It is taken
+// once, by the first workspace load: switching workspaces or reloading the page must not keep
+// reopening it, so it is also dropped from the address bar once used.
+let deepLink: string | null = qs.get("path");
+const dropDeepLink = () => {
+  try { const u = new URL(location.href); u.searchParams.delete("path"); history.replaceState(history.state, "", u); } catch { /* no history API */ }
+};
 const dirOf = (p: string) => { const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); return i > 0 ? p.slice(0, i) : "/data/warehouse"; };
 
 interface RunnerCfg { open: boolean; title: string; sharedSql: string | null; jobs: RunJob[]; }
@@ -72,10 +79,9 @@ export function App() {
 
   // Content-only fingerprint (excludes timestamps/id) — the autosave trigger. Memoized so the
   // full-workbench stringify runs only when ws/tabs actually change, not on every render.
-  const contentKey = useMemo(
-    () => (ws ? JSON.stringify({ name: ws.name, connections: ws.connections, saved_queries: ws.saved_queries, variables: ws.variables || [], tabs: buildDoc(ws, tabs).tabs }) : null),
-    [ws, tabs],
-  );
+  const keyOf = (w: Workspace, ts: OpenTab[]) =>
+    JSON.stringify({ name: w.name, connections: w.connections, saved_queries: w.saved_queries, variables: w.variables || [], tabs: buildDoc(w, ts).tabs });
+  const contentKey = useMemo(() => (ws ? keyOf(ws, tabs) : null), [ws, tabs]);
 
   const patchTab = (id: string, p: Partial<OpenTab>) => setTabs((ts) => ts.map((t) => (t.id === id ? { ...t, ...p } : t)));
   const addTab = (t: OpenTab) => { setTabs((ts) => [...ts, t]); setActiveId(t.id); };
@@ -146,6 +152,26 @@ export function App() {
       setWs(w); setWsId(id); setSavedKey(null); setCompareSel(null);
       let t = docToTabs(w);
       const conn0 = w.connections[0];
+      // A deep link wins over whatever the workspace would open: the restored tabs stay, and the
+      // linked source is the active one (its existing tab when it has one, else a new tab).
+      const link = deepLink;
+      if (link) {
+        deepLink = null; dropDeepLink();
+        // Autosave takes the first content after a load as already saved. Name the stored tabs as
+        // that baseline instead, so a tab the link adds is a change and is saved like any other.
+        setSavedKey(keyOf(w, t));
+        if (isWholeDbUri(link)) {
+          setTabs(t); setActiveId(t[0]?.id ?? null);
+          backend.list(link).then(setListing).catch((e) => setErr((e as Error).message));
+        } else {
+          const hit = t.find((x) => x.kind === "data" && x.path === link);
+          if (!hit) t = [...t, newDataTab(link)];
+          setTabs(t); setActiveId((hit ?? t[t.length - 1]).id);
+          loadListingFor(link);
+        }
+        loadHistory(id);
+        return;
+      }
       // Auto-open the first connection as a grid — but NOT a whole-database URI (it has no single
       // table; browse its tables instead so we don't open a tab that errors).
       if (t.length === 0 && conn0 && !isWholeDbUri(conn0.path)) t = [newDataTab(conn0.path, { connId: conn0.id })];
@@ -407,10 +433,10 @@ export function App() {
     ...(active?.kind === "data" && active.sub === "SQL" ? [{ icon: "▶", label: "Run across connections…", hint: "current SQL", run: runAcross }] : []),
     ...(closedTabs.length ? [{ icon: "↺", label: "Reopen closed tab", hint: "Alt+R", run: reopenClosed }] : []),
     { icon: "⤓", label: "Export workspace", run: exportWorkspace },
-    ...(ws?.connections || []).map((c) => ({ icon: "▤", label: c.label, hint: c.path, run: () => openConnection(c) })),
+    ...(ws?.connections || []).map((c) => ({ icon: "▤", label: c.label, hint: displayPath(c.path), run: () => openConnection(c) })),
     ...(ws?.saved_queries || []).map((q) => ({ icon: "λ", label: (q.folder ? q.folder + "/" : "") + q.name, hint: q.sql.replace(/\s+/g, " "), run: () => openQuery(q) })),
-    ...(listing?.entries || []).map((e) => ({ icon: e.kind === "dir" ? "▸" : "▦", label: e.name, hint: e.path, run: () => (e.kind === "dir" ? openDir(e.path) : openPath(e.path)) })),
-    ...tabs.map((t) => ({ icon: "▦", label: "Tab: " + t.title, hint: t.path, run: () => setActiveId(t.id) })),
+    ...(listing?.entries || []).map((e) => ({ icon: e.kind === "dir" ? "▸" : "▦", label: e.name, hint: displayPath(e.path), run: () => (e.kind === "dir" ? openDir(e.path) : openPath(e.path)) })),
+    ...tabs.map((t) => ({ icon: "▦", label: "Tab: " + t.title, hint: displayPath(t.path), run: () => setActiveId(t.id) })),
   ];
 
   return (

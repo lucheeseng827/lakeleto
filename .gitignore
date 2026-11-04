@@ -1,6 +1,9 @@
 # Rust build output
 /target/
 
+# What `make out`, `make api-export` and `make api-arrow` write.
+/out/
+
 # Lakeleto UI (Vite + React + TS) — source in frontend/src, the BUILT bundle in
 # frontend/dist/ IS committed (rust-embed bakes it into the binary; keeps `cargo
 # build` / `cargo install` Node-free). Regenerate with `cd frontend && npm run build`.

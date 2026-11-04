@@ -39,6 +39,10 @@ bar for clarity, test coverage, and keeping the default build lean.
    cargo fmt --all -- --check
    ```
 
+   `make ci` runs what CI runs: format, then lint and test on the lean build, the release
+   feature set and the database set. `make help` lists the rest, from `make serve` to a smoke
+   test of every API endpoint (`make api-smoke`).
+
 2. **Add tests.** New behavior needs a test; bug fixes need a regression test.
    The `serve` router is driven in-process (`tower::ServiceExt::oneshot`, no
    socket); reader work should add a throwaway Parquet/CSV fixture (`tempfile`).

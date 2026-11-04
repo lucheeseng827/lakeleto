@@ -5,7 +5,7 @@
 import { useEffect, useMemo, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode, type SyntheticEvent } from "react";
 import type { Conn, Filters, Row, RunRecord, RunResponse, Sort, Workspace, WsConnection, WsMeta, WsSavedQuery, WsVariable, QueryResp } from "./api";
 import { Button, Chip, filterRows, LakeletoMark, Select, StatTable, TextInput, ThemeToggle } from "./components";
-import { isDatabaseUri } from "./api";
+import { displayPath, isDatabaseUri } from "./api";
 
 const VAR_RE = /\{\{\s*([\w.-]+)\s*\}\}/g;
 /** Substitute `{{key}}` with the workspace variable's value (client-side, Postman-style). Unknown
@@ -186,7 +186,7 @@ export function TabStrip({ tabs, activeId, onSelect, onClose, onNew, onRename, o
         const active = t.id === activeId;
         const isOver = onReorder && overId === t.id && dragId != null && dragId !== t.id;
         return (
-          <div key={t.id} onClick={() => onSelect(t.id)} title={t.path}
+          <div key={t.id} onClick={() => onSelect(t.id)} title={displayPath(t.path)}
             draggable={!!onReorder}
             onDragStart={() => onReorder && setDragId(t.id)}
             onDragEnd={() => { setDragId(null); setOverId(null); }}
@@ -525,7 +525,7 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
           {listing.entries.map((e) => (
             <SideRow key={e.path} icon={e.kind === "dir" ? "▸" : "▦"} label={e.name}
               sub={e.kind === "dir" ? "folder — click to open" : undefined}
-              onClick={() => (e.kind === "dir" ? onOpenDir(e.path) : onOpenFile(e.path))} title={e.path} />
+              onClick={() => (e.kind === "dir" ? onOpenDir(e.path) : onOpenFile(e.path))} title={displayPath(e.path)} />
           ))}
           {listing.entries.length === 0 && listing.parent == null && <div style={hint}>Empty folder.</div>}
         </div>
@@ -556,7 +556,7 @@ export function Sidebar({ ws, listing, mutate, onOpenConnection, onOpenQuery, on
             <SideRow key={c.id} icon={c.format === "database" ? "🗄" : "▤"} label={c.label}
               sub={c.description || (c.format === "database" ? "database" : undefined)}
               onClick={() => onOpenConnection(c)} onDelete={() => delConn(c.id)} onPin={() => pinConn(c.id)} pinned={c.pinned}
-              onEdit={() => { setAddingConn(false); setEditingConn(c); }} title={c.path} />
+              onEdit={() => { setAddingConn(false); setEditingConn(c); }} title={displayPath(c.path)} />
           ))}
         </>
       ),

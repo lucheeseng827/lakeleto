@@ -6,6 +6,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-04
+
+### Fixed
+- **`lakeleto open <file>` opens that file.** The command has always pointed the browser at
+  `/?path=<file>`, but the web app never read the parameter, so it showed whatever the workspace
+  restored, or the folder's first file on a fresh one. The linked file now opens as the active
+  tab: its existing tab when one is open, a new one otherwise, beside the tabs the workspace
+  restored. The parameter is used once and dropped from the address bar, so a reload doesn't
+  reopen it, and the new tab is saved to the workspace like any other.
+- **Windows paths show as `C:\…`, not `\\?\C:\…`.** The server canonicalizes a path to its
+  extended-length form, and the path box already showed it plainly, but the Schema view's
+  `source:` line, the Run across targets, the ⌘K palette, the launcher's connections and the
+  sidebar and tab tooltips showed the raw form. Requests keep the canonical path.
+
 ## [0.4.0] - 2026-10-10
 
 ### Added
@@ -907,7 +921,8 @@ one pluggable trait.
 - Release scaffolding: `LICENSE` (Apache-2.0), `NOTICE`, `CONTRIBUTING.md` (DCO),
   `SECURITY.md`, `CODE_OF_CONDUCT.md`, and this changelog.
 
-[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/lucheeseng827/lakeleto/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.4.0
 [0.3.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.3.0
 [0.2.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.2.0

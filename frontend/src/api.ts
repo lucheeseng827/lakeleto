@@ -128,6 +128,13 @@ export interface Conn { mode: "live" | "sample"; base: string | null; caps: Engi
 export const isDatabaseUri = (p: string): boolean =>
   /^(sqlite|postgres|postgresql|mysql):\/\//i.test((p || "").trim());
 
+/** A path as a person reads it. The server canonicalizes a Windows path to its extended-length
+ *  form (`\\?\C:\…`, `\\?\UNC\host\share\…`), which is the path, but not the one anybody typed or
+ *  would paste into Explorer. Every place the UI SHOWS a path goes through this; requests keep the
+ *  canonical form, so a tab, a listing and a deep link still name the same file. */
+export const displayPath = (p: string): string =>
+  (p || "").replace(/^\\\\\?\\UNC\\/, "\\\\").replace(/^\\\\\?\\/, "");
+
 /** Is this a JSON source? By its extension, as the server detects one (src/format/json.rs). */
 export const isJsonSource = (p: string): boolean => /\.(json|ndjson|jsonl|geojson)$/i.test((p || "").trim());
 

@@ -4,7 +4,7 @@
 // the tab object so they round-trip through the workspace store. SQL "Run" goes up to the shell
 // (onRunSql) so the run is recorded in the workspace history and its result is cached.
 import { useEffect, useState, type CSSProperties } from "react";
-import { isJsonSource, normalizeJsonPath, type Backend, type Conn, type Profile, type Row, type SchemaResp } from "./api";
+import { displayPath, isJsonSource, normalizeJsonPath, type Backend, type Conn, type Profile, type Row, type SchemaResp } from "./api";
 import { Banner, Button, cellText, Chip, DataGrid, filterRows, Select, StatTable, Tabs, TextInput, Textarea } from "./components";
 import { useRowWindows } from "./windows";
 import { usedVars, type OpenTab, type SubView } from "./workspace";
@@ -14,9 +14,8 @@ const fmtInt = (n?: number | null) => (n == null ? "?" : Number(n).toLocaleStrin
 // since an empty struct is left whole by flattening.
 const STRUCT = /^Struct\((?!\))/;
 const basename = (p: string) => { const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); return i >= 0 ? p.slice(i + 1) : p; };
-// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`) so the UI shows and copies
-// a clean `C:\…` path instead of `\\?\C:\…` (the server canonicalizes to the verbatim form).
-const cleanPath = (p: string) => p.replace(/^\\\\\?\\UNC\\/, "\\\\").replace(/^\\\\\?\\/, "");
+// Shows and copies a clean `C:\…` path instead of the server's canonical `\\?\C:\…`.
+const cleanPath = displayPath;
 
 /** One tab's explorer for a single source: its Grid, Schema, Profile and SQL views. */
 export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable, resolve, onOpenRow }: {
@@ -222,7 +221,7 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
       {!shownErr && sub === "Schema" && schema && (
         <div style={pane}>
           <div style={{ color: "var(--muted)", fontSize: "var(--text-12)", marginBottom: 8 }}>
-            source: {schema.source} · format: {schema.format} · engine: {schema.engine} · rows: {fmtInt(schema.row_count)}
+            source: {cleanPath(schema.source)} · format: {schema.format} · engine: {schema.engine} · rows: {fmtInt(schema.row_count)}
           </div>
           <StatTable columns={[{ key: "name", label: "column" }, { key: "data_type", label: "type", type: true }, { key: "nullable", label: "null?" }]}
             rows={schema.columns.map((c) => ({ name: c.name, data_type: c.data_type, nullable: c.nullable ? "yes" : "no" }))} />
