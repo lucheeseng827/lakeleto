@@ -2,28 +2,28 @@
 class Lakeleto < Formula
   desc "Instant local lakehouse-table explorer (Parquet/CSV/Iceberg) in a single binary"
   homepage "https://github.com/lucheeseng827/lakeleto"
-  version "0.4.0"
+  version "0.4.1"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
       url "https://github.com/lucheeseng827/lakeleto/releases/download/v#{version}/lakeleto-aarch64-apple-darwin.tar.gz"
-      sha256 "812c434e19e3d138a431f1b2c10a100885e7874030d4940e0074749abdc2ac69"
+      sha256 "8e4c175247ae444904a8d586f9274d4bad03bae2219614bfb36249b1cb8a6971"
     end
     on_intel do
       url "https://github.com/lucheeseng827/lakeleto/releases/download/v#{version}/lakeleto-x86_64-apple-darwin.tar.gz"
-      sha256 "70e3b4374b2ee8a1074174f8fc7b8ba6c3409488aeced3d39d71af86c4977483"
+      sha256 "984e09111f27d1a3187222d494002458bbfa72ce74d698f387bafffe344a8f1f"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/lucheeseng827/lakeleto/releases/download/v#{version}/lakeleto-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "606d20b795b034bd703cd9b5bcceadba2d521175cae6bb4925b4e584f77ec272"
+      sha256 "dba7da1c5d760f23b706cceb3dfc38e09a99fb23ef4ea561b1cc5fe548531745"
     end
     on_intel do
       url "https://github.com/lucheeseng827/lakeleto/releases/download/v#{version}/lakeleto-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "dafb64eb16fd331d59aa1fa4346dd31ad082ec65e676ef5ecf50fc71846fa01a"
+      sha256 "23e2e162fd57ee85fc8bc0376b948fef12bff0cf504ce24e421a36b9d746ef89"
     end
   end
 
