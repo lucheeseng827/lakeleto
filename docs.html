@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lakeleto docs — the CLI and the UI</title>
+<meta name="description" content="How to use Lakeleto 0.4.1: install, the browser UI (grid, schema, profile, SQL, saved queries, variables, run across, history), every CLI command and flag, sources, MCP, serving safely and configuration.">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<a class="skip-link" href="#doc">Skip to content</a>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="index.html" aria-label="Lakeleto home">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <rect x="4" y="4" width="56" height="56" fill="#14161a"/>
+        <rect x="8" y="8" width="48" height="48" fill="#f2e6ce"/>
+        <rect x="15" y="15" width="34" height="6" fill="#14161a"/>
+        <rect x="15" y="26" width="22" height="6" fill="#1e3a5f"/>
+        <rect x="15" y="37" width="29" height="6" fill="#d14a3a"/>
+        <rect x="15" y="48" width="14" height="6" fill="#5a3e2b"/>
+      </svg>
+      <span>Lakeleto</span>
+    </a>
+    <span class="ver">v0.4.1</span>
+    <div class="nav-spacer"></div>
+    <nav aria-label="Primary"><ul class="nav" id="nav">
+      <li><a href="index.html#live">Live query</a></li>
+      <li><a href="index.html#screens">Screens</a></li>
+      <li><a href="index.html#compare">Compare</a></li>
+      <li><a href="docs.html" aria-current="page">Docs</a></li>
+      <li class="nav-cta"><a href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download</a></li>
+    </ul></nav>
+    <a class="btn btn-primary" href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download</a>
+    <button class="nav-toggle" data-nav-toggle aria-controls="nav" aria-expanded="false" aria-label="Menu">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    </button>
+  </div>
+</header>
+
+<div class="wrap docs">
+  <nav class="toc" aria-label="On this page">
+    <b>Start</b>
+    <a href="#install">Install</a>
+    <a href="#quickstart">Quick start</a>
+    <a href="#ideas">Three ideas</a>
+    <b>The UI</b>
+    <a href="#ui-layout">Layout</a>
+    <a href="#ui-open">Opening a source</a>
+    <a href="#ui-grid">Grid</a>
+    <a href="#ui-row">Row detail</a>
+    <a href="#ui-schema">Schema &amp; profile</a>
+    <a href="#ui-sql">SQL</a>
+    <a href="#ui-history">History &amp; compare</a>
+    <a href="#ui-saved">Saved queries</a>
+    <a href="#ui-vars">Variables</a>
+    <a href="#ui-across">Run across</a>
+    <a href="#ui-export">Export</a>
+    <a href="#ui-db">Databases</a>
+    <a href="#ui-workspaces">Workspaces</a>
+    <a href="#ui-keys">Keyboard</a>
+    <b>The CLI</b>
+    <a href="#cli">Overview</a>
+    <a href="#cli-global">Global flags</a>
+    <a href="#cli-schema">schema</a>
+    <a href="#cli-head">head</a>
+    <a href="#cli-profile">profile</a>
+    <a href="#cli-info">info</a>
+    <a href="#cli-query">query</a>
+    <a href="#cli-output">Output formats</a>
+    <a href="#cli-open">open &amp; serve</a>
+    <a href="#cli-catalog">catalog ls</a>
+    <a href="#cli-engines">engines</a>
+    <a href="#cli-mcp">mcp</a>
+    <b>Sources</b>
+    <a href="#src-files">Files &amp; folders</a>
+    <a href="#src-lake">Iceberg &amp; Delta</a>
+    <a href="#src-cloud">S3, GCS, Azure</a>
+    <a href="#src-catalog">REST catalogs</a>
+    <a href="#src-db">Databases</a>
+    <b>Run it</b>
+    <a href="#safe">Sharing safely</a>
+    <a href="#api">HTTP API</a>
+    <a href="#env">Environment</a>
+    <a href="#trouble">Troubleshooting</a>
+  </nav>
+
+  <article class="doc" id="doc">
+    <h1>Using Lakeleto</h1>
+    <p class="lede">Everything in Lakeleto 0.4.1, in the order you'll need it: install, the browser UI, every CLI command, the sources it reads, and how to run it for others. The examples use <code>orders.parquet</code>, the 5,000-row sample in <code>examples/sample-data/</code>. The outputs shown are what 0.4.0 prints.</p>
+
+    <!-- ===================================================== START -->
+    <h2 id="install">Install</h2>
+    <div class="tw"><table>
+      <thead><tr><th>Platform</th><th>Get it</th><th>Then</th></tr></thead>
+      <tbody>
+        <tr><td>Windows</td><td><code>lakeleto-0.4.1-x64.msi</code> from the <a href="https://github.com/lucheeseng827/lakeleto/releases/latest">release</a></td><td>Double-click. Installs for your user (no admin). Start Menu → <b>Lakeleto</b>. Puts <code>lakeleto</code> on your PATH; open a new terminal.</td></tr>
+        <tr><td>macOS</td><td><code>Lakeleto-0.4.1.dmg</code> (Intel + Apple Silicon)</td><td>Drag to Applications. It lives in the menu bar. Menu bar → <b>Install command line tool…</b> for the CLI.</td></tr>
+        <tr><td>macOS / Linux</td><td><code>brew install lucheeseng827/lakeleto/lakeleto</code></td><td>CLI only.</td></tr>
+        <tr><td>Any, with Rust</td><td><code>cargo binstall lakeleto</code></td><td>Fetches the prebuilt binary for your platform.</td></tr>
+        <tr><td>Docker</td><td><code>mancube/lakeleto</code> (amd64, arm64)</td><td>See <a href="#cli-open">serve</a>.</td></tr>
+        <tr><td>Archive</td><td><code>lakeleto-&lt;target&gt;.tar.gz</code> / <code>.zip</code></td><td>Unzip, run. One static executable. Linux x86_64 and arm64 (static), macOS Intel and Apple Silicon, Windows x86_64.</td></tr>
+        <tr><td>Windows on ARM64</td><td>No prebuilt binary yet</td><td>Build from source with the command below.</td></tr>
+      </tbody>
+    </table></div>
+    <p>Every release asset has a cosign signature (<code>.sig</code>, <code>.pem</code>), a <code>.sha256</code> and SLSA provenance. Windows SmartScreen and macOS Gatekeeper will warn on first launch until code-signing certificates exist. See <a href="#trouble">Troubleshooting</a>.</p>
+    <p>Building from source? The release feature set is:</p>
+    <pre><code>cargo install lakeleto --features serve,sql,iceberg,object-store,catalog,sqlite,postgres,mysql,delta,mcp,remote,parquet-out,compression</code></pre>
+
+    <h2 id="quickstart">Quick start</h2>
+    <h3>In the browser</h3>
+    <ol>
+      <li><b>Installer:</b> open Lakeleto from the Start Menu or Applications. Your browser opens at the viewer.<br><b>Terminal:</b> <code>lakeleto serve --root ~/data</code>, then open <a href="http://127.0.0.1:8080">http://127.0.0.1:8080</a>. Or <code>lakeleto open orders.parquet</code> to start the server and open that file.</li>
+      <li>Click a file in <b>Files</b> on the left. It opens in a tab on the <b>Grid</b>.</li>
+      <li>Click a column header to sort. Type in the box under a header to filter. Switch to <b>Schema</b>, <b>Profile</b> or <b>SQL</b> at the top.</li>
+    </ol>
+    <h3>In the terminal</h3>
+<pre><code><span class="p">$ </span>lakeleto schema orders.parquet          <span class="c"># what's in it</span>
+<span class="p">$ </span>lakeleto head orders.parquet -n 20      <span class="c"># first rows</span>
+<span class="p">$ </span>lakeleto profile --fast orders.parquet  <span class="c"># nulls, min, max from the footer</span>
+<span class="p">$ </span>lakeleto query "SELECT city, count(*) n FROM t GROUP BY city" --file orders.parquet</code></pre>
+
+    <h2 id="ideas">Three ideas</h2>
+    <ul>
+      <li><b>A source is anything you can point at.</b> A file, a folder of Parquet parts, an Iceberg or Delta table, <code>s3://…</code>, <code>catalog://…</code>, or a database URI. Lakeleto reads it where it sits. There's no import step.</li>
+      <li><b>In SQL, the source is the table <code>t</code>.</b> The SQL tab and <code>lakeleto query --file</code> register it as <code>t</code>. Name more tables with <code>--table name=path</code>. A database's SQL uses its own table names.</li>
+      <li><b>Everything is read-only.</b> SQL accepts <code>SELECT</code>, <code>WITH</code> and <code>EXPLAIN</code>; database connections are opened read-only. Export writes a new file.</li>
+    </ul>
+
+    <!-- ===================================================== UI -->
+    <h2 id="ui-layout">The UI: layout</h2>
+    <figure>
+      <img src="assets/shots/sql.jpg" width="2880" height="1720" loading="lazy" alt="The Lakeleto window with its four regions: workspace bar and tabs at the top, sidebar on the left, the tab's views in the middle, history on the right.">
+      <figcaption>Workspace bar and tabs on top. Sidebar left. The open tab in the middle. Run history on the right.</figcaption>
+    </figure>
+    <div class="tw"><table>
+      <thead><tr><th>Region</th><th>What's there</th></tr></thead>
+      <tbody>
+        <tr><td>Workspace bar</td><td>The workspace picker, <b>＋ New</b>, <b>Rename</b>, <b>Export</b>, <b>Import</b>, <b>Delete</b>. On the right: the theme (<b>◐ Auto</b> → <b>☀ Light</b> → <b>☾ Dark</b>), the engine in use, and <b>live</b> when connected.</td></tr>
+        <tr><td>Tabs</td><td>One per open source. <b>▦</b> is a data tab; <b>λ</b> a tab on its SQL view; <b>▤</b> a cached result; <b>⇄</b> a compare. <b>＋</b> opens a new tab.</td></tr>
+        <tr><td>Toolbar</td><td><b>☰ Sidebar</b>, <b>⭑ Save source</b>, <b>Save query</b>, <b>▶ Run across…</b>, <b>⌘K</b> (palette), <b>◷ History</b>.</td></tr>
+        <tr><td>Sidebar</td><td><b>Files</b> (the folder you serve), <b>Connections</b> (saved sources), <b>Saved queries</b>, <b>Variables</b>. Drag the <b>⠿</b> handles to reorder sections; drag tabs to reorder them.</td></tr>
+        <tr><td>Tab views</td><td><b>Grid</b>, <b>Schema</b>, <b>Profile</b>, <b>SQL</b>. Above them: the source path, <b>Copy path</b>, the export format and <b>Download view</b>.</td></tr>
+        <tr><td>History</td><td>Every SQL run in this workspace: rows, time, when. Totals at the top.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="ui-open">Opening a source</h2>
+    <ul>
+      <li><b>Files:</b> click a file to open it in a new tab; click a folder to go into it; <b>↑ ..</b> goes up. A folder of Parquet files, an Iceberg table and a Delta table each open as one table.</li>
+      <li><b>＋ (new tab):</b> type or paste a path, <code>s3://</code> URI, <code>catalog://</code> reference or database URI. <code>{{variables}}</code> work here.</li>
+      <li><b>⌘K:</b> type part of a file or connection name, then <kbd>Enter</kbd>.</li>
+      <li><b>From the terminal:</b> <code>lakeleto open path/to/file</code>.</li>
+    </ul>
+    <p>Click <b>⭑ Save source</b> to pin the tab's source under <b>Connections</b>. Saved connections survive a restart and are what <a href="#ui-across">Run across</a> targets.</p>
+
+    <h2 id="ui-grid">Grid</h2>
+    <figure>
+      <img src="assets/shots/grid.jpg" width="2880" height="1720" loading="lazy" alt="The grid sorted by amount_usd descending with filters on city and quantity.">
+      <figcaption>Sorted by <code>amount_usd</code> (▼), filtered by <code>city</code> and <code>quantity</code>. The footer says 290 matched of 5,000.</figcaption>
+    </figure>
+    <ul>
+      <li><b>Sort:</b> click a header: ascending, again for descending, a third time to clear.</li>
+      <li><b>Filter:</b> type in the box under a header. Filters on several columns combine with AND.</li>
+      <li><b>Copy a cell:</b> click it (or focus it and press <kbd>Enter</kbd>).</li>
+      <li><b>Scroll:</b> all the way. The grid fetches a window of rows as you go. A CSV or JSON file's total isn't known until its end is read, so the footer shows <code>≥ N</code> and grows.</li>
+      <li><b>Footer:</b> rows shown, total, rows scanned, and how many filters are active.</li>
+    </ul>
+    <div class="tw"><table>
+      <thead><tr><th>Type in a filter box</th><th>Matches</th></tr></thead>
+      <tbody>
+        <tr><td><code>Singapore</code> or <code>~Singapore</code></td><td>contains the text</td></tr>
+        <tr><td><code>!~test</code></td><td>doesn't contain it</td></tr>
+        <tr><td><code>^cust_00</code>, <code>$_9</code></td><td>starts with / ends with</td></tr>
+        <tr><td><code>&gt;= 100</code>, <code>&gt; 100</code>, <code>&lt; 5</code>, <code>&lt;= 5</code></td><td>comparisons</td></tr>
+        <tr><td><code>= pro</code>, <code>!= free</code></td><td>equal / not equal</td></tr>
+        <tr><td><code>in: pro, enterprise</code></td><td>any of a comma-separated list</td></tr>
+        <tr><td><code>null</code>, <code>!null</code></td><td>empty / not empty</td></tr>
+      </tbody>
+    </table></div>
+    <p>With SQL in the build (the release has it), sort and filter run in the engine over the whole table and are exact. Without it, they run over the first 200,000 rows and the footer says the view is partial.</p>
+    <p><b>JSON sources</b> get a <b>Records</b> button: where in the document the rows are (<code>/data · auto</code> when detected). Sources with struct columns get <b>Flatten structs</b>, which turns <code>user.geo.lat</code> into its own column.</p>
+
+    <h2 id="ui-row">Row detail</h2>
+    <figure>
+      <img src="assets/shots/row-detail.jpg" width="2880" height="1720" loading="lazy" alt="The row detail panel listing one row's fields.">
+      <figcaption>Click a row number. <kbd>Esc</kbd> closes it.</figcaption>
+    </figure>
+    <ul>
+      <li><b>JSON</b> copies the row as a JSON object.</li>
+      <li><b>WHERE</b> copies a clause matching this row, quoted for the source's SQL dialect. Paste it to find the row again.</li>
+      <li><b>INSERT</b> copies an <code>INSERT INTO … VALUES …</code> for seeding a test fixture.</li>
+    </ul>
+
+    <h2 id="ui-schema">Schema and Profile</h2>
+    <figure>
+      <img src="assets/shots/profile.jpg" width="2880" height="1720" loading="lazy" alt="The profile view with null counts and ranges.">
+      <figcaption>Profile: nulls, null %, distinct, min, max for each column.</figcaption>
+    </figure>
+    <p><b>Schema</b> lists each column's name, Arrow type and nullability, plus the format, engine and row count. For Parquet and Arrow files the count comes from the footer.</p>
+    <p><b>Profile</b> scans up to 10,000 rows by default (<code>--default-scan</code> on the server changes it). It respects the grid's filters, so filter first to profile a slice.</p>
+
+    <h2 id="ui-sql">SQL</h2>
+    <figure>
+      <img src="assets/shots/sql-dark.jpg" width="2880" height="1720" loading="lazy" alt="A SQL query and its result in dark mode.">
+      <figcaption>Write SQL against <code>t</code>. <kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>Enter</kbd> or <b>Run</b>.</figcaption>
+    </figure>
+    <ul>
+      <li>The tab's source is the table <code>t</code>. Partition columns from Hive folders are real columns.</li>
+      <li>SQL is <a href="https://datafusion.apache.org/user-guide/sql/index.html">DataFusion's dialect</a>: <code>date_trunc</code>, window functions, CTEs, <code>regexp_like</code> and so on. On a database connection it's the database's own SQL.</li>
+      <li><b>search result…</b> narrows the result rows on screen. The <b>›</b> on a row opens its detail.</li>
+      <li>The result count and time show under the table. The run goes to <b>History</b>.</li>
+    </ul>
+
+    <h2 id="ui-history">History and compare</h2>
+    <ul>
+      <li><b>◷ History</b> toggles the panel. Each run shows its SQL, source, rows, time and age. Click one to reopen the query in a SQL tab.</li>
+      <li>Tick <b>Save result rows</b> to cache results (as Parquet, in the workspace). A cached run reopens instantly without re-reading the source.</li>
+      <li><b>Compare:</b> on two cached runs, click compare on each. A <b>⇄</b> tab shows them side by side with a diff summary.</li>
+    </ul>
+
+    <h2 id="ui-saved">Saved queries</h2>
+    <figure>
+      <img src="assets/shots/workbench.jpg" width="2880" height="1720" loading="lazy" alt="A saved query filed under reports, and a variable.">
+      <figcaption><code>reports/big-orders-by-tier</code>, saved from the SQL tab, using <code>{{min_amt}}</code>.</figcaption>
+    </figure>
+    <ul>
+      <li>On a SQL tab, click <b>Save query</b> and name it. A name with a slash, like <code>reports/daily</code>, files it in a folder.</li>
+      <li>Click a saved query to open it. The <b>▶</b> on a folder runs every query in it, each with its own SQL and source: a report pack.</li>
+    </ul>
+
+    <h2 id="ui-vars">Variables</h2>
+    <p>Sidebar → <b>＋ Variable</b> → a key and a value. Use <code>{{key}}</code> in SQL or in a path. It's substituted as text right before the query runs.</p>
+<pre><code>SELECT * FROM t WHERE city = '{{city}}'        <span class="c">-- quote strings yourself</span>
+SELECT * FROM t WHERE amount_usd &gt; {{min_amt}}  <span class="c">-- numbers bare</span>
+C:\exports\orders-{{day}}.parquet               <span class="c">-- in the path box too</span>
+postgres://me:{{PGPASS}}@db:5432/shop            <span class="c">-- secrets stay out of saved URIs</span></code></pre>
+    <p>An unset <code>{{x}}</code> shows a warning chip until you define it. It's a text substitution, not a bound parameter, so don't paste untrusted text into a value.</p>
+
+    <h2 id="ui-across">Run across</h2>
+    <figure>
+      <img src="assets/shots/run-across.jpg" width="2880" height="1720" loading="lazy" alt="Run across connections: one query over four saved sources.">
+      <figcaption>One query over three monthly exports and the full file, each with its own result.</figcaption>
+    </figure>
+    <ol>
+      <li>Save each source you want with <b>⭑ Save source</b>.</li>
+      <li>On a SQL tab, write a query against <code>t</code>.</li>
+      <li><b>▶ Run across…</b> → tick the targets → <b>Run</b>. Each result has an <b>open</b> button. A source whose columns don't fit fails on its own row only.</li>
+    </ol>
+
+    <h2 id="ui-export">Export</h2>
+    <p>Pick <b>CSV</b>, <b>JSON</b> or <b>Parquet</b> next to <b>Download view</b> (the API's <code>/v1/export</code> also does TSV and NDJSON). You get the view as it is, with its sort, filters and columns, over every matching row, not only those on screen. The cap is 1,000,000 rows and 512 MiB per file.</p>
+
+    <h2 id="ui-db">Databases in the UI</h2>
+    <p>Sidebar <b>Connections → ＋</b> → SQLite, Postgres or MySQL → paste the URI, optionally a table → <b>Add</b>. A whole-database connection lists its tables; click one to open it. The ✎ on a connection edits it.</p>
+<pre><code>sqlite:///C:/data/app.db
+sqlite:///home/me/app.db?table=orders
+postgres://user:{{PGPASS}}@host:5432/shop
+mysql://user:{{MYSQLPASS}}@host:3306/shop</code></pre>
+    <p>The open-source build allows two database connections open at once.</p>
+
+    <h2 id="ui-workspaces">Workspaces</h2>
+    <p>A workspace holds your tabs, connections, saved queries, variables and history. Switch with the picker; <b>＋ New</b>, <b>Rename</b>, <b>Delete</b> do what they say. <b>Export</b> downloads a bundle and <b>Import</b> loads one as a new workspace, so you can hand a set of queries to a colleague.</p>
+    <p>They're stored in <code>~/.lakeleto/workspaces/&lt;id&gt;/</code> (<code>workspace.json</code>, <code>history.jsonl</code>, <code>results/*.parquet</code>). Set <code>LAKELETO_HOME</code> to move them.</p>
+
+    <h2 id="ui-keys">Keyboard</h2>
+    <figure>
+      <img src="assets/shots/palette.jpg" width="2880" height="1720" loading="lazy" alt="The command palette.">
+      <figcaption>The command palette: files, tabs, connections, saved queries and commands.</figcaption>
+    </figure>
+    <div class="tw"><table>
+      <thead><tr><th>Keys</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>Ctrl</kbd>/<kbd>⌘</kbd> <kbd>K</kbd></td><td>Command palette (<kbd>↑</kbd> <kbd>↓</kbd>, <kbd>Enter</kbd>, <kbd>Esc</kbd>)</td></tr>
+        <tr><td><kbd>Ctrl</kbd>/<kbd>⌘</kbd> <kbd>Enter</kbd></td><td>Run the SQL tab's query</td></tr>
+        <tr><td><kbd>Ctrl</kbd>/<kbd>⌘</kbd> <kbd>B</kbd></td><td>Show / hide the sidebar</td></tr>
+        <tr><td><kbd>Alt</kbd> <kbd>T</kbd></td><td>New tab</td></tr>
+        <tr><td><kbd>Alt</kbd> <kbd>W</kbd></td><td>Close tab</td></tr>
+        <tr><td><kbd>Alt</kbd> <kbd>R</kbd></td><td>Reopen the last closed tab</td></tr>
+        <tr><td><kbd>Alt</kbd> <kbd>←</kbd> / <kbd>→</kbd></td><td>Previous / next tab</td></tr>
+        <tr><td><kbd>Esc</kbd></td><td>Close the palette, row detail or a dialog</td></tr>
+        <tr><td><kbd>Enter</kbd> / <kbd>Space</kbd></td><td>On a header: sort. On a cell: copy. On a row number: detail.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The <kbd>Alt</kbd> and <kbd>Ctrl</kbd>+<kbd>B</kbd> shortcuts don't fire while you're typing in a box.</p>
+
+    <!-- ===================================================== CLI -->
+    <h2 id="cli">The CLI</h2>
+    <p class="synopsis">lakeleto [OPTIONS] &lt;COMMAND&gt;</p>
+    <div class="tw"><table>
+      <thead><tr><th>Command</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><a href="#cli-schema"><code>schema</code></a></td><td>Columns, types, nullability, row count</td></tr>
+        <tr><td><a href="#cli-head"><code>head</code></a></td><td>The first N rows</td></tr>
+        <tr><td><a href="#cli-profile"><code>profile</code></a></td><td>Null %, distinct, min/max per column</td></tr>
+        <tr><td><a href="#cli-info"><code>info</code></a></td><td>Format, engine, size, rows, columns</td></tr>
+        <tr><td><a href="#cli-query"><code>query</code></a></td><td>Read-only SQL over one or more tables</td></tr>
+        <tr><td><a href="#cli-open"><code>open</code></a></td><td>Start the UI and open a file in the browser</td></tr>
+        <tr><td><a href="#cli-open"><code>serve</code></a></td><td>Serve the UI and the HTTP API</td></tr>
+        <tr><td><a href="#cli-catalog"><code>catalog ls</code></a></td><td>Browse Iceberg REST catalogs</td></tr>
+        <tr><td><a href="#cli-engines"><code>engines</code></a></td><td>What this binary can read</td></tr>
+        <tr><td><a href="#cli-mcp"><code>mcp</code></a></td><td>Serve tables to an AI agent over MCP</td></tr>
+      </tbody>
+    </table></div>
+    <p>Anywhere a <code>&lt;PATH&gt;</code> goes, you can give a local file or folder, <code>s3://</code>, <code>gs://</code>, <code>az://</code>, <code>catalog://</code> or a database URI. <code>lakeleto &lt;command&gt; --help</code> prints the full help.</p>
+
+    <h3 id="cli-global">Global flags</h3>
+    <div class="tw"><table>
+      <thead><tr><th>Flag</th><th>Default</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>-o, --output &lt;FMT&gt;</code></td><td><code>table</code></td><td><code>table</code>, <code>json</code>, <code>ndjson</code>, <code>csv</code>, <code>tsv</code>; for rows also <code>parquet</code>, <code>arrow</code>, <code>arrows</code>. See <a href="#cli-output">Output formats</a>.</td></tr>
+        <tr><td><code>--out &lt;FILE&gt;</code></td><td>stdout</td><td>Write to a file. It appears only if the command succeeds. With no <code>-o</code>, the extension picks the format.</td></tr>
+        <tr><td><code>--format &lt;NAME&gt;</code></td><td>inferred</td><td>Read as <code>parquet</code>, <code>csv</code>, <code>tsv</code>, <code>json</code>, <code>arrow</code>, <code>iceberg</code>, <code>delta</code> or <code>database</code>.</td></tr>
+        <tr><td><code>--json-path &lt;POINTER&gt;</code></td><td>detected</td><td>Where a JSON document's rows are: <code>/response/items</code> or <code>data</code>. <code>""</code> reads the whole document as one row.</td></tr>
+        <tr><td><code>--flatten[=N]</code></td><td>off</td><td>Spread struct columns into <code>a.b.c</code> columns; <code>=1</code> for one level.</td></tr>
+        <tr><td><code>--max-decompressed &lt;BYTES&gt;</code></td><td><code>4GiB</code></td><td>Stop a compressed read past this size (<code>512M</code>, <code>8GiB</code>). Env <code>LAKELETO_MAX_DECOMPRESSED</code>.</td></tr>
+        <tr><td><code>--engine &lt;E&gt;</code></td><td><code>auto</code></td><td><code>auto</code>, <code>local</code>, <code>sql</code>, <code>remote</code>.</td></tr>
+        <tr><td><code>--remote-url &lt;URL&gt;</code></td><td>—</td><td>Read through another Lakeleto server instead of this machine. Env <code>LAKELETO_REMOTE_URL</code>.</td></tr>
+        <tr><td><code>--remote-token &lt;TOK&gt;</code></td><td>—</td><td>Bearer token for it. Env <code>LAKELETO_REMOTE_TOKEN</code>.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3 id="cli-schema">schema</h3>
+    <p class="synopsis">lakeleto schema &lt;PATH&gt;</p>
+    <p>Columns, types and nullability. For Parquet and Arrow the row count is read from the footer, without reading rows.</p>
+<pre><code><span class="p">$ </span>lakeleto schema orders.parquet</code></pre>
+<pre class="out"><code>source : orders.parquet
+format : parquet
+engine : local
+rows   : 5000
+columns: 11
+
+column        type           null?
+------------  -------------  -----
+order_id      Int32          yes
+customer      Utf8           yes
+city          Utf8           yes
+tier          Utf8           yes
+amount_usd    Float64        yes
+quantity      Int32          yes
+discount_pct  Float64        yes
+is_refunded   Boolean        yes
+rating        Float64        yes
+order_ts      Timestamp(ns)  yes
+ship_date     Date32         yes</code></pre>
+
+    <h3 id="cli-head">head</h3>
+    <p class="synopsis">lakeleto head &lt;PATH&gt; [-n, --rows &lt;N&gt;]</p>
+    <p>The first <code>N</code> rows (default 10). Reads only as far as it needs.</p>
+<pre><code><span class="p">$ </span>lakeleto head orders.parquet -n 5</code></pre>
+<pre class="out"><code>| order_id | customer  | city     | tier       | amount_usd | quantity | discount_pct | is_refunded | rating | order_ts            | ship_date  |
+|----------|-----------|----------|------------|------------|----------|--------------|-------------|--------|---------------------|------------|
+| 100000   | cust_0332 | Berlin   | pro        | 23.29      | 13       | 0.05         | false       | 3.0    | 2024-06-13T04:40:00 | 2024-01-22 |
+| 100001   | cust_0155 | Nairobi  | enterprise | 66.53      | 1        | 0.0          | false       | 4.0    | 2024-03-10T08:12:00 | 2024-02-03 |
+| 100002   | cust_0405 | Toronto  | free       | 164.86     | 12       | 0.1          | false       | 1.0    | 2024-06-21T00:31:00 | 2024-06-12 |
+| 100003   | cust_0667 | New York | pro        | 59.14      | 16       | 0.25         | false       | 4.0    | 2024-02-24T12:57:00 | 2024-01-11 |
+| 100004   | cust_0050 | New York | free       | 53.34      | 16       | 0.05         | false       | 4.0    | 2024-04-02T18:46:00 | 2024-04-05 |
+
+5 row(s)</code></pre>
+
+    <h3 id="cli-profile">profile</h3>
+    <p class="synopsis">lakeleto profile &lt;PATH&gt; [--scan &lt;N&gt;] [--fast]</p>
+    <div class="tw"><table>
+      <thead><tr><th>Flag</th><th>Default</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>--scan &lt;N&gt;</code></td><td>10000</td><td>Rows to scan for nulls, distinct values, min, max and samples.</td></tr>
+        <tr><td><code>--fast</code></td><td>off</td><td>Parquet only: nulls, min and max from the footer for the whole file, no scan. No distinct counts.</td></tr>
+      </tbody>
+    </table></div>
+<pre><code><span class="p">$ </span>lakeleto profile orders.csv</code></pre>
+<pre class="out"><code>source : orders.csv
+engine : local
+rows   : unknown (scanned 5000)
+
+| column       | type         | nulls | null% | distinct | min                 | max                 |
+|--------------|--------------|-------|-------|----------|---------------------|---------------------|
+| order_id     | Int64        | 0     | 0.0%  | 5000     | 100000              | 104999              |
+| customer     | Utf8         | 242   | 4.8%  | 898      | cust_0001           | cust_0900           |
+| city         | Utf8         | 0     | 0.0%  | 10       | Berlin              | Toronto             |
+| tier         | Utf8         | 0     | 0.0%  | 3        | enterprise          | pro                 |
+| amount_usd   | Float64      | 0     | 0.0%  | 4531     | 5.01                | 1172.35             |
+| quantity     | Int64        | 0     | 0.0%  | 19       | 1                   | 19                  |
+| discount_pct | Float64      | 0     | 0.0%  | 5        | 0                   | 0.25                |
+| is_refunded  | Boolean      | 0     | 0.0%  | 2        | false               | true                |
+| rating       | Float64      | 774   | 15.5% | 5        | 1                   | 5                   |
+| order_ts     | Timestamp(s) | 0     | 0.0%  | 4953     | 2024-01-01T00:59:00 | 2024-06-28T22:13:00 |
+| ship_date    | Date32       | 0     | 0.0%  | 180      | 2024-01-01          | 2024-06-28          |</code></pre>
+
+    <h3 id="cli-info">info</h3>
+    <p class="synopsis">lakeleto info &lt;PATH&gt;</p>
+<pre><code><span class="p">$ </span>lakeleto info orders.parquet</code></pre>
+<pre class="out"><code>path   : orders.parquet
+format : parquet
+engine : local
+size   : 115.1 KiB
+rows   : 5000
+columns: 11</code></pre>
+    <p>For a <code>catalog://</code> table, <code>info</code> also says whose credentials read it: <code>vended</code>, <code>catalog</code> or <code>ambient</code>.</p>
+
+    <h3 id="cli-query">query</h3>
+    <p class="synopsis">lakeleto query &lt;SQL&gt; [--file &lt;PATH&gt;] [--table &lt;NAME=PATH&gt;]…</p>
+    <div class="tw"><table>
+      <thead><tr><th>Flag</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>--file &lt;PATH&gt;</code></td><td>Register a source as the table <code>t</code>.</td></tr>
+        <tr><td><code>--table &lt;NAME=PATH&gt;</code></td><td>Register a source under a name. Repeat for joins.</td></tr>
+      </tbody>
+    </table></div>
+    <p>One <code>SELECT</code>, <code>WITH</code> or <code>EXPLAIN</code> statement. Anything that writes is refused. With a database URI, the SQL runs in the database and names its tables.</p>
+<pre><code><span class="p">$ </span>lakeleto query "SELECT city, count(*) AS orders, round(sum(amount_usd), 2) AS revenue
+    FROM t GROUP BY city ORDER BY revenue DESC LIMIT 5" --file orders.parquet</code></pre>
+<pre class="out"><code>| city      | orders | revenue  |
+|-----------|--------|----------|
+| Sydney    | 503    | 66834.05 |
+| Toronto   | 517    | 66242.49 |
+| Mumbai    | 515    | 65590.18 |
+| Singapore | 550    | 64419.91 |
+| London    | 493    | 62170.92 |
+
+5 row(s)</code></pre>
+<pre><code><span class="c"># join two sources</span>
+<span class="p">$ </span>lakeleto query "SELECT o.city, avg(p.score) FROM o JOIN p ON o.city = p.city GROUP BY 1" \
+    --table o=orders.parquet --table p=people.csv
+
+<span class="c"># a whole SQLite database: its own table names</span>
+<span class="p">$ </span>lakeleto query "SELECT city, count(*) FROM orders GROUP BY city" --file 'sqlite:///home/me/app.db'
+
+<span class="c"># a catalog table</span>
+<span class="p">$ </span>lakeleto query "SELECT count(*) FROM t" --table t=catalog://prod/sales/orders</code></pre>
+
+    <h3 id="cli-output">Output formats</h3>
+    <div class="tw"><table>
+      <thead><tr><th><code>-o</code></th><th>For</th></tr></thead>
+      <tbody>
+        <tr><td><code>table</code></td><td>Reading in a terminal (the default)</td></tr>
+        <tr><td><code>json</code>, <code>ndjson</code></td><td><code>jq</code>, scripts</td></tr>
+        <tr><td><code>csv</code>, <code>tsv</code></td><td>Spreadsheets. Nested values become JSON text in the cell.</td></tr>
+        <tr><td><code>parquet</code></td><td>DuckDB, Polars, pandas, Spark, with types kept</td></tr>
+        <tr><td><code>arrow</code></td><td>Arrow IPC file / Feather v2: <code>pandas.read_feather</code>, <code>polars.read_ipc</code></td></tr>
+        <tr><td><code>arrows</code></td><td>Arrow IPC stream, to pipe: <code>polars.read_ipc_stream(sys.stdin.buffer)</code></td></tr>
+      </tbody>
+    </table></div>
+<pre><code><span class="p">$ </span>lakeleto head orders.parquet -n 5 -o csv</code></pre>
+<pre class="out"><code>order_id,customer,city,tier,amount_usd,quantity,discount_pct,is_refunded,rating,order_ts,ship_date
+100000,cust_0332,Berlin,pro,23.29,13,0.05,false,3.0,2024-06-13T04:40:00,2024-01-22
+100001,cust_0155,Nairobi,enterprise,66.53,1,0.0,false,4.0,2024-03-10T08:12:00,2024-02-03
+100002,cust_0405,Toronto,free,164.86,12,0.1,false,1.0,2024-06-21T00:31:00,2024-06-12
+100003,cust_0667,New York,pro,59.14,16,0.25,false,4.0,2024-02-24T12:57:00,2024-01-11
+100004,cust_0050,New York,free,53.34,16,0.05,false,4.0,2024-04-02T18:46:00,2024-04-05</code></pre>
+<pre><code><span class="c"># a filtered slice as a Parquet file, then into DuckDB</span>
+<span class="p">$ </span>lakeleto query "SELECT * FROM t WHERE amount_usd &gt; 100" --file orders.csv --out big.parquet
+<span class="p">$ </span>duckdb -c "SELECT city, sum(amount_usd) FROM 'big.parquet' GROUP BY city"
+
+<span class="c"># an Arrow stream straight into Polars</span>
+<span class="p">$ </span>lakeleto head orders.parquet -n 100000 -o arrows | python -c "import sys, polars as pl; print(pl.read_ipc_stream(sys.stdin.buffer).describe())"</code></pre>
+    <p>The binary formats are refused when stdout is a terminal: use <code>--out</code>, a redirect or a pipe.</p>
+
+    <h3 id="cli-open">open and serve</h3>
+    <p class="synopsis">lakeleto open &lt;PATH&gt; [--addr …] [--root …] [--token …] [--default-scan …]</p>
+    <p class="synopsis">lakeleto serve [--addr …] [--root …] [--token …] [--default-scan …] [--workspace-remote …]</p>
+    <div class="tw"><table>
+      <thead><tr><th>Flag</th><th>Default</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>--addr &lt;HOST:PORT&gt;</code></td><td><code>127.0.0.1:8080</code></td><td>Where to listen. Env <code>LAKELETO_ADDR</code>.</td></tr>
+        <tr><td><code>--root &lt;DIR&gt;</code></td><td>any path</td><td>Refuse every read outside this folder, and all bucket, catalog and database URIs.</td></tr>
+        <tr><td><code>--token &lt;TOK&gt;</code></td><td>none (open)</td><td>Require <code>Authorization: Bearer &lt;TOK&gt;</code> on <code>/v1/*</code>. Env <code>LAKELETO_TOKEN</code>.</td></tr>
+        <tr><td><code>--default-scan &lt;N&gt;</code></td><td>10000</td><td>Rows the Profile view scans.</td></tr>
+        <tr><td><code>--workspace-remote &lt;URL&gt;</code></td><td>local disk</td><td><code>serve</code> only: keep workspaces on another server. Env <code>LAKELETO_WORKSPACE_REMOTE</code>, token <code>LAKELETO_WORKSPACE_REMOTE_TOKEN</code>.</td></tr>
+      </tbody>
+    </table></div>
+<pre><code><span class="p">$ </span>lakeleto open orders.parquet                     <span class="c"># browser opens on the file</span>
+<span class="p">$ </span>lakeleto serve --root ~/data                     <span class="c"># browse a folder at :8080</span>
+<span class="p">$ </span>lakeleto serve --addr 127.0.0.1:8090              <span class="c"># another port</span>
+<span class="p">$ </span>docker run --rm -p 127.0.0.1:8080:8080 -v "$PWD:/data:ro" \
+    mancube/lakeleto serve --addr 0.0.0.0:8080 --root /data</code></pre>
+    <p>Stop it with <kbd>Ctrl</kbd>+<kbd>C</kbd>. The installed desktop app picks a free port itself and lives in the tray / menu bar, where <b>Quit</b> is.</p>
+
+    <h3 id="cli-catalog">catalog ls</h3>
+    <p class="synopsis">lakeleto catalog ls [REFERENCE]</p>
+<pre><code><span class="p">$ </span>lakeleto catalog ls                         <span class="c"># configured catalogs (no network call)</span>
+<span class="p">$ </span>lakeleto catalog ls catalog://prod/         <span class="c"># prod's namespaces</span>
+<span class="p">$ </span>lakeleto catalog ls catalog://prod/sales/   <span class="c"># namespaces and tables in sales</span></code></pre>
+    <p>It prints names, types and URIs, never a credential. Setup is in <a href="#src-catalog">REST catalogs</a>.</p>
+
+    <h3 id="cli-engines">engines</h3>
+    <p>What this binary was built with. The release binary has everything. A source build lists what's missing and the feature that adds it. With <code>--remote-url</code> it reports the server's engines.</p>
+<pre class="out"><code>Lakeleto engine backends:
+
+  ✓ local (built-in reader)          reads: parquet, csv, tsv, json, arrow, iceberg, delta
+  ✓ sql (DataFusion)                 reads: parquet, csv, tsv, json, arrow, iceberg, delta + read-only SQL
+  ✓ iceberg (reader)                 reads: iceberg tables (current-snapshot Parquet)
+  ✓ delta (reader)                   reads: delta lake tables (JSON transaction log)
+  ✓ object-store (s3/gs/az)          reads: remote parquet, csv, tsv, json and arrow via your own creds
+  ✓ catalog (Iceberg REST)           reads: catalog:// tables, with the credentials the catalog vends
+  ✓ sqlite (read-only)               reads: sqlite files + connection URIs
+  …</code></pre>
+
+    <h3 id="cli-mcp">mcp</h3>
+    <p class="synopsis">lakeleto mcp [--root &lt;DIR&gt;] [--max-rows N] [--max-bytes N] [--timeout SECS] [--default-scan N]</p>
+    <p>Lets an AI agent read your tables over the Model Context Protocol, on stdin and stdout. The agent's client starts it; you don't run it yourself.</p>
+<pre><code><span class="c"># Claude Code, confined to ./data</span>
+<span class="p">$ </span>claude mcp add lakeleto -- lakeleto mcp --root "$PWD/data"</code></pre>
+<pre><code><span class="c">// Claude Desktop, Cursor (.cursor/mcp.json), or a project .mcp.json</span>
+{
+  "mcpServers": {
+    "lakeleto": { "command": "lakeleto", "args": ["mcp", "--root", "/Users/me/data"] }
+  }
+}</code></pre>
+    <div class="tw"><table>
+      <thead><tr><th>Tool</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>list</code></td><td>A folder's subfolders and tables; also a bucket prefix, a database or a catalog namespace</td></tr>
+        <tr><td><code>describe</code></td><td>Columns, types, row count, and Parquet footer stats, without reading rows</td></tr>
+        <tr><td><code>preview</code></td><td>Rows from any offset, optionally some columns</td></tr>
+        <tr><td><code>profile</code></td><td>Nulls, distinct, min, max, samples</td></tr>
+        <tr><td><code>query</code></td><td>One read-only SQL statement</td></tr>
+        <tr><td><code>catalog_ls</code></td><td>Catalogs, namespaces, tables</td></tr>
+      </tbody>
+    </table></div>
+    <div class="tw"><table>
+      <thead><tr><th>Flag</th><th>Default</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>--root</code></td><td>any path</td><td>Only this folder; bucket, database and catalog references are refused</td></tr>
+        <tr><td><code>--max-rows</code></td><td>1000</td><td>Most rows per call</td></tr>
+        <tr><td><code>--max-bytes</code></td><td>32768</td><td>Most bytes of JSON per call; a cut result says <code>truncated</code></td></tr>
+        <tr><td><code>--timeout</code></td><td>30</td><td>Seconds per call</td></tr>
+      </tbody>
+    </table></div>
+    <p class="note">The agent sees what the tools return, and so does the service that runs it. Point <code>--root</code> at data you're fine with both reading.</p>
+
+    <!-- ===================================================== SOURCES -->
+    <h2 id="src-files">Sources: files and folders</h2>
+    <div class="tw"><table>
+      <thead><tr><th>Source</th><th>Recognised by</th></tr></thead>
+      <tbody>
+        <tr><td>Parquet</td><td><code>.parquet</code>, <code>.pq</code>, or its magic bytes. Snappy, gzip, LZ4, zstd, Brotli.</td></tr>
+        <tr><td>CSV / TSV</td><td><code>.csv</code>, <code>.tsv</code>. Types are inferred.</td></tr>
+        <tr><td>JSON</td><td><code>.json</code>, <code>.ndjson</code>, <code>.jsonl</code>, <code>.geojson</code>. NDJSON, a top-level array, or one records member like <code>{"data": [...]}</code>, detected.</td></tr>
+        <tr><td>Arrow</td><td><code>.arrow</code>, <code>.feather</code>, <code>.ipc</code> files and <code>.arrows</code> streams.</td></tr>
+        <tr><td>Compressed text</td><td><code>.csv.gz</code>, <code>.ndjson.zst</code>, <code>.tsv.bz2</code>, <code>.json.xz</code>, read as they decompress</td></tr>
+        <tr><td>A folder of Parquet</td><td>Read as one table, columns unioned. <code>key=value</code> folders (Hive partitions) become columns.</td></tr>
+      </tbody>
+    </table></div>
+<pre><code>warehouse/orders/date=2026-07-17/part-0.parquet
+warehouse/orders/date=2026-07-18/part-0.parquet
+
+<span class="p">$ </span>lakeleto query "SELECT date, count(*) FROM t GROUP BY date" --file warehouse/orders/</code></pre>
+
+    <h2 id="src-lake">Iceberg and Delta</h2>
+    <ul>
+      <li><b>Iceberg:</b> a folder with a <code>metadata/</code> child. Lakeleto reads the current snapshot, with positional and equality deletes applied. Locally or in a bucket.</li>
+      <li><b>Delta:</b> a folder with <code>_delta_log/</code>. Lakeleto replays the JSON log, so overwritten and deleted rows don't show. Checkpoints aren't read yet: if log cleanup removed early commits, the table may not open or may undercount. <code>VACUUM</code> is fine.</li>
+    </ul>
+<pre><code><span class="p">$ </span>lakeleto open ./warehouse/db/orders
+<span class="p">$ </span>lakeleto open s3://my-bucket/warehouse/db/orders</code></pre>
+
+    <h2 id="src-cloud">S3, GCS and Azure</h2>
+    <p>Credentials come from your environment, exactly as the cloud SDKs read them. Bytes go from the bucket to your machine. Parquet and Arrow are read with ranged requests, so only the footer and the parts a read needs are fetched.</p>
+<pre><code><span class="p">$ </span>export AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=… AWS_REGION=us-east-1
+<span class="p">$ </span>lakeleto schema s3://my-bucket/events/2026-07-18.parquet
+<span class="p">$ </span>export AWS_ENDPOINT=https://…         <span class="c"># MinIO, R2 and other S3-compatible stores</span>
+
+<span class="p">$ </span>export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
+<span class="p">$ </span>lakeleto profile gs://my-bucket/events.parquet
+
+<span class="p">$ </span>export AZURE_STORAGE_ACCOUNT_NAME=… AZURE_STORAGE_ACCOUNT_KEY=…
+<span class="p">$ </span>lakeleto head az://my-container/events.parquet</code></pre>
+    <p>In the UI, paste <code>s3://my-bucket/warehouse/</code> into a new tab to browse the prefix. Schemes: <code>s3</code>/<code>s3a</code>, <code>gs</code>/<code>gcs</code>, <code>az</code>/<code>azure</code>/<code>abfs</code>/<code>abfss</code>/<code>adl</code>.</p>
+    <p class="note"><code>--root</code> refuses bucket URIs. Run without it when you read remote data.</p>
+
+    <h2 id="src-catalog">Iceberg REST catalogs</h2>
+    <p>Name a table by catalog instead of by location: <code>catalog://&lt;catalog&gt;/&lt;namespace&gt;/&lt;table&gt;</code>. Tested against Apache Polaris and Lakekeeper; Nessie and Unity Catalog speak the same protocol.</p>
+<pre><code><span class="c"># ~/.lakeleto/catalogs.toml</span>
+[catalog.prod]
+uri = "https://polaris.example.com/api/catalog"
+warehouse = "analytics"
+oauth2-server-uri = "https://polaris.example.com/api/catalog/v1/oauth/tokens"
+
+<span class="c"># the secret stays out of the file</span>
+<span class="p">$ </span>export LAKELETO_CATALOG__PROD__CREDENTIAL='&lt;client-id&gt;:&lt;client-secret&gt;'
+<span class="p">$ </span>lakeleto open catalog://prod/sales/orders</code></pre>
+    <p>Any key can also be set as <code>LAKELETO_CATALOG__&lt;NAME&gt;__&lt;KEY&gt;</code>. Credentials the catalog vends are kept in memory and refreshed before they expire. Glue and S3 Tables need request signing, which isn't supported yet.</p>
+
+    <h2 id="src-db">Databases</h2>
+<pre><code><span class="p">$ </span>lakeleto head   'sqlite:///home/me/app.db?table=orders'
+<span class="p">$ </span>lakeleto schema 'postgres://me@db:5432/shop?table=orders'
+<span class="p">$ </span>lakeleto query  "SELECT city, count(*) FROM orders GROUP BY 1" --file 'mysql://me@db:3306/shop'</code></pre>
+    <p>Connections are read-only. Without <code>?table=</code> a URI names the whole database: the UI lists its tables and <code>query</code> uses its table names. On Windows, SQLite is <code>sqlite:///C:/data/app.db</code>.</p>
+
+    <!-- ===================================================== RUN IT -->
+    <h2 id="safe">Sharing it safely</h2>
+    <p>By default <code>serve</code> listens on <code>127.0.0.1</code> and the API is open, which is fine on your own machine. Before anyone else can reach it:</p>
+<pre><code><span class="p">$ </span>lakeleto serve --addr 0.0.0.0:8080 --root /data --token "$(openssl rand -hex 16)"</code></pre>
+    <ul>
+      <li><code>--root</code> confines reads to one folder.</li>
+      <li><code>--token</code> requires a bearer token on every API call. Without it, a non-loopback bind warns and stays open.</li>
+      <li>Prefer an SSH tunnel or a TLS reverse proxy over binding <code>0.0.0.0</code> directly.</li>
+    </ul>
+
+    <h2 id="api">HTTP API</h2>
+    <p><code>serve</code> answers the same <code>/v1</code> API the UI uses (protocol 1.0, sent as <code>X-Lakeleto-Protocol</code>). Rows come back as JSON, or as an Arrow IPC stream with <code>Accept: application/vnd.apache.arrow.stream</code>.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Call</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /v1/schema?path=</code></td><td>Columns, types, row count</td></tr>
+        <tr><td><code>GET /v1/preview?path=&amp;limit=</code></td><td>First rows</td></tr>
+        <tr><td><code>GET /v1/rows?path=&amp;offset=&amp;limit=&amp;sort=&amp;desc=&amp;filter=col:op:value</code></td><td>A grid window</td></tr>
+        <tr><td><code>GET /v1/profile?path=&amp;scan=</code></td><td>Column profile (<code>scan=0</code>: footer only)</td></tr>
+        <tr><td><code>GET /v1/export?path=&amp;fmt=</code></td><td>The view as a file</td></tr>
+        <tr><td><code>POST /v1/query</code> <code>{"sql", "file"}</code></td><td>SQL result</td></tr>
+        <tr><td><code>GET /v1/list?dir=</code></td><td>A folder, prefix, database or namespace</td></tr>
+        <tr><td><code>GET /v1/engines</code></td><td>Version, protocol, engines, limits</td></tr>
+      </tbody>
+    </table></div>
+<pre><code><span class="p">$ </span>curl 'localhost:8080/v1/schema?path=orders.parquet'
+<span class="p">$ </span>curl -sX POST localhost:8080/v1/query -H 'content-type: application/json' \
+    -d '{"sql":"SELECT count(*) FROM t","file":"orders.parquet"}'</code></pre>
+    <p>Filter operators: <code>eq ne lt le gt ge contains notcontains startswith endswith in isnull notnull</code>. The full reference is <code>docs/CONFIG.md</code> in the source.</p>
+
+    <h2 id="env">Environment variables</h2>
+    <div class="tw"><table>
+      <thead><tr><th>Variable</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>LAKELETO_HOME</code></td><td>Where workspaces and <code>catalogs.toml</code> live (default <code>~/.lakeleto</code>)</td></tr>
+        <tr><td><code>LAKELETO_ADDR</code></td><td><code>--addr</code> for <code>serve</code> / <code>open</code></td></tr>
+        <tr><td><code>LAKELETO_TOKEN</code></td><td><code>--token</code></td></tr>
+        <tr><td><code>LAKELETO_MAX_DECOMPRESSED</code></td><td><code>--max-decompressed</code></td></tr>
+        <tr><td><code>LAKELETO_REMOTE_URL</code>, <code>LAKELETO_REMOTE_TOKEN</code></td><td>Read through another Lakeleto server</td></tr>
+        <tr><td><code>LAKELETO_WORKSPACE_REMOTE</code>, <code>…_TOKEN</code></td><td>Keep workspaces on another server</td></tr>
+        <tr><td><code>LAKELETO_CATALOG__&lt;NAME&gt;__&lt;KEY&gt;</code></td><td>Catalog settings and secrets</td></tr>
+        <tr><td><code>AWS_*</code>, <code>GOOGLE_APPLICATION_CREDENTIALS</code>, <code>AZURE_STORAGE_*</code></td><td>Bucket credentials, read as the cloud SDKs read them</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2 id="trouble">Troubleshooting</h2>
+    <div class="tw"><table>
+      <thead><tr><th>You see</th><th>Do</th></tr></thead>
+      <tbody>
+        <tr><td>Windows: "Windows protected your PC"</td><td><b>More info → Run anyway</b>. Check the <code>.sha256</code> or cosign signature if you want proof.</td></tr>
+        <tr><td>macOS: "cannot verify the developer"</td><td>Right-click the app → <b>Open</b> once, or <code>xattr -d com.apple.quarantine ./lakeleto</code>.</td></tr>
+        <tr><td>Double-clicking <code>lakeleto.exe</code> flashes a window</td><td>It's the CLI. Use the installer's Start Menu entry, or run it from a terminal.</td></tr>
+        <tr><td>Port 8080 in use</td><td><code>lakeleto serve --addr 127.0.0.1:8090</code></td></tr>
+        <tr><td><code>forbidden: path is outside the server root</code></td><td>The file is outside <code>--root</code>, or it's a bucket or database URI and <code>--root</code> is set.</td></tr>
+        <tr><td>"rebuild with <code>--features …</code>"</td><td>Your build lacks that reader. Use the release binary, or add the feature.</td></tr>
+        <tr><td>An MCP client shows no Lakeleto tools</td><td>Run its exact command in a terminal: it should sit waiting for input. Claude Desktop needs absolute paths.</td></tr>
+        <tr><td>Run across fails on one source</td><td>That source lacks a column the query uses. The others still ran.</td></tr>
+      </tbody>
+    </table></div>
+    <p style="margin-top:40px">Something missing or wrong here? <a href="https://github.com/lucheeseng827/lakeleto/issues">Open an issue</a>.</p>
+  </article>
+</div>
+
+<footer class="colophon">
+  <div class="wrap">
+    <p class="colophon-legal" style="margin-top:0;border-top:none;padding-top:0">© <span data-year>2026</span> Lakeleto · Apache-2.0 · Docs for v0.4.1.</p>
+  </div>
+</footer>
+<script src="assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lakeleto Cloud pricing (preview)</title>
+<meta name="description" content="Proposed pricing for Lakeleto Cloud, the hosted team plane for Lakeleto. A preview: not available yet, and pricing is subject to change. The Lakeleto tool itself is free and Apache-2.0.">
+<meta property="og:title" content="Lakeleto Cloud pricing (preview)">
+<meta property="og:description" content="Proposed pricing for the hosted team plane. Not available yet; subject to change. The tool stays free.">
+<meta property="og:type" content="website">
+<meta name="robots" content="noindex">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<!--
+  A PREVIEW of proposed pricing. Nothing here is for sale: no hosted plane is running and no
+  payment can be taken. Every claim on this page has to stay true while that is so. The numbers
+  come from the private pricing proposal; change them there first, and only with the owner's
+  sign-off. `noindex` keeps a draft price list out of search results until launch.
+-->
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="index.html" aria-label="Lakeleto home">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <rect x="4" y="4" width="56" height="56" fill="#14161a"/>
+        <rect x="8" y="8" width="48" height="48" fill="#f2e6ce"/>
+        <rect x="15" y="15" width="34" height="6" fill="#14161a"/>
+        <rect x="15" y="26" width="22" height="6" fill="#1e3a5f"/>
+        <rect x="15" y="37" width="29" height="6" fill="#d14a3a"/>
+        <rect x="15" y="48" width="14" height="6" fill="#5a3e2b"/>
+      </svg>
+      <span>Lakeleto</span>
+    </a>
+    <span class="ver">Cloud preview</span>
+    <div class="nav-spacer"></div>
+    <nav aria-label="Primary"><ul class="nav" id="nav">
+      <li><a href="index.html">The tool</a></li>
+      <li><a href="#tiers">Tiers</a></li>
+      <li><a href="#faq">Questions</a></li>
+      <li><a href="docs.html">Docs</a></li>
+      <li class="nav-cta"><a href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download</a></li>
+    </ul></nav>
+    <a class="btn btn-primary" href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download</a>
+    <button class="nav-toggle" data-nav-toggle aria-controls="nav" aria-expanded="false" aria-label="Menu">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="field field--tight">
+  <div class="wrap">
+    <div class="section-head">
+      <h1 class="display-2">Lakeleto Cloud (preview)</h1>
+      <p class="lede">A hosted team plane for Lakeleto: shared workspaces and run history, a governed catalog over your own buckets, roles, table and column grants, and a tamper-evident audit log.</p>
+      <p class="preview-note">Not available yet. These are proposed prices, shown so you can tell us if they are wrong. Pricing is subject to change.</p>
+    </div>
+    <p class="dim" style="max-width:46rem">The Lakeleto tool stays free. The binary, the web grid, SQL and MCP are Apache-2.0, need no account and upload nothing. None of it depends on Cloud.</p>
+  </div>
+</section>
+
+<section class="field" id="tiers">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">Proposed tiers.</h2>
+      <p class="lede">The plan is to charge for the people who build and let viewers ride free on paid plans. Reaching a limit would pause new runs, never add a charge.</p>
+    </div>
+    <div class="blocks blocks--4">
+      <div class="block tier"><div class="ink sheet ink-clove">
+        <h3>Free</h3>
+        <p class="price">$0<small>forever, no card</small></p>
+        <ul>
+          <li>Up to 3 members</li>
+          <li>10 compute-hours a month</li>
+          <li>Catalog, grants, audit log and console included</li>
+          <li>Never expires</li>
+        </ul>
+      </div></div>
+      <div class="block tier"><div class="ink sheet ink-indigo">
+        <h3>Pro</h3>
+        <p class="price">$19<small>per member a month, or $15 billed yearly</small></p>
+        <ul>
+          <li>1 to 10 members, viewers free</li>
+          <li>25 compute-hours a month</li>
+          <li>Everything in Free</li>
+        </ul>
+      </div></div>
+      <div class="block tier"><div class="ink sheet ink-saff">
+        <h3>Team</h3>
+        <p class="price">$39<small>per member a month, or $32 billed yearly; 3-member minimum</small></p>
+        <ul>
+          <li>Unlimited members, viewers free</li>
+          <li>150 compute-hours a month</li>
+          <li>Priority support</li>
+          <li>A 14-day trial with no card is planned</li>
+        </ul>
+      </div></div>
+      <div class="block tier"><div class="ink sheet">
+        <h3>Enterprise</h3>
+        <p class="price">Contact<small>dedicated plane or self-hosted, annual</small></p>
+        <ul>
+          <li>Negotiated limits</li>
+          <li>SSO, SLA and security review</li>
+          <li>Invoice billing</li>
+        </ul>
+      </div></div>
+    </div>
+    <p class="dim" style="margin-top:22px;font-size:.86rem">Proposed November 2026, in US dollars, before tax. Everything in these four blocks is a proposal: member counts, support, SSO and the SLA are not in place during the preview, and only the compute and run limits exist in the software today. Limits are measured over a trailing window, so capacity returns as older use ages out, with no reset day to wait for.</p>
+  </div>
+</section>
+
+<section class="field--sheet" id="faq">
+  <div class="wrap">
+    <div class="section-head"><h2 class="display-2">Questions.</h2></div>
+    <div class="register">
+      <details>
+        <summary>Can I sign up?</summary>
+        <div class="answer"><p>Not yet. Lakeleto Cloud is in preview and no hosted plan is on sale. If these prices would or would not work for your team, <a href="https://github.com/lucheeseng827/lakeleto/issues">tell us on GitHub</a>.</p></div>
+      </details>
+      <details>
+        <summary>Do I pay to scroll a table?</summary>
+        <div class="answer"><p>No. Browsing a table in the web grid, its schema and its stats is not billed per call. The only metered thing is compute time, and each plan includes a monthly amount.</p></div>
+      </details>
+      <details>
+        <summary>What happens when I reach a limit?</summary>
+        <div class="answer"><p>New runs pause until the trailing window frees capacity, and you can upgrade. Nothing is billed for going over, and nothing is deleted.</p></div>
+      </details>
+      <details>
+        <summary>Does Cloud change the free tool?</summary>
+        <div class="answer"><p>No. The tool is Apache-2.0, works offline, needs no account and stays that way. Cloud is a separate, optional product.</p></div>
+      </details>
+      <details>
+        <summary>Discounts?</summary>
+        <div class="answer"><p>Under consideration, none decided: about 20% off for paying yearly, early-customer pricing, and free Pro for open-source maintainers, educators and non-profits.</p></div>
+      </details>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <div class="wrap">
+    <div class="colophon-grid">
+      <div>
+        <a class="brand" href="index.html" aria-label="Lakeleto home">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <rect x="4" y="4" width="56" height="56" fill="#14161a"/>
+            <rect x="8" y="8" width="48" height="48" fill="#f2e6ce"/>
+            <rect x="15" y="15" width="34" height="6" fill="#14161a"/>
+            <rect x="15" y="26" width="22" height="6" fill="#1e3a5f"/>
+            <rect x="15" y="37" width="29" height="6" fill="#d14a3a"/>
+            <rect x="15" y="48" width="14" height="6" fill="#5a3e2b"/>
+          </svg>
+          <span>Lakeleto</span>
+        </a>
+        <p>See inside any table, on your own machine.</p>
+      </div>
+      <nav class="colophon-links" aria-label="Footer">
+        <a href="index.html">The tool</a>
+        <a href="docs.html">Docs</a>
+        <a href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download</a>
+        <a href="https://github.com/lucheeseng827/lakeleto">Source</a>
+      </nav>
+    </div>
+    <p class="colophon-legal">© <span data-year>2026</span> Lakeleto · Lakeleto Cloud is a preview; pricing is proposed and subject to change.</p>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

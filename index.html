@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lakeleto — open any table, query it on the spot</title>
+<meta name="description" content="Lakeleto 0.4.1 opens Parquet, CSV, JSON, Arrow, Iceberg and Delta tables, databases and buckets on your own machine: a grid, schema, profile and read-only SQL in your browser, or one command in your terminal. No account, no upload. Apache-2.0.">
+<meta property="og:title" content="Lakeleto — open any table, query it on the spot">
+<meta property="og:description" content="One binary. Point it at a file, a folder, a bucket or a database and query it where it sits. Nothing is uploaded.">
+<meta property="og:type" content="website">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<!--
+  Registered Blocks, v0.4.0 revamp. The first build said a great deal and showed two plates of
+  v0.1.4. This one shows: the running app above the fold, a real query answered on the page, a
+  gallery of every view, and a measured comparison. Words were cut to what a visitor acts on.
+  Every screenshot is v0.4.0; every output on the page is what that build printed. See DESIGN.md.
+-->
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="masthead">
+  <div class="wrap">
+    <a class="brand" href="index.html" aria-label="Lakeleto home">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <rect x="4" y="4" width="56" height="56" fill="#14161a"/>
+        <rect x="8" y="8" width="48" height="48" fill="#f2e6ce"/>
+        <rect x="15" y="15" width="34" height="6" fill="#14161a"/>
+        <rect x="15" y="26" width="22" height="6" fill="#1e3a5f"/>
+        <rect x="15" y="37" width="29" height="6" fill="#d14a3a"/>
+        <rect x="15" y="48" width="14" height="6" fill="#5a3e2b"/>
+      </svg>
+      <span>Lakeleto</span>
+    </a>
+    <span class="ver">v0.4.1</span>
+    <div class="nav-spacer"></div>
+    <nav aria-label="Primary"><ul class="nav" id="nav">
+      <li><a href="#live">Live query</a></li>
+      <li><a href="#screens">Screens</a></li>
+      <li><a href="#compare">Compare</a></li>
+      <li><a href="docs.html">Docs</a></li>
+      <li class="nav-cta"><a href="#install">Download</a></li>
+    </ul></nav>
+    <a class="btn btn-primary" href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download</a>
+    <button class="nav-toggle" data-nav-toggle aria-controls="nav" aria-expanded="false" aria-label="Menu">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+
+<!-- ============================ HERO ============================ -->
+<section class="hero hero--show">
+  <div class="wrap">
+    <h1 class="display-1">Open any table.<br>Query it on the spot.</h1>
+    <p class="lede">
+      Parquet, CSV, JSON, Iceberg, Delta, a bucket or a database: point Lakeleto at it and get a
+      grid, a profile and SQL in your browser. Nothing is imported, nothing is uploaded.
+    </p>
+
+    <div class="install" id="install" data-tabs>
+      <div class="tabbar" role="tablist" aria-label="Install">
+        <button role="tab" aria-selected="true" aria-controls="i-win" id="t-win">Windows</button>
+        <button role="tab" aria-selected="false" aria-controls="i-mac" id="t-mac" tabindex="-1">macOS</button>
+        <button role="tab" aria-selected="false" aria-controls="i-linux" id="t-linux" tabindex="-1">Linux</button>
+        <button role="tab" aria-selected="false" aria-controls="i-docker" id="t-docker" tabindex="-1">Docker</button>
+        <button role="tab" aria-selected="false" aria-controls="i-cargo" id="t-cargo" tabindex="-1">Cargo</button>
+      </div>
+      <div role="tabpanel" id="i-win" aria-labelledby="t-win">
+        <div class="cmd"><code>Download lakeleto-0.4.1-x64.msi → double-click → Start Menu › Lakeleto</code></div>
+      </div>
+      <div role="tabpanel" id="i-mac" aria-labelledby="t-mac" hidden>
+        <div class="cmd"><span class="p">$</span><code>brew install lucheeseng827/lakeleto/lakeleto</code><button class="copy" data-copy>Copy</button></div>
+      </div>
+      <div role="tabpanel" id="i-linux" aria-labelledby="t-linux" hidden>
+        <div class="cmd"><span class="p">$</span><code>brew install lucheeseng827/lakeleto/lakeleto</code><button class="copy" data-copy>Copy</button></div>
+      </div>
+      <div role="tabpanel" id="i-docker" aria-labelledby="t-docker" hidden>
+        <div class="cmd"><span class="p">$</span><code>docker run --rm -p 8080:8080 -v "$PWD:/data:ro" mancube/lakeleto serve --addr 0.0.0.0:8080 --root /data</code><button class="copy" data-copy>Copy</button></div>
+      </div>
+      <div role="tabpanel" id="i-cargo" aria-labelledby="t-cargo" hidden>
+        <div class="cmd"><span class="p">$</span><code>cargo binstall lakeleto</code><button class="copy" data-copy>Copy</button></div>
+      </div>
+      <div class="getit-row" style="margin-top:18px">
+        <a class="btn btn-primary" href="https://github.com/lucheeseng827/lakeleto/releases/latest">All downloads</a>
+        <a class="btn btn-quiet" href="docs.html">Read the docs</a>
+      </div>
+      <p class="hint" style="margin-top:12px;font-size:.86rem;color:var(--indigo-fade)">
+        Windows .msi · macOS .dmg (universal) · Linux x86_64 / arm64 static · Apache-2.0 · no account
+      </p>
+    </div>
+
+    <figure class="hero-shot">
+      <div class="block"><div class="ink" style="background:var(--keyline);padding:0">
+        <img src="assets/shots/sql-dark.jpg" width="2880" height="1720"
+             alt="Lakeleto 0.4.0 in dark mode: a SQL tab over orders.parquet grouping 5,000 orders by city, ten result rows, four saved connections in the sidebar, a saved query, a variable min_amt = 100, and a run history of seven queries.">
+      </div></div>
+    </figure>
+  </div>
+</section>
+
+<!-- ============================ LIVE QUERY ============================ -->
+<section class="field" id="live">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">Ask the file. It answers.</h2>
+      <p class="lede">Pick a question. The command and the answer below are exactly what Lakeleto 0.4.0 printed for <code class="inline">orders.parquet</code>, the 5,000-row sample in the repo.</p>
+    </div>
+    <div class="qpick" role="group" aria-label="Pick a query" id="qpick"></div>
+    <div class="term">
+      <div class="term-bar"><span>~/data</span><span id="qmeta">read-only · local</span></div>
+      <div class="term-body" aria-live="polite"><pre id="qcmd"><span class="p">$</span> lakeleto query "SELECT city, count(*) AS orders, round(sum(amount_usd), 2) AS revenue FROM t GROUP BY city ORDER BY revenue DESC LIMIT 5" --file orders.parquet</pre><pre class="term-out" id="qout">| city      | orders | revenue  |
+|-----------|--------|----------|
+| Sydney    | 503    | 66834.05 |
+| Toronto   | 517    | 66242.49 |
+| Mumbai    | 515    | 65590.18 |
+| Singapore | 550    | 64419.91 |
+| London    | 493    | 62170.92 |
+
+5 row(s)</pre></div>
+    </div>
+    <p class="live-note">The open file is the table <code class="inline">t</code>. Name more with <code class="inline">--table name=path</code>. Add <code class="inline">-o json</code>, <code class="inline">csv</code>, <code class="inline">parquet</code> or <code class="inline">arrows</code> to pipe it on. The same SQL runs in the browser's SQL tab.</p>
+  </div>
+</section>
+
+<!-- ============================ SCREENS ============================ -->
+<section class="field--sheet" id="screens">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">Every view, running.</h2>
+      <p class="lede">Screenshots of v0.4.0 on the same sample data, taken for this page.</p>
+    </div>
+    <div class="gallery" data-tabs>
+      <div class="tabbar" role="tablist" aria-label="Screens">
+        <button role="tab" aria-selected="true" aria-controls="s-grid" id="ts-grid">Grid</button>
+        <button role="tab" aria-selected="false" aria-controls="s-row" id="ts-row" tabindex="-1">Row detail</button>
+        <button role="tab" aria-selected="false" aria-controls="s-schema" id="ts-schema" tabindex="-1">Schema</button>
+        <button role="tab" aria-selected="false" aria-controls="s-profile" id="ts-profile" tabindex="-1">Profile</button>
+        <button role="tab" aria-selected="false" aria-controls="s-sql" id="ts-sql" tabindex="-1">SQL</button>
+        <button role="tab" aria-selected="false" aria-controls="s-wb" id="ts-wb" tabindex="-1">Saved queries &amp; variables</button>
+        <button role="tab" aria-selected="false" aria-controls="s-across" id="ts-across" tabindex="-1">Run across</button>
+        <button role="tab" aria-selected="false" aria-controls="s-palette" id="ts-palette" tabindex="-1">⌘K palette</button>
+      </div>
+      <figure role="tabpanel" id="s-grid" aria-labelledby="ts-grid">
+        <div class="block"><div class="ink" style="background:var(--keyline);padding:0"><img src="assets/shots/grid.jpg" width="2880" height="1720" alt="The grid: orders.parquet sorted by amount_usd descending, filtered to city Singapore and quantity at least 10, 290 of 5,000 rows matched."></div></div>
+        <figcaption><b>Grid.</b> Sorted by <code class="inline">amount_usd</code>, filtered to Singapore and <code class="inline">&gt;= 10</code> units: 290 of 5,000 rows, exact across the whole file. Scroll to the last row; it reads a window at a time.</figcaption>
+      </figure>
+      <figure role="tabpanel" id="s-row" aria-labelledby="ts-row" hidden>
+        <div class="block"><div class="ink" style="background:var(--keyline);padding:0"><img src="assets/shots/row-detail.jpg" width="2880" height="1720" loading="lazy" alt="The row detail panel beside the grid, listing one order's eleven fields, with buttons to copy it as JSON, a WHERE clause or an INSERT."></div></div>
+        <figcaption><b>Row detail.</b> Click a row number for every field. Copy it as JSON, as a <code class="inline">WHERE</code> clause that finds it again, or as an <code class="inline">INSERT</code> for a fixture.</figcaption>
+      </figure>
+      <figure role="tabpanel" id="s-schema" aria-labelledby="ts-schema" hidden>
+        <div class="block"><div class="ink" style="background:var(--keyline);padding:0"><img src="assets/shots/schema.jpg" width="2880" height="1720" loading="lazy" alt="The schema view of orders.parquet: eleven columns with their Arrow types and nullability."></div></div>
+        <figcaption><b>Schema.</b> Columns, types, nullability. For Parquet and Arrow the row count comes from the footer, so it is exact and instant.</figcaption>
+      </figure>
+      <figure role="tabpanel" id="s-profile" aria-labelledby="ts-profile" hidden>
+        <div class="block"><div class="ink" style="background:var(--keyline);padding:0"><img src="assets/shots/profile.jpg" width="2880" height="1720" loading="lazy" alt="The profile view: per-column nulls, null percentage, distinct count, minimum and maximum; rating is 15.5% null."></div></div>
+        <figcaption><b>Profile.</b> Nulls, distinct values, min and max per column. Here <code class="inline">rating</code> is 15.5% null, which you see before you average it.</figcaption>
+      </figure>
+      <figure role="tabpanel" id="s-sql" aria-labelledby="ts-sql" hidden>
+        <div class="block"><div class="ink" style="background:var(--keyline);padding:0"><img src="assets/shots/sql.jpg" width="2880" height="1720" loading="lazy" alt="The SQL tab: a GROUP BY city query over orders.parquet with its ten-row result and the run recorded in the history panel."></div></div>
+        <figcaption><b>SQL.</b> Read-only SQL on DataFusion. <kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>Enter</kbd> runs it; every run lands in the history with its row count and time.</figcaption>
+      </figure>
+      <figure role="tabpanel" id="s-wb" aria-labelledby="ts-wb" hidden>
+        <div class="block"><div class="ink" style="background:var(--keyline);padding:0"><img src="assets/shots/workbench.jpg" width="2880" height="1720" loading="lazy" alt="A query using the variable {{min_amt}}, saved as reports/big-orders-by-tier, with the variable min_amt = 100 in the sidebar."></div></div>
+        <figcaption><b>Saved queries and variables.</b> <code class="inline">{{min_amt}}</code> is filled in from the sidebar at run time. Save as <code class="inline">reports/name</code> to file it in a folder, then run the whole folder.</figcaption>
+      </figure>
+      <figure role="tabpanel" id="s-across" aria-labelledby="ts-across" hidden>
+        <div class="block"><div class="ink" style="background:var(--keyline);padding:0"><img src="assets/shots/run-across.jpg" width="2880" height="1720" loading="lazy" alt="The Run across dialog: one SQL statement run against four saved Parquet sources, each returning its own row."></div></div>
+        <figcaption><b>Run across.</b> One query, many sources: monthly exports, regions, partitions. Each runs on its own, so one bad file fails alone.</figcaption>
+      </figure>
+      <figure role="tabpanel" id="s-palette" aria-labelledby="ts-palette" hidden>
+        <div class="block"><div class="ink" style="background:var(--keyline);padding:0"><img src="assets/shots/palette.jpg" width="2880" height="1720" loading="lazy" alt="The command palette filtered to 'orders', listing files, tabs and saved connections."></div></div>
+        <figcaption><b>Command palette.</b> <kbd>Ctrl</kbd>/<kbd>⌘</kbd> + <kbd>K</kbd> jumps to any file, tab, connection, saved query or command, without the mouse.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ READS + FACTS ============================ -->
+<section class="field">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">Reads what you already have.</h2>
+    </div>
+    <div class="inventory">
+      <span class="slug">Parquet</span><span class="slug">CSV / TSV</span><span class="slug">JSON / NDJSON</span>
+      <span class="slug">Arrow / Feather</span><span class="slug">Apache Iceberg</span><span class="slug">Delta Lake</span>
+      <span class="slug">Hive partitions</span><span class="slug">.gz .zst .bz2 .xz</span>
+      <span class="slug">s3:// gs:// az://</span><span class="slug">Iceberg REST catalogs</span>
+      <span class="slug">SQLite</span><span class="slug">PostgreSQL</span><span class="slug">MySQL</span>
+    </div>
+    <div class="facts" style="margin-top:56px">
+      <div class="fact"><h3>Stays on your machine</h3><p>No account, no server in the path. Buckets are read with your own credentials, straight to your laptop.</p></div>
+      <div class="fact"><h3>Read-only</h3><p>SQL is <code class="inline">SELECT</code> only and database connections can't write. Exports are new files.</p></div>
+      <div class="fact"><h3>Works offline</h3><p>The UI is inside the binary. No CDN, no fonts to fetch. Runs on a plane or an air-gapped box.</p></div>
+      <div class="fact"><h3>Agents too</h3><p><code class="inline">lakeleto mcp</code> lets Claude, Cursor or any MCP client read your tables, capped and confined to a folder.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================ COMPARE ============================ -->
+<section class="field--sheet" id="compare">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">How it compares.</h2>
+      <p class="lede">Lakeleto is a viewer first. The engines below are excellent, and Lakeleto's SQL runs on one of their peers (Apache DataFusion). What differs is what you get without writing code.</p>
+    </div>
+    <div class="ctable-wrap">
+      <table class="ctable">
+        <thead><tr><th scope="col"></th><th scope="col">Lakeleto 0.4</th><th scope="col">DuckDB CLI</th><th scope="col">Polars / pandas</th><th scope="col">VisiData</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">What it is</th><td class="y">Table viewer + read-only SQL</td><td>SQL database engine</td><td>Python DataFrame libraries</td><td>Terminal spreadsheet</td></tr>
+          <tr><th scope="row">Point-and-click UI</th><td class="y">Yes, in the browser, bundled</td><td>Web UI via <code class="inline">duckdb -ui</code><small>front end loaded from ui.duckdb.org</small></td><td>No (notebooks)</td><td>Keyboard TUI</td></tr>
+          <tr><th scope="row">Fully offline UI</th><td class="y">Yes</td><td>CLI yes, web UI no</td><td>—</td><td>Yes</td></tr>
+          <tr><th scope="row">Grid with sort, filter, row detail</th><td class="y">Yes, over the whole file</td><td>No</td><td>No</td><td>Yes</td></tr>
+          <tr><th scope="row">Per-column profile</th><td class="y">Yes, plus a Parquet-footer fast path</td><td><code class="inline">SUMMARIZE</code></td><td><code class="inline">describe()</code></td><td>Describe sheet</td></tr>
+          <tr><th scope="row">SQL</th><td class="y">Read-only (DataFusion)</td><td>Full, read-write</td><td>Polars SQLContext; pandas no</td><td>No</td></tr>
+          <tr><th scope="row">Iceberg / Delta</th><td class="y">Built in, current snapshot</td><td>Extensions</td><td>Polars with <code class="inline">pyiceberg</code> / <code class="inline">deltalake</code>; pandas via those libraries</td><td>No</td></tr>
+          <tr><th scope="row">Saved queries, variables, history, run-across</th><td class="y">Yes</td><td>No (UI: notebooks)</td><td>Your own scripts</td><td>No</td></tr>
+          <tr><th scope="row">MCP server for AI agents</th><td class="y">Built in</td><td>Separate projects</td><td>No</td><td>No</td></tr>
+          <tr><th scope="row">Install</th><td class="y">One binary or installer</td><td>One binary</td><td>Python + packages</td><td>Python package</td></tr>
+          <tr><th scope="row">Can change your data</th><td class="y">No, by design</td><td>Yes</td><td>Yes</td><td>Can save edits</td></tr>
+          <tr><th scope="row">Licence</th><td class="y">Apache-2.0</td><td>MIT</td><td>MIT / BSD-3</td><td>GPL-3.0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="dim" style="margin-top:14px;font-size:.86rem">From each project's own documentation as of November 2026. Tell us if a row is out of date.</p>
+
+    <h3 class="display-2" style="font-size:clamp(1.6rem,3vw,2.3rem);margin-top:70px" id="bench">Measured, one command at a time.</h3>
+    <p style="margin-top:14px;color:var(--clove)">
+      Each bar is one command typed in a terminal, start to exit, median of five runs on a warm file
+      cache. Lakeleto answers "what is this file?" fastest and on a CSV it leads. On a full scan of a
+      20-million-row Parquet file, DuckDB is about twice as fast. Lakeleto and DuckDB finish every task
+      in under 0.3 s, using a fraction of the memory of loading a DataFrame.
+    </p>
+    <div class="bench" style="margin-top:34px">
+      <div>
+        <h3>Schema + row count · 20M-row Parquet</h3>
+        <div class="bars">
+          <div class="bar us"><span class="who">Lakeleto</span><span class="track"><span class="fill" style="width:2.5%"></span></span><span class="val">19 ms · 11 MiB</span></div>
+          <div class="bar"><span class="who">DuckDB</span><span class="track"><span class="fill" style="width:5.2%"></span></span><span class="val">40 ms · 21 MiB</span></div>
+          <div class="bar"><span class="who">Polars</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="val">772 ms · 44 MiB</span></div>
+          <div class="bar"><span class="who">pandas</span><span class="track"><span class="fill" style="width:33.9%"></span></span><span class="val">262 ms · 40 MiB</span></div>
+        </div>
+      </div>
+      <div>
+        <h3>First 10 rows · 20M-row Parquet</h3>
+        <div class="bars">
+          <div class="bar us"><span class="who">Lakeleto</span><span class="track"><span class="fill" style="width:3.9%"></span></span><span class="val">31 ms · 18 MiB</span></div>
+          <div class="bar"><span class="who">DuckDB</span><span class="track"><span class="fill" style="width:5.5%"></span></span><span class="val">44 ms · 27 MiB</span></div>
+          <div class="bar"><span class="who">Polars</span><span class="track"><span class="fill" style="width:42.4%"></span></span><span class="val">339 ms · 48 MiB</span></div>
+          <div class="bar"><span class="who">pandas</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="val">799 ms · 91 MiB</span></div>
+        </div>
+      </div>
+      <div>
+        <h3>GROUP BY city · all 20M rows (Parquet)</h3>
+        <div class="bars">
+          <div class="bar us"><span class="who">Lakeleto</span><span class="track"><span class="fill" style="width:7%"></span></span><span class="val">154 ms · 56 MiB</span></div>
+          <div class="bar"><span class="who">DuckDB</span><span class="track"><span class="fill" style="width:4%"></span></span><span class="val">87 ms · 54 MiB</span></div>
+          <div class="bar"><span class="who">Polars</span><span class="track"><span class="fill" style="width:33.3%"></span></span><span class="val">733 ms · 1.5 GiB</span></div>
+          <div class="bar"><span class="who">pandas</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="val">2.2 s · 1.1 GiB</span></div>
+        </div>
+      </div>
+      <div>
+        <h3>Filter + sort, top 10 · 20M rows (Parquet)</h3>
+        <div class="bars">
+          <div class="bar us"><span class="who">Lakeleto</span><span class="track"><span class="fill" style="width:8.5%"></span></span><span class="val">263 ms · 100 MiB</span></div>
+          <div class="bar"><span class="who">DuckDB</span><span class="track"><span class="fill" style="width:4.2%"></span></span><span class="val">128 ms · 50 MiB</span></div>
+          <div class="bar"><span class="who">Polars</span><span class="track"><span class="fill" style="width:28.5%"></span></span><span class="val">878 ms · 1.0 GiB</span></div>
+          <div class="bar"><span class="who">pandas</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="val">3.1 s · 1.8 GiB</span></div>
+        </div>
+      </div>
+      <div>
+        <h3>GROUP BY city · 2M-row CSV (145 MiB)</h3>
+        <div class="bars">
+          <div class="bar us"><span class="who">Lakeleto</span><span class="track"><span class="fill" style="width:6.9%"></span></span><span class="val">110 ms · 48 MiB</span></div>
+          <div class="bar"><span class="who">DuckDB</span><span class="track"><span class="fill" style="width:11.5%"></span></span><span class="val">185 ms · 182 MiB</span></div>
+          <div class="bar"><span class="who">Polars</span><span class="track"><span class="fill" style="width:26.5%"></span></span><span class="val">426 ms · 270 MiB</span></div>
+          <div class="bar"><span class="who">pandas</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="val">1.6 s · 139 MiB</span></div>
+        </div>
+      </div>
+      <div>
+        <h3>Reading the bars</h3>
+        <p style="color:var(--clove);font-size:.94rem">Bars are time, scaled to the slowest tool in each task. The label is the median time, then the process's peak working set. Shorter is better on both.</p>
+        <p style="color:var(--clove);font-size:.94rem;margin-top:10px">Polars and pandas are timed as Python one-liners, so roughly 0.2–0.3 s of each is starting Python and importing the library. In a notebook that's paid once. From a terminal it's paid every time.</p>
+      </div>
+    </div>
+
+    <details class="method">
+      <summary>Method, versions and exact commands</summary>
+      <p style="margin-top:12px">Run 2026-11-04 on one laptop: AMD Ryzen 9 8945HS (8 cores, 16 threads), 93 GiB RAM, NVMe SSD, Windows 11. Lakeleto 0.4.0 (release build, release feature set), DuckDB CLI 1.4.1, Polars 1.34.0, pandas 2.3.3 with pyarrow 21.0.0, Python 3.12. Each command ran once to warm the cache, then five times; the median is shown. Memory is the peak working set Windows records for the process. All four tools returned the same counts and sums.</p>
+      <p style="margin-top:10px">Data: 20,000,000 orders-shaped rows (10 columns: ids, strings, doubles, a boolean, a timestamp) generated by DuckDB with a fixed seed and written as Snappy Parquet (463 MiB), and 2,000,000 of the same as CSV (145 MiB). One machine and one data shape. Your numbers will differ, so run it yourself: <a href="bench/gen.py" style="color:var(--safflower-ink);text-decoration:underline">gen.py</a>, <a href="bench/bench.py" style="color:var(--safflower-ink);text-decoration:underline">bench.py</a>, <a href="bench/results-2026-11-04.json" style="color:var(--safflower-ink);text-decoration:underline">raw results</a>.</p>
+<pre>lakeleto schema orders_20m.parquet
+lakeleto head orders_20m.parquet -n 10
+lakeleto query "SELECT city, count(*) AS n, round(sum(amount_usd), 2) AS revenue
+  FROM t GROUP BY city ORDER BY revenue DESC" --file orders_20m.parquet
+lakeleto query "SELECT order_id, city, amount_usd FROM t WHERE tier = 'enterprise'
+  AND NOT is_refunded ORDER BY amount_usd DESC LIMIT 10" --file orders_20m.parquet
+
+duckdb -c "DESCRIBE SELECT * FROM 'orders_20m.parquet'; SELECT count(*) FROM 'orders_20m.parquet';"
+duckdb -c "SELECT * FROM 'orders_20m.parquet' LIMIT 10"        # and the same two queries
+
+python -c "import polars as pl; pl.scan_parquet(f).group_by('city').agg(...).collect()"
+python -c "import pandas as pd; pd.read_parquet(f, columns=['city','amount_usd']).groupby('city')..."
+python -c "import pyarrow.parquet as pq; pq.ParquetFile(f).schema_arrow / .metadata.num_rows"   # pandas column</pre>
+    </details>
+  </div>
+</section>
+
+<!-- ============================ WHO IT'S FOR ============================ -->
+<section class="field" id="who">
+  <div class="wrap">
+    <div class="section-head">
+      <h2 class="display-2">Who it's for.</h2>
+      <p class="lede">Lakeleto is an early release, v0.4.1. It's built for these three cases.</p>
+    </div>
+    <div class="aud">
+      <article class="block"><div class="ink sheet">
+        <h3>Data engineers</h3>
+        <p>You live in a terminal and want to see a table before you build on it. <code class="inline">lakeleto schema</code>, <code class="inline">head</code> and <code class="inline">profile --fast</code> answer in one line, in CI too.</p>
+      </div></article>
+      <article class="block"><div class="ink sheet">
+        <h3>Analysts who don't code</h3>
+        <p>You have a Parquet file and no Python. Install, click the file, scroll, filter, export to CSV. SQL is there when you want it.</p>
+      </div></article>
+      <article class="block"><div class="ink sheet">
+        <h3>Teams that can't upload</h3>
+        <p>Customer records, regulated data, air-gapped boxes. Nothing leaves the machine, and <code class="inline">--root</code> keeps it to one folder.</p>
+      </div></article>
+    </div>
+    <p class="dim" style="margin-top:30px">Need to transform, join across warehouses or write results back? Use DuckDB or Polars. Lakeleto hands you Parquet or Arrow (<code class="inline">-o parquet</code>, <code class="inline">-o arrows</code>) to pass along.</p>
+  </div>
+</section>
+
+<!-- ============================ FAQ ============================ -->
+<section class="field--sheet" id="faq">
+  <div class="wrap">
+    <div class="section-head"><h2 class="display-2">Before you download.</h2></div>
+    <div class="register">
+      <details>
+        <summary>How finished is it?</summary>
+        <div class="answer"><p>It's v0.4.1, an early release. The grid, schema, profile, SQL, export, every reader above and the database connectors work today, and the maintainers use it daily. Expect rough edges, and file them.</p></div>
+      </details>
+      <details>
+        <summary>What does it cost?</summary>
+        <div class="answer"><p>Nothing. The tool is Apache-2.0 and stays that way. A hosted team edition is on the roadmap. It isn't available, and nothing on this page depends on it.</p></div>
+      </details>
+      <details>
+        <summary>Files bigger than my memory?</summary>
+        <div class="answer"><p>Yes. The grid reads a window at a time and Parquet by row group. Sorts and filters run in the SQL engine over the whole file. Iceberg and Delta tables are loaded into memory for that.</p></div>
+      </details>
+      <details>
+        <summary>Why does my OS warn me on first launch?</summary>
+        <div class="answer"><p>No Authenticode certificate or Apple notarization yet. On Windows: <b>More info → Run anyway</b>. On macOS: right-click → <b>Open</b> once. Every release carries a cosign signature, a SHA-256 and SLSA provenance you can check instead.</p></div>
+      </details>
+    </div>
+  </div>
+</section>
+
+<section class="field field--tight">
+  <div class="wrap">
+    <h2 class="display-2" style="max-width:18ch">Point it at a table.</h2>
+    <div class="getit">
+      <div class="getit-row">
+        <a class="btn btn-primary" href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download v0.4.1</a>
+        <a class="btn btn-quiet" href="docs.html">Docs: CLI and UI</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <div class="wrap">
+    <div class="colophon-grid">
+      <div>
+        <a class="brand" href="index.html" aria-label="Lakeleto home">
+          <svg viewBox="0 0 64 64" aria-hidden="true">
+            <rect x="4" y="4" width="56" height="56" fill="#14161a"/>
+            <rect x="8" y="8" width="48" height="48" fill="#f2e6ce"/>
+            <rect x="15" y="15" width="34" height="6" fill="#14161a"/>
+            <rect x="15" y="26" width="22" height="6" fill="#1e3a5f"/>
+            <rect x="15" y="37" width="29" height="6" fill="#d14a3a"/>
+            <rect x="15" y="48" width="14" height="6" fill="#5a3e2b"/>
+          </svg>
+          <span>Lakeleto</span>
+        </a>
+        <p>See inside any table, on your own machine.</p>
+      </div>
+      <nav class="colophon-links" aria-label="Footer">
+        <a href="#live">Live query</a>
+        <a href="#screens">Screens</a>
+        <a href="#compare">Compare</a>
+        <a href="docs.html">Docs</a>
+        <a href="https://github.com/lucheeseng827/lakeleto/releases/latest">Download</a>
+        <a href="https://github.com/lucheeseng827/lakeleto">Source</a>
+      </nav>
+    </div>
+    <p class="colophon-legal">© <span data-year>2026</span> Lakeleto · Apache-2.0 · Screenshots and output are of v0.4.0.</p>
+  </div>
+</footer>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,156 @@
+﻿{
+    "machine":  {
+                    "os":  "Windows-11-10.0.26300-SP0",
+                    "cpu":  "AMD64 Family 25 Model 117 Stepping 2, AuthenticAMD",
+                    "cores_logical":  16,
+                    "ram_gib":  92.8
+                },
+    "runs":  5,
+    "tasks":  {
+                  "schema":  {
+                                 "label":  "Schema + row count (20M-row Parquet)",
+                                 "tools":  {
+                                               "lakeleto":  {
+                                                                "median_s":  0.019,
+                                                                "min_s":  0.018,
+                                                                "max_s":  0.591,
+                                                                "peak_mib":  10.8
+                                                            },
+                                               "duckdb":  {
+                                                              "median_s":  0.04,
+                                                              "min_s":  0.039,
+                                                              "max_s":  0.684,
+                                                              "peak_mib":  20.9
+                                                          },
+                                               "polars":  {
+                                                              "median_s":  0.772,
+                                                              "min_s":  0.312,
+                                                              "max_s":  1.068,
+                                                              "peak_mib":  43.7
+                                                          },
+                                               "pandas":  {
+                                                              "median_s":  0.262,
+                                                              "min_s":  0.233,
+                                                              "max_s":  1.263,
+                                                              "peak_mib":  40.4
+                                                          }
+                                           }
+                             },
+                  "head":  {
+                               "label":  "First 10 rows (20M-row Parquet)",
+                               "tools":  {
+                                             "lakeleto":  {
+                                                              "median_s":  0.031,
+                                                              "min_s":  0.029,
+                                                              "max_s":  0.035,
+                                                              "peak_mib":  17.7
+                                                          },
+                                             "duckdb":  {
+                                                            "median_s":  0.044,
+                                                            "min_s":  0.044,
+                                                            "max_s":  0.045,
+                                                            "peak_mib":  27.2
+                                                        },
+                                             "polars":  {
+                                                            "median_s":  0.339,
+                                                            "min_s":  0.331,
+                                                            "max_s":  0.394,
+                                                            "peak_mib":  48.1
+                                                        },
+                                             "pandas":  {
+                                                            "median_s":  0.799,
+                                                            "min_s":  0.684,
+                                                            "max_s":  1.408,
+                                                            "peak_mib":  91.4
+                                                        }
+                                         }
+                           },
+                  "groupby":  {
+                                  "label":  "GROUP BY city over all 20M rows (Parquet)",
+                                  "tools":  {
+                                                "lakeleto":  {
+                                                                 "median_s":  0.154,
+                                                                 "min_s":  0.15,
+                                                                 "max_s":  0.155,
+                                                                 "peak_mib":  56.2
+                                                             },
+                                                "duckdb":  {
+                                                               "median_s":  0.087,
+                                                               "min_s":  0.082,
+                                                               "max_s":  0.09,
+                                                               "peak_mib":  54.3
+                                                           },
+                                                "polars":  {
+                                                               "median_s":  0.733,
+                                                               "min_s":  0.692,
+                                                               "max_s":  1.017,
+                                                               "peak_mib":  1559.8
+                                                           },
+                                                "pandas":  {
+                                                               "median_s":  2.201,
+                                                               "min_s":  1.984,
+                                                               "max_s":  2.362,
+                                                               "peak_mib":  1118.6
+                                                           }
+                                            }
+                              },
+                  "topn":  {
+                               "label":  "Filter + sort, top 10 (20M-row Parquet)",
+                               "tools":  {
+                                             "lakeleto":  {
+                                                              "median_s":  0.263,
+                                                              "min_s":  0.256,
+                                                              "max_s":  0.851,
+                                                              "peak_mib":  99.9
+                                                          },
+                                             "duckdb":  {
+                                                            "median_s":  0.128,
+                                                            "min_s":  0.118,
+                                                            "max_s":  0.803,
+                                                            "peak_mib":  49.8
+                                                        },
+                                             "polars":  {
+                                                            "median_s":  0.878,
+                                                            "min_s":  0.632,
+                                                            "max_s":  1.369,
+                                                            "peak_mib":  1022.6
+                                                        },
+                                             "pandas":  {
+                                                            "median_s":  3.082,
+                                                            "min_s":  2.996,
+                                                            "max_s":  3.636,
+                                                            "peak_mib":  1880.7
+                                                        }
+                                         }
+                           },
+                  "csv_groupby":  {
+                                      "label":  "GROUP BY city over a 2M-row CSV",
+                                      "tools":  {
+                                                    "lakeleto":  {
+                                                                     "median_s":  0.11,
+                                                                     "min_s":  0.106,
+                                                                     "max_s":  0.725,
+                                                                     "peak_mib":  48.0
+                                                                 },
+                                                    "duckdb":  {
+                                                                   "median_s":  0.185,
+                                                                   "min_s":  0.179,
+                                                                   "max_s":  0.195,
+                                                                   "peak_mib":  182.2
+                                                               },
+                                                    "polars":  {
+                                                                   "median_s":  0.426,
+                                                                   "min_s":  0.407,
+                                                                   "max_s":  0.532,
+                                                                   "peak_mib":  269.9
+                                                               },
+                                                    "pandas":  {
+                                                                   "median_s":  1.605,
+                                                                   "min_s":  1.568,
+                                                                   "max_s":  1.736,
+                                                                   "peak_mib":  138.7
+                                                               }
+                                                }
+                                  }
+              }
+}
