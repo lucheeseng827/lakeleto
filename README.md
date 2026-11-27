@@ -14,7 +14,7 @@ locked-down CI runner. (`.tsv` is read tab-delimited; `--format tsv` forces it f
 [![Image size](https://img.shields.io/docker/image-size/mancube/lakeleto?sort=semver&label=image)](https://hub.docker.com/r/mancube/lakeleto)
 [![Platforms](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-informational)](https://github.com/lucheeseng827/lakeleto/releases)
 
-**Status: released.** The current release is **0.4.1** (2026-11-04). Each tagged release
+**Status: released.** The current release is **0.5.0** (2026-11-27). Each tagged release
 publishes:
 - signed binaries for Linux (musl, `x86_64` and `aarch64`), macOS (`x86_64` and `aarch64`) and
   Windows (`x86_64`), a macOS `.dmg` and a Windows `.msi`, with `SHA256SUMS` and an SBOM, on the

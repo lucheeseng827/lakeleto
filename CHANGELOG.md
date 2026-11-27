@@ -6,6 +6,8 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-27
+
 ### Added
 - **The web app's Diff view, and `GET /v1/diff` (protocol `1.3`).** An open table gets a **Diff**
   view beside Grid, Schema, Profile and SQL: compare it with another table, or with one of its own
@@ -1157,7 +1159,8 @@ one pluggable trait.
 - Release scaffolding: `LICENSE` (Apache-2.0), `NOTICE`, `CONTRIBUTING.md` (DCO),
   `SECURITY.md`, `CODE_OF_CONDUCT.md`, and this changelog.
 
-[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/lucheeseng827/lakeleto/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/lucheeseng827/lakeleto/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/lucheeseng827/lakeleto/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.4.0
 [0.3.0]: https://github.com/lucheeseng827/lakeleto/releases/tag/v0.3.0

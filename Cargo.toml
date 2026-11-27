@@ -9,7 +9,7 @@ panic = "unwind"
 
 [package]
 name = "lakeleto"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Lakeleto — instant local lakehouse-table explorer (\"the Postman of lakehouse tables\"): reads Parquet, CSV/TSV, JSON and Arrow IPC, and with features Iceberg and Delta tables, object stores and databases, all behind one pluggable Engine trait; a hosted Lakeleto Cloud is on the roadmap. Read-only: schema / head / profile / query / grid."
