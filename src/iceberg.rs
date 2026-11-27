@@ -60,6 +60,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::context::RequestContext;
 use crate::engine::{FilterOp, FilterSpec};
 use crate::error::{EngineError, Result};
+use crate::snapshot::{SnapshotRef, TableMetadata};
 
 /// Per-data-file statistics from its manifest entry, used to skip files that cannot contain a
 /// filter's matching rows (statistics/partition pruning). All maps are keyed by **field-id**;
@@ -251,6 +252,11 @@ pub struct TablePlan {
     /// plan time, see below), row lineage, and the VARIANT/GEOMETRY types. Recorded so callers can
     /// say which version they are looking at rather than guessing. `0` when the metadata omits it.
     pub format_version: i64,
+    /// When the table last changed, in milliseconds since the epoch: the current snapshot's
+    /// `timestamp-ms`, or, for a table with no snapshot, the metadata's `last-updated-ms`. From
+    /// the metadata, never a file's modification time, which a copy or a checkout resets. `None`
+    /// when the metadata records neither.
+    pub committed_ms: Option<i64>,
 }
 
 impl DataFileEntry {
@@ -343,6 +349,451 @@ pub(crate) fn plan_metadata_local(table_dir: &Path, metadata: &[u8]) -> Result<T
     )
 }
 
+/// The table in directory `table_dir` at snapshot `at`, its current one when `None`, described by
+/// its metadata alone, for `diff`: see [`describe_from`].
+pub fn describe(table_dir: &Path, at: Option<&SnapshotRef>) -> Result<TableMetadata> {
+    let files = LocalFiles {
+        table_dir,
+        root: None,
+    };
+    let (_, meta) = locate_metadata(&files)?;
+    describe_from(&files, &meta, at)
+}
+
+/// [`describe`] for the table at object-store URI `table`, read through `stores`.
+#[cfg(feature = "object-store")]
+pub(crate) fn describe_in_store(
+    table: &str,
+    stores: &crate::objstore::Stores,
+    ctx: &RequestContext,
+    at: Option<&SnapshotRef>,
+) -> Result<TableMetadata> {
+    let files = StoreFiles {
+        table: table.trim_end_matches('/'),
+        stores,
+        ctx,
+    };
+    let (_, meta) = locate_metadata(&files)?;
+    describe_from(&files, &meta, at)
+}
+
+/// [`describe`] from `metadata`, the current metadata a catalog handed over, for a table whose
+/// manifests are in an object store.
+#[cfg(feature = "catalog")]
+pub(crate) fn describe_metadata_in_store(
+    table: &str,
+    metadata: &[u8],
+    stores: &crate::objstore::Stores,
+    ctx: &RequestContext,
+    at: Option<&SnapshotRef>,
+) -> Result<TableMetadata> {
+    let files = StoreFiles {
+        table: table.trim_end_matches('/'),
+        stores,
+        ctx,
+    };
+    describe_from(&files, metadata, at)
+}
+
+/// [`describe`] from `metadata`, the current metadata a catalog handed over, for a table on this
+/// machine.
+#[cfg(feature = "catalog")]
+pub(crate) fn describe_metadata_local(
+    table_dir: &Path,
+    metadata: &[u8],
+    at: Option<&SnapshotRef>,
+) -> Result<TableMetadata> {
+    let files = LocalFiles {
+        table_dir,
+        root: None,
+    };
+    describe_from(&files, metadata, at)
+}
+
+/// The snapshot `at` names in `meta`, or the current one when `None`; `None` when the table has
+/// no snapshot yet. An instant names the snapshot the table's `snapshot-log` says was current
+/// then: `snapshots` also holds other branches' snapshots and ones rolled back, which never were.
+fn choose_snapshot<'a>(
+    meta: &'a serde_json::Value,
+    table: &str,
+    at: Option<&SnapshotRef>,
+) -> Result<Option<&'a serde_json::Value>> {
+    let snapshots: &[serde_json::Value] = meta
+        .get("snapshots")
+        .and_then(|v| v.as_array())
+        .map_or(&[], Vec::as_slice);
+    let id_of = |s: &serde_json::Value| s.get("snapshot-id").and_then(|v| v.as_i64());
+    let find = |id: i64| snapshots.iter().find(|s| id_of(s) == Some(id));
+    let known = || {
+        let mut ids: Vec<String> = snapshots
+            .iter()
+            .rev()
+            .take(10)
+            .filter_map(id_of)
+            .map(|id| id.to_string())
+            .collect();
+        if snapshots.len() > ids.len() {
+            ids.push("…".to_string());
+        }
+        if ids.is_empty() {
+            "it has none".to_string()
+        } else {
+            format!("its snapshots, newest first, are {}", ids.join(", "))
+        }
+    };
+    let id = match at {
+        None => match meta.get("current-snapshot-id").and_then(|v| v.as_i64()) {
+            Some(id) if id >= 0 => id,
+            _ => return Ok(None),
+        },
+        Some(SnapshotRef::Id(id)) => *id,
+        Some(SnapshotRef::At { ms, text }) => {
+            let log: Vec<(i64, i64)> = meta
+                .get("snapshot-log")
+                .and_then(|v| v.as_array())
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|e| {
+                            Some((
+                                e.get("timestamp-ms")?.as_i64()?,
+                                e.get("snapshot-id")?.as_i64()?,
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if log.is_empty() {
+                return Err(EngineError::Other(format!(
+                    "iceberg: {table} keeps no snapshot log, so the snapshot current at {text} \
+                     cannot be told: name a snapshot id (`@<id>`) instead; {}",
+                    known()
+                )));
+            }
+            match log.iter().filter(|(t, _)| t <= ms).max_by_key(|(t, _)| *t) {
+                Some((_, id)) => *id,
+                None => {
+                    let (first, _) = log
+                        .iter()
+                        .min_by_key(|(t, _)| *t)
+                        .copied()
+                        .unwrap_or_default();
+                    return Err(EngineError::Other(format!(
+                        "iceberg: {table} had no snapshot at {text}: the first its snapshot log \
+                         records was made at {}",
+                        crate::snapshot::instant(first)
+                    )));
+                }
+            }
+        }
+    };
+    match find(id) {
+        Some(snapshot) => Ok(Some(snapshot)),
+        None => Err(EngineError::Other(format!(
+            "iceberg: {table} has no snapshot {id}, or it has expired: {}",
+            known()
+        ))),
+    }
+}
+
+/// The schema snapshot `snapshot` was written with: the one its `schema-id` names. A snapshot that
+/// records none, as early v1 writers did not, is refused rather than given another's columns:
+/// those writers kept no schema history, so even a table that lists one schema may have had others
+/// when the snapshot was written. So is one whose schema the metadata no longer holds.
+fn snapshot_schema<'a>(
+    meta: &'a serde_json::Value,
+    table: &str,
+    snapshot: Option<&'a serde_json::Value>,
+) -> Result<Option<&'a serde_json::Value>> {
+    let schemas = meta.get("schemas").and_then(|v| v.as_array());
+    let by_id = |id: i64| {
+        schemas?
+            .iter()
+            .find(|s| s.get("schema-id").and_then(|v| v.as_i64()) == Some(id))
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(current_schema_object(meta));
+    };
+    let named = || {
+        snapshot
+            .get("snapshot-id")
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    };
+    if let Some(id) = snapshot.get("schema-id").and_then(|v| v.as_i64()) {
+        return by_id(id).map(Some).ok_or_else(|| {
+            EngineError::Other(format!(
+                "iceberg: {table}'s snapshot {} was written with schema {id}, which the \
+                 table's metadata no longer holds, so its columns are not known",
+                named()
+            ))
+        });
+    }
+    // A metadata that declares no schema at all gives no columns to either side, and says so.
+    if current_schema_object(meta).is_none() {
+        return Ok(None);
+    }
+    Err(EngineError::Other(format!(
+        "iceberg: {table}'s snapshot {} records no schema-id, and the writers that wrote none kept \
+         no schema history, so the columns it was written with are not known",
+        named()
+    )))
+}
+
+/// The table described by `meta` at snapshot `at`, for `diff` by metadata: the snapshot's schema,
+/// its data files' rows, and each column's null count, minimum and maximum where its manifests
+/// make them exact. Only the manifest list and the manifests are read: no data file, and no
+/// delete file.
+///
+/// - **Rows** are the data files' `record_count`s. A snapshot with delete files has rows they
+///   remove, which only reading them would count: then rows and column statistics are not given.
+/// - **A column's** nulls are its files' `null_value_counts`, and its minimum and maximum the least
+///   and greatest of their `lower_bounds` and `upper_bounds`, when every file records them. Text
+///   and binary bounds are left out, since writers truncate them, and a float's are given only
+///   when every file records no NaN in it, since bounds leave NaN out.
+fn describe_from(
+    files: &dyn TableFiles,
+    meta: &[u8],
+    at: Option<&SnapshotRef>,
+) -> Result<TableMetadata> {
+    use crate::diff::ColumnStats;
+    let meta: serde_json::Value = serde_json::from_slice(meta)
+        .map_err(|e| EngineError::Other(format!("iceberg: bad metadata json: {e}")))?;
+    let table = files.table();
+    let snapshot = choose_snapshot(&meta, &table, at)?;
+    let schema = match at {
+        // The table now: its current schema, which a schema change makes without a snapshot.
+        None => current_schema_object(&meta),
+        Some(_) => snapshot_schema(&meta, &table, snapshot)?,
+    };
+    let fields = schema
+        .and_then(parse_schema)
+        .map(|s| s.fields)
+        .unwrap_or_default();
+    let raw_types: HashMap<i32, String> = schema
+        .and_then(|s| s.get("fields"))
+        .and_then(|f| f.as_array())
+        .map(|fs| {
+            fs.iter()
+                .filter_map(|f| {
+                    let ty = f.get("type")?;
+                    let name = ty
+                        .as_str()
+                        .or_else(|| ty.get("type")?.as_str())
+                        .unwrap_or("nested");
+                    Some((f.get("id")?.as_i64()? as i32, name.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = TableMetadata {
+        snapshot: snapshot
+            .and_then(|s| s.get("snapshot-id"))
+            .map(|v| v.to_string()),
+        committed_ms: snapshot
+            .and_then(|s| s.get("timestamp-ms"))
+            .and_then(|v| v.as_i64())
+            .or_else(|| meta.get("last-updated-ms").and_then(|v| v.as_i64())),
+        columns: fields
+            .iter()
+            .map(|f| crate::engine::ColumnSchema {
+                name: f.name.clone(),
+                data_type: match &f.arrow_type {
+                    Some(t) => format!("{t}"),
+                    None => raw_types.get(&f.id).cloned().unwrap_or_default(),
+                },
+                nullable: !f.required,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    if schema.is_none() {
+        out.note("the metadata declares no schema, so no column is compared");
+    }
+
+    let mut data: Vec<FileStats> = Vec::new();
+    let mut delete_files = 0usize;
+    if let Some(snapshot) = snapshot {
+        let manifest_list = snapshot
+            .get("manifest-list")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                EngineError::Other(format!(
+                    "iceberg: {table}'s snapshot has no manifest-list (a v1 table's manifests \
+                     listed inline are not read)"
+                ))
+            })?;
+        let list = files.resolve(manifest_list)?;
+        for (manifest_path, content, _) in read_manifest_list(&files.read(&list)?, &list)? {
+            let manifest = files.resolve(&manifest_path)?;
+            for e in read_manifest_entries(&files.read(&manifest)?, &manifest)? {
+                if e.status == 2 {
+                    continue; // DELETED entry: not in this snapshot
+                }
+                match (content, e.content) {
+                    (0, 0) => data.push(e.stats),
+                    (1, _) => delete_files += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    out.files = data.len() as u64;
+    if delete_files > 0 {
+        out.note(format!(
+            "the snapshot has {delete_files} delete file(s), whose deleted rows only reading them \
+             would count: its rows and column statistics are not taken by metadata"
+        ));
+    } else {
+        out.rows = Some(data.iter().map(|f| f.record_count.max(0) as u64).sum());
+    }
+    for field in &fields {
+        let mut stat = ColumnStats::default();
+        if delete_files == 0 {
+            stat.nulls = data
+                .iter()
+                .map(|f| f.null_counts.get(&field.id).map(|n| (*n).max(0) as u64))
+                .sum();
+            if stat.nulls.is_none() {
+                out.note(
+                    "a data file records no null count for a column, so its nulls are not taken \
+                     by metadata",
+                );
+            }
+            let bounds = field.arrow_type.as_ref().map(|t| (t, exact_bounds(t)));
+            let (min, max) = match bounds {
+                Some((t, Ok(floats))) => match column_bounds(&data, field.id, t, floats)? {
+                    Ok(pair) => pair,
+                    Err(why) => {
+                        out.note(why);
+                        (None, None)
+                    }
+                },
+                Some((_, Err(why))) => {
+                    out.note(why);
+                    (None, None)
+                }
+                // A type this reader maps to none (`timestamp_ns`, a struct, a list, …).
+                None => {
+                    out.note(BOUNDS_TAKEN);
+                    (None, None)
+                }
+            };
+            stat.min = min;
+            stat.max = max;
+        }
+        out.stats.push((field.name.clone(), stat));
+    }
+    Ok(out)
+}
+
+/// The note for a column whose bounds are left out for its type, which is not one of those below.
+const BOUNDS_TAKEN: &str = "a column's minimum and maximum are taken from manifests only for \
+     booleans, integers, decimals, floats, dates, times and microsecond timestamps: others' are \
+     left out";
+
+/// Whether manifests make a column of type `dt`'s bounds exact: `Ok(true)` for a float, whose are
+/// exact only where no NaN was counted; `Err` with the reason when they are not.
+fn exact_bounds(dt: &DataType) -> std::result::Result<bool, &'static str> {
+    match dt {
+        DataType::Boolean
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Date32
+        | DataType::Time64(TimeUnit::Microsecond)
+        | DataType::Timestamp(TimeUnit::Microsecond, _)
+        | DataType::Decimal128(..) => Ok(false),
+        DataType::Float32 | DataType::Float64 => Ok(true),
+        DataType::Utf8 | DataType::Binary => Err(
+            "text and binary columns' minimum and maximum are left out: an Iceberg writer \
+             truncates them",
+        ),
+        // `uuid` and `fixed`, among others.
+        _ => Err(BOUNDS_TAKEN),
+    }
+}
+
+/// A column's least and greatest value, as `diff` prints a value.
+type Bounds = (Option<String>, Option<String>);
+
+/// The least and greatest of field `id`'s bounds over `data`, when every file that holds a value
+/// of it records both; otherwise why not. `floats`: they count only where every such file counted
+/// no NaN. A file whose every value of it is null needs no bounds.
+fn column_bounds(
+    data: &[FileStats],
+    id: i32,
+    dt: &DataType,
+    floats: bool,
+) -> Result<std::result::Result<Bounds, &'static str>> {
+    let mut values = Vec::with_capacity(data.len() * 2);
+    for f in data {
+        if f.null_counts.get(&id) == Some(&f.record_count) {
+            continue; // every value null: no bounds, and none needed
+        }
+        if floats && f.nan_counts.get(&id) != Some(&0) {
+            return Ok(Err(
+                "a data file counts a NaN in a float column, or records no NaN count for it, and \
+                 bounds leave NaN out: its minimum and maximum are not taken by metadata",
+            ));
+        }
+        let pair = f
+            .lower_bounds
+            .get(&id)
+            .zip(f.upper_bounds.get(&id))
+            .and_then(|(lo, hi)| bound_array(lo, dt).zip(bound_array(hi, dt)));
+        match pair {
+            Some((lo, hi)) => values.extend([lo, hi]),
+            None => {
+                return Ok(Err(
+                    "a data file records no bounds for a column, so its minimum and maximum are \
+                     not taken by metadata",
+                ))
+            }
+        }
+    }
+    crate::snapshot::extremes(&values).map(Ok)
+}
+
+/// An Iceberg single-value binary bound as a one-value array of type `dt`, exactly: no value goes
+/// through a float. A bound written before the column's type was widened (`int` to `long`,
+/// `float` to `double`) is read at its own width.
+fn bound_array(bytes: &[u8], dt: &DataType) -> Option<ArrayRef> {
+    use arrow_array::{BooleanArray, Float32Array, Int32Array, Int64Array};
+    let le4 = |b: &[u8]| -> Option<[u8; 4]> { b.try_into().ok() };
+    let le8 = |b: &[u8]| -> Option<[u8; 8]> { b.try_into().ok() };
+    let long = |b: &[u8]| match b.len() {
+        4 => le4(b).map(|b| i64::from(i32::from_le_bytes(b))),
+        _ => le8(b).map(i64::from_le_bytes),
+    };
+    Some(match dt {
+        DataType::Boolean => Arc::new(BooleanArray::from(vec![*bytes.first()? != 0])),
+        DataType::Int32 => Arc::new(Int32Array::from(vec![i32::from_le_bytes(le4(bytes)?)])),
+        DataType::Int64 => Arc::new(Int64Array::from(vec![long(bytes)?])),
+        DataType::Float32 => Arc::new(Float32Array::from(vec![f32::from_le_bytes(le4(bytes)?)])),
+        DataType::Float64 => Arc::new(Float64Array::from(vec![match bytes.len() {
+            4 => f64::from(f32::from_le_bytes(le4(bytes)?)),
+            _ => f64::from_le_bytes(le8(bytes)?),
+        }])),
+        DataType::Date32 => Arc::new(Date32Array::from(vec![i32::from_le_bytes(le4(bytes)?)])),
+        DataType::Time64(TimeUnit::Microsecond) => {
+            Arc::new(Time64MicrosecondArray::from(vec![long(bytes)?]))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let a = TimestampMicrosecondArray::from(vec![long(bytes)?]);
+            Arc::new(match tz {
+                Some(z) => a.with_timezone(z.clone()),
+                None => a,
+            })
+        }
+        DataType::Decimal128(p, s) => Arc::new(
+            Decimal128Array::from(vec![decode_i128_be(bytes)?])
+                .with_precision_and_scale(*p, *s)
+                .ok()?,
+        ),
+        _ => return None,
+    })
+}
+
 /// The planner body, wherever the table's files are.
 fn plan_inner(files: &dyn TableFiles) -> Result<TablePlan> {
     let (_, meta) = locate_metadata(files)?;
@@ -367,18 +818,24 @@ fn plan_from(files: &dyn TableFiles, meta: &[u8]) -> Result<TablePlan> {
         _ => {
             return Ok(TablePlan {
                 format_version,
+                committed_ms: meta.get("last-updated-ms").and_then(|v| v.as_i64()),
                 ..Default::default()
             })
         }
     };
-    let manifest_list = meta
+    let snapshot = meta
         .get("snapshots")
         .and_then(|v| v.as_array())
         .and_then(|snaps| {
             snaps
                 .iter()
                 .find(|s| s.get("snapshot-id").and_then(|v| v.as_i64()) == Some(current))
-        })
+        });
+    let committed_ms = snapshot
+        .and_then(|s| s.get("timestamp-ms"))
+        .and_then(|v| v.as_i64())
+        .or_else(|| meta.get("last-updated-ms").and_then(|v| v.as_i64()));
+    let manifest_list = snapshot
         .and_then(|s| s.get("manifest-list"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
@@ -540,6 +997,7 @@ fn plan_from(files: &dyn TableFiles, meta: &[u8]) -> Result<TablePlan> {
         single_partition_spec: has_single_partition_spec(&meta),
         skipped_non_parquet,
         format_version,
+        committed_ms,
     })
 }
 
@@ -613,7 +1071,11 @@ fn parse_transform(s: &str) -> Transform {
 
 /// Parse the table's current schema (v2 `schemas` + `current-schema-id`, else v1 `schema`).
 fn parse_current_schema(meta: &serde_json::Value) -> Option<IcebergSchema> {
-    let schema_obj = current_schema_object(meta)?;
+    parse_schema(current_schema_object(meta)?)
+}
+
+/// Parse one schema object's top-level fields.
+fn parse_schema(schema_obj: &serde_json::Value) -> Option<IcebergSchema> {
     let raw_fields = schema_obj.get("fields")?.as_array()?;
     let mut fields = Vec::with_capacity(raw_fields.len());
     for f in raw_fields {
@@ -1761,6 +2223,7 @@ pub fn prune(plan: &TablePlan, filters: &[FilterSpec]) -> (TablePlan, usize) {
             single_partition_spec: plan.single_partition_spec,
             skipped_non_parquet: plan.skipped_non_parquet,
             format_version: plan.format_version,
+            committed_ms: plan.committed_ms,
         },
         skipped,
     )
@@ -1871,6 +2334,18 @@ fn as_int_bytes_map(v: &Value) -> HashMap<i32, Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only text and binary bounds are said to be truncated; a `uuid` or `fixed` column's are left
+    /// out for its type, as is any other type's that is not exact.
+    #[test]
+    fn a_bounds_note_names_why_for_the_type() {
+        let note = |dt: DataType| exact_bounds(&dt).unwrap_err();
+        assert!(note(DataType::Utf8).contains("truncates"));
+        assert!(note(DataType::Binary).contains("truncates"));
+        assert_eq!(note(DataType::FixedSizeBinary(16)), BOUNDS_TAKEN);
+        assert_eq!(exact_bounds(&DataType::Int64), Ok(false));
+        assert_eq!(exact_bounds(&DataType::Float64), Ok(true));
+    }
 
     /// An equality-delete key over a `timestamptz` column encodes in every build, and alike for
     /// `UTC`, which a delete file read from Parquet calls its zone, and `+00:00`, which the table's

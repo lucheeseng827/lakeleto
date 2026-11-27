@@ -557,3 +557,108 @@ fn sql_reads_a_table_in_a_store_without_copying_it() {
     // The query reads every row of the current snapshot, and nothing else.
     assert!(s3.sent() < stored as u64, "sent {} of {stored}", s3.sent());
 }
+
+/// What `check` counts of a table in a store, as the call's identity: an Iceberg table's current
+/// snapshot's data files, their bytes as its manifest records them, and the snapshot's commit time
+/// from the metadata; a Parquet object's size and time from its own `HEAD`. Without an identity,
+/// nothing is asked of the store.
+#[test]
+fn a_tables_files_in_a_store_are_its_current_snapshots_and_its_time_is_the_metadatas() {
+    let s3 = FakeS3::start();
+    let stored = put_orders(&s3);
+    let meta = |name: &str| format!("{ORDERS}/metadata/{name}");
+    let mut current: serde_json::Value = serde_json::from_slice(&metadata(
+        ORDERS,
+        &[
+            (1, &uri(&meta("snap-1.avro"))),
+            (2, &uri(&meta("snap-2.avro"))),
+        ],
+    ))
+    .unwrap();
+    current["snapshots"][0]["timestamp-ms"] = serde_json::json!(1_700_000_000_000_i64);
+    current["snapshots"][1]["timestamp-ms"] = serde_json::json!(1_790_000_000_000_i64);
+    s3.put(
+        &meta("v2.metadata.json"),
+        serde_json::to_vec(&current).unwrap(),
+    );
+    let engine = LocalReaderEngine::default().with_store_options(s3.options());
+    let ctx = RequestContext::detached();
+
+    let seen = engine.files(&ctx, &orders()).unwrap();
+    assert_eq!(
+        seen.files,
+        Some(3),
+        "the current snapshot's, not the orphan or the old one"
+    );
+    let current_bytes: usize = ["a.parquet", "b.parquet", "c.parquet"]
+        .iter()
+        .map(|name| stored[&format!("{ORDERS}/data/{name}")])
+        .sum();
+    assert_eq!(seen.bytes, Some(current_bytes as u64));
+    assert_eq!(
+        seen.updated_ms,
+        Some(1_790_000_000_000),
+        "the current snapshot's"
+    );
+
+    let object = Source::with_format(uri(&format!("{ORDERS}/data/a.parquet")), Format::Parquet);
+    let seen = engine.files(&ctx, &object).unwrap();
+    assert_eq!(seen.files, Some(1));
+    assert_eq!(
+        seen.bytes,
+        Some(stored[&format!("{ORDERS}/data/a.parquet")] as u64)
+    );
+    // The fake store's `Last-Modified`: 2026-10-01T00:00:00Z.
+    assert_eq!(seen.updated_ms, Some(1_790_812_800_000));
+
+    let requests = s3.requests().len();
+    assert!(
+        LocalReaderEngine::default().files(&ctx, &object).is_err(),
+        "no identity, no request as the host"
+    );
+    assert_eq!(s3.requests().len(), requests);
+}
+
+/// A snapshot of a table in a store is compared by its metadata: the metadata file, the snapshot's
+/// manifest list and its manifests are all that is asked for. No data file is, so a snapshot whose
+/// files were since removed would compare the same.
+#[test]
+fn a_snapshot_in_a_store_is_described_by_its_manifests_alone() {
+    use lakeleto::snapshot::SnapshotRef;
+    let s3 = FakeS3::start();
+    put_orders(&s3);
+    let engine = LocalReaderEngine::default().with_store_options(s3.options());
+    let ctx = RequestContext::detached();
+
+    let one = engine
+        .metadata(&ctx, &orders(), Some(&SnapshotRef::Id(1)))
+        .unwrap();
+    assert_eq!(
+        (one.snapshot.as_deref(), one.rows, one.files),
+        (Some("1"), Some(10), 1)
+    );
+    let requests = s3.requests();
+    assert_eq!(
+        requests[requests.len() - 2..],
+        [
+            format!("GET {ORDERS}/metadata/snap-1.avro"),
+            format!("GET {ORDERS}/metadata/manifest-1.avro"),
+        ]
+    );
+    assert!(
+        !requests.iter().any(|r| r.contains("/data/")),
+        "no data file: {requests:#?}"
+    );
+
+    s3.reset();
+    let now = engine.metadata(&ctx, &orders(), None).unwrap();
+    assert_eq!(
+        (now.snapshot.as_deref(), now.rows, now.files),
+        (Some("2"), Some(90_000), 3)
+    );
+    assert!(
+        !s3.requests().iter().any(|r| r.contains("/data/")),
+        "{:#?}",
+        s3.requests()
+    );
+}

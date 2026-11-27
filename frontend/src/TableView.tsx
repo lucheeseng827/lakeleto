@@ -1,4 +1,4 @@
-// TableView — the per-tab explorer (Grid / Schema / Profile / SQL) for a single source.
+// TableView — the per-tab explorer (Grid / Schema / Profile / Diff / SQL) for a single source.
 // One of these renders inside each open workspace tab; it owns its own browse-fetch state
 // (grid/schema/profile) keyed on the tab's path + sort + filters, while sort/filters/sql live in
 // the tab object so they round-trip through the workspace store. SQL "Run" goes up to the shell
@@ -6,6 +6,7 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { displayPath, isJsonSource, normalizeJsonPath, type Backend, type Conn, type Profile, type Row, type SchemaResp } from "./api";
 import { Banner, Button, cellText, Chip, DataGrid, filterRows, Select, StatTable, Tabs, TextInput, Textarea } from "./components";
+import { DiffPane } from "./diff";
 import { useRowWindows } from "./windows";
 import { usedVars, type OpenTab, type SubView } from "./workspace";
 
@@ -17,14 +18,15 @@ const basename = (p: string) => { const i = Math.max(p.lastIndexOf("/"), p.lastI
 // Shows and copies a clean `C:\…` path instead of the server's canonical `\\?\C:\…`.
 const cleanPath = displayPath;
 
-/** One tab's explorer for a single source: its Grid, Schema, Profile and SQL views. */
-export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable, resolve, onOpenRow }: {
+/** One tab's explorer for a single source: its Grid, Schema, Profile, Diff and SQL views. Diff is
+ *  offered when `canDiff`: the server answers `GET /v1/diff`. */
+export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable, canDiff, resolve, onOpenRow }: {
   backend: Backend; conn: Conn; tab: OpenTab;
   onPatch: (p: Partial<OpenTab>) => void;
-  onRunSql: (sql: string) => void; sqlAvailable: boolean;
+  onRunSql: (sql: string) => void; sqlAvailable: boolean; canDiff: boolean;
   resolve: (s: string) => string; onOpenRow: (r: Row) => void;
 }) {
-  const { sub, sort, filters, sql } = tab;
+  const { sort, filters, sql } = tab;
   const flatten = !!tab.flatten;
   const jsonPath = tab.jsonPath ?? null;    // null: the reader detects the records
   const rpath = resolve(tab.path);          // {{var}} → value; the engine only ever sees resolved paths
@@ -32,6 +34,8 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
   // it (that errors "names a whole database"); show a table picker instead. Guarded HERE so a tab
   // that lands on a whole-DB path by ANY route (restore, launcher, add) browses rather than errors.
   const wholeDb = /^(sqlite|postgres|postgresql|mysql):\/\//i.test(rpath) && !/[?&]table=/.test(rpath);
+  // A tab left on Diff, on a server that has none or at a whole database, shows its grid.
+  const sub = tab.sub === "Diff" && (!canDiff || wholeDb) ? "Grid" : tab.sub;
   const [schema, setSchema] = useState<SchemaResp | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [dbTables, setDbTables] = useState<{ name: string; path: string }[] | null>(null);
@@ -115,6 +119,12 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
   const nFilters = Object.values(filters).filter((v) => v && v.trim()).length;
 
   const doExport = () => {
+    // Lakeleto Cloud takes the token only in a header, so its export is fetched rather than
+    // navigated to; a local `lakeleto serve` keeps the plain link, which streams.
+    if (conn.mode === "live" && conn.caps.ee && backend.download) {
+      backend.download({ path: rpath, fmt: exportFmt, sort, filters, flatten, jsonPath }).catch((e) => setErr((e as Error).message));
+      return;
+    }
     if (conn.mode === "live") { const u = backend.exportUrl({ path: rpath, fmt: exportFmt, sort, filters, flatten, jsonPath }); if (u) window.location.href = u; return; }
     backend.rows({ path: rpath, offset: 0, limit: 100000, sort, filters, flatten, jsonPath }).then((g) => {
       const names = g.columns.map((c) => c.name);
@@ -140,7 +150,7 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
   return (
     <main style={{ flex: "1 1 auto", minWidth: 0, display: "flex", flexDirection: "column" }}>
       <div style={{ padding: "var(--space-4) var(--gutter) 0", borderBottom: "var(--border-hairline)", background: "var(--panel)", flex: "0 0 auto" }}>
-        <Tabs tabs={["Grid", "Schema", "Profile", "SQL"]} value={sub} onChange={(t) => onPatch({ sub: t as SubView })} />
+        <Tabs tabs={canDiff && !wholeDb ? ["Grid", "Schema", "Profile", "Diff", "SQL"] : ["Grid", "Schema", "Profile", "SQL"]} value={sub} onChange={(t) => onPatch({ sub: t as SubView })} />
       </div>
       <div style={toolbar}>
         <span role="button" tabIndex={0} onClick={copyPath}
@@ -241,6 +251,10 @@ export function TableView({ backend, conn, tab, onPatch, onRunSql, sqlAvailable,
               distinct: c.distinct + (c.distinct_capped ? "+" : ""), min: c.min, max: c.max,
             }))} />
         </div>
+      )}
+
+      {!wholeDb && sub === "Diff" && (
+        <DiffPane backend={backend} path={rpath} flatten={flatten} jsonPath={jsonPath} tab={tab} onPatch={onPatch} sqlAvailable={sqlAvailable} />
       )}
 
       {sub === "SQL" && (

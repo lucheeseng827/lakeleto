@@ -123,6 +123,14 @@ async-trait = { version = "0.1", optional = true }   # `sql` — DataFusion's as
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"], optional = true }  # `remote` (the Lakeleto Cloud seam) and `catalog` (Iceberg REST)
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }  # `sql`/`serve` — async runtime
 axum = { version = "0.8", optional = true }          # `serve` — the HTTP/JSON backend the SPA + Lakeleto Cloud speak
+# `flight` — the read-only Flight SQL server. arrow-flight is on the 58 line, as the rest of Arrow is
+# (58.4.1 in the lock, in lockstep with DataFusion 54 and evald; `ops/size-budget.toml` holds arrow*
+# to one version), and its tonic 0.14 routes through the same axum 0.8.
+arrow-flight = { version = "58", default-features = false, features = ["flight-sql"], optional = true }
+tonic = { version = "0.14", default-features = false, features = ["transport", "router", "codegen", "tls-ring"], optional = true }  # `tls-ring`: --tls-cert, on the rustls and ring the release set already links
+prost = { version = "0.14", optional = true }        # `flight` — encode Flight SQL tickets and actions
+getrandom = { version = "0.3", optional = true }     # `flight` — statement handles no client can guess
+base64 = { version = "0.22", optional = true }       # `flight` — a handshake's `Basic` credentials
 # `debug-embed` embeds the SPA bundle even in debug builds, so `lakeleto serve`/`lakeleto open` are
 # self-contained (no runtime dependency on the source tree) from any working directory.
 rust-embed = { version = "8", features = ["debug-embed"], optional = true }  # `serve` — embed frontend/dist/ into the binary
@@ -139,6 +147,12 @@ toml = { version = "0.8", default-features = false, features = ["parse"], option
 object_store = { version = "0.13", default-features = false, features = ["aws", "gcp", "azure"], optional = true }
 url = { version = "2", optional = true }             # `object-store` — parse s3://… URIs
 futures = { version = "0.3", optional = true }        # `object-store` — drive the async parquet stream
+# `contracts` — `lakeleto check --contract`: a table's rows against an ODCS (or Covenant) data
+# contract, judged by Covenant's Arrow validator, in process. The published crate, by name and with
+# no path: the image, the public mirror and the paid layer's workspace all build this crate without
+# the sibling module beside it, which a path dependency would need even with the feature off. Its
+# Arrow and Parquet are the 58 line, the same crates as here.
+covenant = { package = "covenant-data", version = "0.2.1", default-features = false, features = ["arrow"], optional = true }
 # `sqlite`/`postgres`/`mysql` (umbrella `database`) — read-only BYO-database connectors. rustls TLS
 # (no OpenSSL); per-backend drivers are gated by their own feature so nothing unused is pulled in.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls"], optional = true }
@@ -207,6 +221,9 @@ object-store = [
 # build's other features read: `query` needs `sql` (or a database driver, for a database's own
 # SQL), and a catalog `catalog`.
 mcp = []
+# `contracts` lets `check --contract` judge every row against a data contract with Covenant. It
+# needs `sql`, whose engine streams the rows. Not in the release set yet: its size is unmeasured.
+contracts = ["sql", "dep:covenant"]
 # `parquet-out` lets the CLI write results as Parquet (`-o parquet`, or `--out` to a `.parquet`
 # file). It adds no crate, as `parquet` is linked to read, and is a feature for its bytes alone:
 # the writer is about 530 KB of the default build, against about 110 KB for the Arrow IPC writers
@@ -257,7 +274,17 @@ mysql = [
     "dep:tokio", "tokio/rt-multi-thread", "dep:futures",
 ]
 database = ["sqlite", "postgres", "mysql"]
+# `openlineage` sends a run of `check`, `diff` or an export to an OpenLineage endpoint (Marquez, or
+# any service that takes the standard's HTTP events), as `--openlineage <url>` or `OPENLINEAGE_URL`
+# asks: nothing is sent unless one does. It posts with the blocking reqwest client `remote` and
+# `catalog` already use, so a build with either adds no crate. Not in the release set yet.
+openlineage = ["dep:reqwest"]
+# `flight` serves the tables named on its command line to Flight SQL clients — ADBC (Python, R, Go,
+# Java), JDBC tools, notebooks — read-only, through the SQL engine. Not in the release set yet.
+flight = ["sql", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:getrandom", "dep:base64", "dep:futures", "tokio/net", "tokio/macros", "tokio/signal", "tokio/sync"]
 
 [dev-dependencies]
 tempfile = "3"                                       # write throwaway parquet/csv fixtures in tests
 tower = { version = "0.5", features = ["util"] }     # ServiceExt::oneshot — drive the `serve` router in tests, no socket
+jsonschema = { version = "0.46", default-features = false }  # OpenLineage events held to the published schemas (tests/openlineage/)
+rcgen = "0.14"                                       # a throwaway certificate for the Flight SQL TLS tests (tests/flight.rs)

@@ -21,7 +21,7 @@ use super::flatten::{flatten_rows, flatten_schema};
 use super::{
     apply_scan, build_table_schema, filter_batches, profile_columns, project_rows,
     truncate_batches, Capabilities, ColumnProfile, Engine, FilterSpec, RowBatch, ScanResult,
-    ScanSpec, TableProfile, TableSchema,
+    ScanSpec, TableFiles, TableProfile, TableSchema,
 };
 use crate::context::RequestContext;
 use crate::error::{EngineError, Result};
@@ -161,6 +161,136 @@ impl LocalReaderEngine {
         Ok((crate::iceberg::plan(&source.path)?, DataFiles::Local))
     }
 
+    /// Resolve the Delta read plan for `source`, and where its data files are read from: like
+    /// [`Self::iceberg_plan`], from disk for a table on this machine, and for one in an object
+    /// store through the store, as the call's identity — its log, the checkpoint the replay starts
+    /// from, and then its data files by ranged requests. Nothing is copied to disk.
+    #[cfg(feature = "delta")]
+    fn delta_plan(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+    ) -> Result<(crate::engine::delta::TablePlan, DataFiles)> {
+        self.delta_plan_at(ctx, source, &crate::engine::delta::Want::default())
+    }
+
+    /// [`Self::delta_plan`] as `want` asks: at an older version, or with its files' statistics.
+    /// The newest plan of a table on this machine is the memoized one.
+    #[cfg(feature = "delta")]
+    fn delta_plan_at(
+        &self,
+        #[cfg_attr(not(feature = "object-store"), allow(unused_variables))] ctx: &RequestContext,
+        source: &Source,
+        want: &crate::engine::delta::Want,
+    ) -> Result<(crate::engine::delta::TablePlan, DataFiles)> {
+        if source.is_remote() {
+            #[cfg(feature = "object-store")]
+            {
+                let uri = source.path.to_string_lossy();
+                let stores = crate::objstore::Stores::new(self.identity(ctx, uri.as_ref())?);
+                let plan = crate::engine::delta::plan_in_store(uri.as_ref(), &stores, ctx, want)?;
+                return Ok((plan, DataFiles::Store(stores)));
+            }
+            #[cfg(not(feature = "object-store"))]
+            return Err(remote_unavailable(source));
+        }
+        let plan = if *want == crate::engine::delta::Want::default() {
+            crate::engine::delta::plan(&source.path)?
+        } else {
+            crate::engine::delta::plan_at(&source.path, want)?
+        };
+        Ok((plan, DataFiles::Local))
+    }
+
+    /// A Delta plan's live row count: each file's rows as its `add` statistics record them, else
+    /// its footer's, so a table whose log records them all is counted without opening a file.
+    /// Exact: the plan refuses deletion vectors, the one way Delta deletes rows inside a file.
+    #[cfg(feature = "delta")]
+    fn delta_count(
+        &self,
+        ctx: &RequestContext,
+        plan: &crate::engine::delta::TablePlan,
+        files: &DataFiles,
+    ) -> Result<u64> {
+        let mut total: u64 = 0;
+        for f in &plan.files {
+            let rows = match f.num_records {
+                Some(rows) => rows,
+                None => {
+                    // One check per file opened — a Delta table can name thousands.
+                    ctx.check()?;
+                    let file = files.open_at(&f.path, f.size)?;
+                    file.metadata().file_metadata().num_rows().max(0) as u64
+                }
+            };
+            total = total.saturating_add(rows);
+        }
+        Ok(total)
+    }
+
+    /// Read an `offset..offset+limit` window of a Delta plan: walk its live files, skipping whole
+    /// files by the rows the log records (or, once a file is open, its footer's), and push the
+    /// residual offset and limit into the Parquet reader (row-group skipping). Each file's batches
+    /// are reordered to the table's schema, with its partition columns filled from its
+    /// `partitionValues`. The schema is the log's, so a table with no files reads as no rows.
+    #[cfg(feature = "delta")]
+    fn read_delta(
+        &self,
+        ctx: &RequestContext,
+        plan: &crate::engine::delta::TablePlan,
+        files: &DataFiles,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(SchemaRef, Vec<arrow_array::RecordBatch>)> {
+        let target = crate::engine::delta::schema(plan)?;
+        let mut batches = Vec::new();
+        let mut to_skip = offset;
+        let mut remaining = limit;
+        for f in &plan.files {
+            // One check per data file — a Delta table can name thousands.
+            ctx.check()?;
+            if remaining == 0 {
+                break;
+            }
+            // A file wholly before the window whose rows the log records is not opened: in an
+            // object store, opening one is a request for its footer.
+            if let Some(rows) = f.num_records {
+                let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+                if to_skip >= rows {
+                    to_skip -= rows;
+                    continue;
+                }
+            }
+            let file = files.open_at(&f.path, f.size)?;
+            let frows = file.metadata().file_metadata().num_rows().max(0) as usize;
+            if to_skip >= frows {
+                to_skip -= frows; // whole file is before the window — skip it
+                continue;
+            }
+            let want = remaining;
+            let mut got = 0usize;
+            file.read(
+                ctx,
+                RowsToRead {
+                    batch_size: remaining.clamp(1, self.batch_size),
+                    offset: to_skip,
+                    limit: Some(remaining),
+                    row_groups: None,
+                },
+                |b| {
+                    got += b.num_rows();
+                    batches.push(crate::engine::delta::project_file_batch(
+                        &b, &target, plan, f,
+                    )?);
+                    Ok(got < want)
+                },
+            )?;
+            remaining = remaining.saturating_sub(got);
+            to_skip = 0;
+        }
+        Ok((target, batches))
+    }
+
     /// Plan a table a catalog serves: load it through the catalog, as the call, and plan from the
     /// metadata the catalog handed over. Also says whose credentials read the files, for a table in
     /// an object store: `vended`, `catalog` or `ambient`.
@@ -174,14 +304,63 @@ impl LocalReaderEngine {
         ctx: &RequestContext,
         source: &Source,
     ) -> Result<(crate::iceberg::TablePlan, DataFiles, Option<&'static str>)> {
+        let loaded = self.catalog_table(ctx, source)?;
+        match loaded.place {
+            CatalogPlace::Store(stores, credentials) => {
+                let plan = crate::iceberg::plan_metadata_in_store(
+                    &loaded.table,
+                    &loaded.metadata,
+                    &stores,
+                    ctx,
+                )
+                .map_err(|e| read_with(e, &loaded.reference, credentials))?;
+                Ok((plan, DataFiles::Store(stores), Some(credentials)))
+            }
+            CatalogPlace::Local(dir) => Ok((
+                crate::iceberg::plan_metadata_local(&dir, &loaded.metadata)?,
+                DataFiles::Local,
+                None,
+            )),
+        }
+    }
+
+    /// A table a catalog serves, described by its metadata at snapshot `at`: loaded as
+    /// [`Self::catalog_plan`] loads it, with the same credentials.
+    #[cfg(feature = "catalog")]
+    fn catalog_describe(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        at: Option<&crate::snapshot::SnapshotRef>,
+    ) -> Result<crate::snapshot::TableMetadata> {
+        let loaded = self.catalog_table(ctx, source)?;
+        match loaded.place {
+            CatalogPlace::Store(stores, credentials) => crate::iceberg::describe_metadata_in_store(
+                &loaded.table,
+                &loaded.metadata,
+                &stores,
+                ctx,
+                at,
+            )
+            .map_err(|e| read_with(e, &loaded.reference, credentials)),
+            CatalogPlace::Local(dir) => {
+                crate::iceberg::describe_metadata_local(&dir, &loaded.metadata, at)
+            }
+        }
+    }
+
+    /// Load a table through the catalog that serves it, as the call: its current metadata, its
+    /// root, and where its files are read from, with whose credentials.
+    #[cfg(feature = "catalog")]
+    fn catalog_table(&self, ctx: &RequestContext, source: &Source) -> Result<CatalogTable> {
         use crate::catalog::TableStorage;
         let reference = crate::catalog::CatalogRef::parse(&source.path.to_string_lossy())?;
         let handle = self.catalogs.load_table(ctx, &reference)?;
-        let metadata = handle.metadata.as_deref().ok_or_else(|| {
+        let metadata = handle.metadata.clone().ok_or_else(|| {
             EngineError::Other(format!("{reference}: the catalog handed over no metadata"))
         })?;
         let location = handle.location.to_string_lossy().into_owned();
-        let table = table_root(metadata, &location);
+        let table = table_root(&metadata, &location);
         if crate::source::is_object_uri(&location) {
             let options: std::borrow::Cow<'_, crate::objstore::StoreOptions> = match &handle.storage
             {
@@ -200,9 +379,12 @@ impl LocalReaderEngine {
                 .as_ref()
                 .map_or("ambient", TableStorage::source);
             let stores = crate::objstore::Stores::new(&options);
-            let plan = crate::iceberg::plan_metadata_in_store(&table, metadata, &stores, ctx)
-                .map_err(|e| read_with(e, &reference, credentials))?;
-            return Ok((plan, DataFiles::Store(stores), Some(credentials)));
+            return Ok(CatalogTable {
+                reference,
+                metadata,
+                table,
+                place: CatalogPlace::Store(stores, credentials),
+            });
         }
         let dir = local_path(&table).ok_or_else(|| EngineError::UnsupportedFormat {
             detail: format!(
@@ -210,8 +392,34 @@ impl LocalReaderEngine {
                  store Lakeleto reads"
             ),
         })?;
-        let plan = crate::iceberg::plan_metadata_local(&dir, metadata)?;
-        Ok((plan, DataFiles::Local, None))
+        Ok(CatalogTable {
+            reference,
+            metadata,
+            table,
+            place: CatalogPlace::Local(dir),
+        })
+    }
+
+    /// [`Engine::metadata`] for an Iceberg table wherever it is: on this machine, in an object
+    /// store, or behind a catalog, each read as the call's identity.
+    #[cfg(feature = "iceberg")]
+    fn iceberg_describe(
+        &self,
+        #[cfg_attr(not(feature = "object-store"), allow(unused_variables))] ctx: &RequestContext,
+        source: &Source,
+        at: Option<&crate::snapshot::SnapshotRef>,
+    ) -> Result<crate::snapshot::TableMetadata> {
+        #[cfg(feature = "catalog")]
+        if source.is_catalog() {
+            return self.catalog_describe(ctx, source, at);
+        }
+        #[cfg(feature = "object-store")]
+        if source.is_remote() {
+            let uri = source.path.to_string_lossy();
+            let stores = crate::objstore::Stores::new(self.identity(ctx, uri.as_ref())?);
+            return crate::iceberg::describe_in_store(uri.as_ref(), &stores, ctx, at);
+        }
+        crate::iceberg::describe(&source.path, at)
     }
 
     /// The exact row count when the format carries one cheaply (a Parquet or Arrow footer,
@@ -306,7 +514,7 @@ impl LocalReaderEngine {
             let schema = self.file_schema(ctx, source, reader)?.schema;
             return Ok((schema, self.row_count(ctx, source)?));
         }
-        if source.is_remote() && !matches!(source.format, Format::Iceberg) {
+        if source.is_remote() && !matches!(source.format, Format::Iceberg | Format::Delta) {
             return self.remote_schema(ctx, source);
         }
         if is_parquet_dataset(source) {
@@ -329,10 +537,10 @@ impl LocalReaderEngine {
             }
             #[cfg(feature = "delta")]
             Format::Delta => {
-                let plan = crate::engine::delta::plan(&source.path)?;
+                let (plan, files) = self.delta_plan(ctx, source)?;
                 Ok((
                     crate::engine::delta::schema(&plan)?,
-                    Some(crate::engine::delta::row_count(&plan)?),
+                    Some(self.delta_count(ctx, &plan, &files)?),
                 ))
             }
             other => Err(EngineError::unsupported_format(other, self.name())),
@@ -349,7 +557,7 @@ impl LocalReaderEngine {
         if let Some(reader) = format::reader(source.format) {
             return self.file_rows(ctx, source, reader, row_limit);
         }
-        if source.is_remote() && !matches!(source.format, Format::Iceberg) {
+        if source.is_remote() && !matches!(source.format, Format::Iceberg | Format::Delta) {
             return self.remote_window(ctx, source, 0, row_limit.unwrap_or(usize::MAX));
         }
         if is_parquet_dataset(source) {
@@ -413,7 +621,7 @@ impl LocalReaderEngine {
                 reader.window(ctx, input, &self.read_options(source), offset, limit)
             });
         }
-        if source.is_remote() && !matches!(source.format, Format::Iceberg) {
+        if source.is_remote() && !matches!(source.format, Format::Iceberg | Format::Delta) {
             return self.remote_window(ctx, source, offset, limit);
         }
         if is_parquet_dataset(source) {
@@ -461,8 +669,8 @@ impl LocalReaderEngine {
             }
             #[cfg(feature = "delta")]
             Format::Delta => {
-                let plan = crate::engine::delta::plan(&source.path)?;
-                crate::engine::delta::read_window(&plan, offset, limit)
+                let (plan, files) = self.delta_plan(ctx, source)?;
+                self.read_delta(ctx, &plan, &files, offset, limit)
             }
             other => Err(EngineError::unsupported_format(other, self.name())),
         }
@@ -665,6 +873,8 @@ impl LocalReaderEngine {
                     name: field.name().clone(),
                     data_type: format!("{}", field.data_type()),
                     null_count: 0,
+                    // Not 0 nulls: none counted. A file of no rows has none to count.
+                    null_count_known: row_count == 0,
                     null_fraction: 0.0,
                     distinct: 0,
                     distinct_capped: false,
@@ -686,8 +896,8 @@ impl LocalReaderEngine {
                 .row_group_maxes(row_groups.iter().copied())
                 .map_err(EngineError::parquet)?;
 
-            // Null count is exact only when every row group reported it.
-            let null_complete = !nulls.is_empty() && nulls.null_count() == 0;
+            // Null count is exact only when every row group reported it — or there are no rows.
+            let null_complete = row_count == 0 || (!nulls.is_empty() && nulls.null_count() == 0);
             let null_count: u64 = nulls.iter().flatten().sum();
             let min = array_extreme_str(&mins, false)?;
             let max = array_extreme_str(&maxes, true)?;
@@ -698,6 +908,7 @@ impl LocalReaderEngine {
                 name: field.name().clone(),
                 data_type: format!("{}", field.data_type()),
                 null_count: if null_complete { null_count } else { 0 },
+                null_count_known: null_complete,
                 null_fraction: if null_complete && row_count > 0 {
                     null_count as f64 / row_count as f64
                 } else {
@@ -831,9 +1042,9 @@ impl LocalReaderEngine {
     /// A plain window of `source`, and the table's exact row count when it carries one cheaply
     /// (Parquet carries an exact total in its footer; CSV does not).
     ///
-    /// An Iceberg table is planned once for both: for a table in an object store, planning is
-    /// requests for its metadata and manifests, which the window and the count would otherwise
-    /// each make.
+    /// An Iceberg or Delta table is planned once for both: for a table in an object store,
+    /// planning is requests for its metadata and manifests, or its log, which the window and the
+    /// count would otherwise each make.
     fn window_and_count(
         &self,
         ctx: &RequestContext,
@@ -847,6 +1058,13 @@ impl LocalReaderEngine {
             let (schema, batches) =
                 self.read_iceberg(ctx, source, &plan, &files, spec.offset, spec.limit, None)?;
             return Ok((schema, batches, self.iceberg_count(ctx, &plan, &files)?));
+        }
+        // A Delta table likewise: in a store, planning is requests for its log and checkpoint.
+        #[cfg(feature = "delta")]
+        if source.format == Format::Delta {
+            let (plan, files) = self.delta_plan(ctx, source)?;
+            let (schema, batches) = self.read_delta(ctx, &plan, &files, spec.offset, spec.limit)?;
+            return Ok((schema, batches, Some(self.delta_count(ctx, &plan, &files)?)));
         }
         let (schema, batches) = self.read_window(ctx, source, spec.offset, spec.limit, proj)?;
         Ok((schema, batches, self.row_count(ctx, source)?))
@@ -1123,6 +1341,110 @@ impl LocalReaderEngine {
     }
 }
 
+/// The data files `engine` reads for `source`, their bytes, and when the table last changed: an
+/// Iceberg table's from its current snapshot, wherever it is (this machine, a store, a catalog),
+/// as the call's identity; a Delta table's from its log, on this machine or in a store; a Parquet
+/// directory's `.parquet` files, which are the files it reads; a single file's, or object's, from
+/// itself. Nothing for what this engine reads no files for here.
+fn table_files(
+    #[cfg_attr(
+        not(any(feature = "iceberg", feature = "object-store")),
+        allow(unused_variables)
+    )]
+    engine: &LocalReaderEngine,
+    #[cfg_attr(
+        not(any(feature = "iceberg", feature = "object-store")),
+        allow(unused_variables)
+    )]
+    ctx: &RequestContext,
+    source: &Source,
+) -> Result<TableFiles> {
+    // A source nothing here resolved is another machine's to read, and a Delta table in a store
+    // is one a build without `object-store` does not read.
+    if source.is_unresolved()
+        || (source.format == Format::Delta && source.is_remote() && !cfg!(feature = "object-store"))
+    {
+        return Ok(TableFiles::default());
+    }
+    #[cfg(feature = "iceberg")]
+    if source.format == Format::Iceberg {
+        let (plan, _) = engine.iceberg_plan(ctx, source)?;
+        // A data file the reader skips (ORC, Avro) is still the table's, of a size not known.
+        let skipped = plan.skipped_non_parquet as u64;
+        let bytes = if skipped > 0 {
+            None
+        } else {
+            plan.files.iter().map(|f| f.size).sum()
+        };
+        return Ok(TableFiles {
+            files: Some(plan.files.len() as u64 + skipped),
+            bytes,
+            updated_ms: plan.committed_ms,
+        });
+    }
+    #[cfg(feature = "delta")]
+    if source.format == Format::Delta {
+        let (plan, _) = engine.delta_plan(ctx, source)?;
+        return Ok(TableFiles {
+            files: Some(plan.files.len() as u64),
+            bytes: plan.files.iter().map(|f| f.size).sum(),
+            updated_ms: plan.committed_ms,
+        });
+    }
+    if source.is_catalog() || matches!(source.format, Format::Iceberg | Format::Delta) {
+        return Ok(TableFiles::default());
+    }
+    if source.is_remote() {
+        #[cfg(feature = "object-store")]
+        {
+            let uri = source.path.to_string_lossy();
+            let (size, modified) =
+                crate::objstore::object_meta_with(&uri, engine.identity(ctx, &uri)?)?;
+            return Ok(TableFiles {
+                files: Some(1),
+                bytes: Some(size),
+                updated_ms: Some(modified),
+            });
+        }
+        #[cfg(not(feature = "object-store"))]
+        return Ok(TableFiles::default());
+    }
+    if is_parquet_dataset(source) {
+        return Ok(local_files(&crate::source::list_parquet_files(
+            &source.path,
+        )));
+    }
+    if source.path.is_file() {
+        return Ok(local_files(std::slice::from_ref(&source.path)));
+    }
+    Ok(TableFiles::default())
+}
+
+/// These files on this machine: how many, their bytes, and the latest any was modified. Nothing
+/// when one cannot be read: a count missing a file would understate.
+fn local_files(files: &[std::path::PathBuf]) -> TableFiles {
+    let (mut bytes, mut updated_ms) = (0u64, None::<i64>);
+    for file in files {
+        let Ok(meta) = std::fs::metadata(file) else {
+            return TableFiles::default();
+        };
+        bytes = bytes.saturating_add(meta.len());
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_millis()).ok());
+        if let Some(ms) = modified {
+            updated_ms = Some(updated_ms.map_or(ms, |at| at.max(ms)));
+        }
+    }
+    TableFiles {
+        files: Some(files.len() as u64),
+        bytes: Some(bytes),
+        updated_ms,
+    }
+}
+
 /// Is this source a directory of Parquet files (a multi-file dataset) rather than a single file?
 fn is_parquet_dataset(source: &Source) -> bool {
     source.format == Format::Parquet && !source.is_remote() && source.path.is_dir()
@@ -1225,7 +1547,7 @@ fn remote_unavailable(source: &Source) -> EngineError {
 /// its metadata names, when that is where its metadata file is (both in an object store, or both
 /// on this machine), else the directory above the metadata file's `metadata/` directory.
 #[cfg(feature = "catalog")]
-fn table_root(metadata: &[u8], metadata_location: &str) -> String {
+pub(crate) fn table_root(metadata: &[u8], metadata_location: &str) -> String {
     let in_store = crate::source::is_object_uri;
     let named = serde_json::from_slice::<serde_json::Value>(metadata)
         .ok()
@@ -1270,27 +1592,54 @@ fn read_with(
     }
 }
 
-/// Where an Iceberg plan's data files are read from: this machine, or the object store the table
-/// is in, by ranged requests, as the identity that planned it.
-#[cfg(feature = "iceberg")]
+/// A table loaded through its catalog: its current metadata and root, and where its files are.
+#[cfg(feature = "catalog")]
+struct CatalogTable {
+    reference: crate::catalog::CatalogRef,
+    metadata: bytes::Bytes,
+    /// The table's root, which relative paths in its metadata resolve against.
+    table: String,
+    place: CatalogPlace,
+}
+
+/// Where a catalog's table is read from: an object store, with whose credentials (`vended`,
+/// `catalog` or `ambient`), or this machine.
+#[cfg(feature = "catalog")]
+enum CatalogPlace {
+    Store(crate::objstore::Stores, &'static str),
+    Local(std::path::PathBuf),
+}
+
+/// Where an Iceberg or Delta plan's data files are read from: this machine, or the object store
+/// the table is in, by ranged requests, as the identity that planned it.
+#[cfg(any(feature = "iceberg", feature = "delta"))]
 enum DataFiles {
     Local,
     #[cfg(feature = "object-store")]
     Store(crate::objstore::Stores),
 }
 
-#[cfg(feature = "iceberg")]
+#[cfg(any(feature = "iceberg", feature = "delta"))]
 impl DataFiles {
-    /// Open one of the plan's data files: its footer is read, its rows are not yet.
+    /// Open one of an Iceberg plan's data files: its footer is read, its rows are not yet.
+    #[cfg(feature = "iceberg")]
     fn open(&self, file: &crate::iceberg::DataFileEntry) -> Result<ParquetFile> {
+        self.open_at(&file.path, file.size)
+    }
+
+    /// Open the data file at `path` (a URI, in a store), whose size the plan may record: its
+    /// footer is read, its rows are not yet.
+    fn open_at(&self, path: &std::path::Path, size: Option<u64>) -> Result<ParquetFile> {
+        #[cfg(not(feature = "object-store"))]
+        let _ = size;
         match self {
             DataFiles::Local => Ok(ParquetFile::Local(
-                ParquetRecordBatchReaderBuilder::try_new(File::open(&file.path)?)
+                ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)
                     .map_err(EngineError::parquet)?,
             )),
             #[cfg(feature = "object-store")]
             DataFiles::Store(stores) => Ok(ParquetFile::Remote(
-                stores.parquet(&file.path.to_string_lossy(), file.size)?,
+                stores.parquet(&path.to_string_lossy(), size)?,
             )),
         }
     }
@@ -1298,7 +1647,7 @@ impl DataFiles {
 
 /// A Parquet data file opened for reading: from disk, or from an object store by ranged requests,
 /// which fetch only the row groups and columns a read asks for.
-#[cfg(feature = "iceberg")]
+#[cfg(any(feature = "iceberg", feature = "delta"))]
 enum ParquetFile {
     Local(ParquetRecordBatchReaderBuilder<File>),
     #[cfg(feature = "object-store")]
@@ -1310,7 +1659,7 @@ enum ParquetFile {
 }
 
 /// Which of a Parquet file's rows to read, set on its reader the same way wherever the file is.
-#[cfg(feature = "iceberg")]
+#[cfg(any(feature = "iceberg", feature = "delta"))]
 struct RowsToRead {
     batch_size: usize,
     offset: usize,
@@ -1318,7 +1667,7 @@ struct RowsToRead {
     row_groups: Option<Vec<usize>>,
 }
 
-#[cfg(feature = "iceberg")]
+#[cfg(any(feature = "iceberg", feature = "delta"))]
 impl RowsToRead {
     fn apply<T>(
         self,
@@ -1338,8 +1687,10 @@ impl RowsToRead {
     }
 }
 
-#[cfg(feature = "iceberg")]
+#[cfg(any(feature = "iceberg", feature = "delta"))]
 impl ParquetFile {
+    /// The file's own Arrow schema. A Delta read takes the log's instead.
+    #[cfg(feature = "iceberg")]
     fn schema(&self) -> &SchemaRef {
         match self {
             ParquetFile::Local(builder) => builder.schema(),
@@ -1453,6 +1804,61 @@ fn apply_equality_deletes(
 }
 
 impl Engine for LocalReaderEngine {
+    fn files(&self, ctx: &RequestContext, source: &Source) -> Result<TableFiles> {
+        table_files(self, ctx, source)
+    }
+
+    fn metadata(
+        &self,
+        #[cfg_attr(
+            not(any(feature = "iceberg", feature = "delta")),
+            allow(unused_variables)
+        )]
+        ctx: &RequestContext,
+        source: &Source,
+        #[cfg_attr(
+            not(any(feature = "iceberg", feature = "delta")),
+            allow(unused_variables)
+        )]
+        at: Option<&crate::snapshot::SnapshotRef>,
+    ) -> Result<crate::snapshot::TableMetadata> {
+        let described: Result<crate::snapshot::TableMetadata> = match source.format {
+            #[cfg(feature = "delta")]
+            Format::Delta => {
+                use crate::snapshot::SnapshotRef;
+                let want = crate::engine::delta::Want {
+                    version: match at {
+                        Some(SnapshotRef::Id(v)) => Some(u64::try_from(*v).map_err(|_| {
+                            EngineError::Other(format!("a Delta version is never negative: {v}"))
+                        })?),
+                        _ => None,
+                    },
+                    instant_ms: match at {
+                        Some(SnapshotRef::At { ms, .. }) => Some(*ms),
+                        _ => None,
+                    },
+                    stats: true,
+                };
+                let (plan, _) = self.delta_plan_at(ctx, source, &want)?;
+                crate::engine::delta::describe(&plan)
+            }
+            #[cfg(feature = "iceberg")]
+            Format::Iceberg => self.iceberg_describe(ctx, source, at),
+            other => Err(EngineError::UnsupportedFormat {
+                detail: format!(
+                    "{} is {other}: a snapshot is compared by a table format's own metadata, \
+                         which only an Iceberg or a Delta table keeps",
+                    source.display()
+                ),
+            }),
+        };
+        let mut described = described?;
+        described.source = source.display();
+        described.format = source.format.as_str().to_string();
+        described.engine = self.name().to_string();
+        Ok(described)
+    }
+
     fn name(&self) -> &str {
         "local"
     }

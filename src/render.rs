@@ -30,6 +30,11 @@ pub enum Output {
     Arrow,
     /// Arrow IPC stream (`.arrows`), the one to pipe: `polars.read_ipc_stream(sys.stdin.buffer)`.
     Arrows,
+    /// Markdown: `diff`'s report, for a pull request or an issue. No other command has this form.
+    #[value(alias = "md")]
+    Markdown,
+    /// JUnit XML: `check`'s report, as the tests a CI system shows. No other command has this form.
+    Junit,
 }
 
 /// Whether this build writes Parquet: the `parquet-out` feature, which the release builds have.
@@ -69,6 +74,8 @@ impl Output {
             "tsv" => Output::Tsv,
             "json" => Output::Json,
             "ndjson" | "jsonl" => Output::Ndjson,
+            "md" | "markdown" => Output::Markdown,
+            "xml" => Output::Junit,
             _ => return None,
         })
     }
@@ -84,6 +91,8 @@ impl Output {
             Output::Parquet => "parquet",
             Output::Arrow => "arrow",
             Output::Arrows => "arrows",
+            Output::Markdown => "markdown",
+            Output::Junit => "junit",
         }
     }
 }
@@ -103,6 +112,12 @@ pub fn rows(rb: &RowBatch, output: Output) -> Result<String> {
             "`{}` output is binary and is written with `stream_rows`, not rendered as text",
             output.name()
         ))),
+        Output::Markdown => Err(EngineError::Other(
+            "`markdown` is `diff`'s report form; rows have none".to_string(),
+        )),
+        Output::Junit => Err(EngineError::Other(
+            "`junit` is `check`'s report form; rows have none".to_string(),
+        )),
     }
 }
 
@@ -129,6 +144,17 @@ pub fn stream_rows<W: std::io::Write + Send>(
     out: &mut W,
 ) -> Result<usize> {
     match output {
+        // Rows have no Markdown form: refused before the stream is read, empty or not.
+        Output::Markdown => {
+            return Err(EngineError::Other(
+                "`markdown` is `diff`'s report form; rows have none".to_string(),
+            ))
+        }
+        Output::Junit => {
+            return Err(EngineError::Other(
+                "`junit` is `check`'s report form; rows have none".to_string(),
+            ))
+        }
         #[cfg(feature = "parquet-out")]
         Output::Parquet => return stream_parquet(stream, out),
         #[cfg(not(feature = "parquet-out"))]
@@ -898,8 +924,17 @@ pub fn profile(p: &TableProfile, output: Output) -> Result<String> {
         table.push(vec![
             truncate(&c.name, MAX_CELL),
             truncate(&c.data_type, MAX_CELL),
-            c.null_count.to_string(),
-            format!("{:.1}%", c.null_fraction * 100.0),
+            // Not 0: a footer that did not record the column's nulls counted none.
+            if c.null_count_known {
+                c.null_count.to_string()
+            } else {
+                "?".to_string()
+            },
+            if c.null_count_known {
+                format!("{:.1}%", c.null_fraction * 100.0)
+            } else {
+                "?".to_string()
+            },
             distinct,
             truncate(c.min.as_deref().unwrap_or("·"), 24),
             truncate(c.max.as_deref().unwrap_or("·"), 24),
@@ -933,7 +968,8 @@ pub struct SourceInfo {
     pub format: Option<String>,
     /// The engine that read the schema.
     pub engine: String,
-    /// The file's size, from the filesystem; `GET /v1/info` also asks an object store for an
+    /// The file's size, from the filesystem — for a table that is a directory, the files under
+    /// it ([`crate::source::size_on_disk`]); `GET /v1/info` also asks an object store for an
     /// object's. `None` when neither knows it, as for a catalog table.
     pub size_bytes: Option<u64>,
     /// The row count, where the format records one, as a Parquet footer or an Iceberg snapshot
@@ -965,10 +1001,12 @@ pub fn info(i: &SourceInfo, output: Output) -> Result<String> {
         Output::Json => json(serde_json::to_string_pretty(i)),
         Output::Ndjson => json(serde_json::to_string(i)),
         Output::Csv | Output::Tsv => rows(&info_row(i)?, output),
-        Output::Parquet | Output::Arrow | Output::Arrows => Err(EngineError::Other(format!(
-            "`-o {}` writes rows, and `info` prints a description: use `-o json`",
-            output.name()
-        ))),
+        Output::Parquet | Output::Arrow | Output::Arrows | Output::Markdown | Output::Junit => {
+            Err(EngineError::Other(format!(
+                "`-o {}` is not a form `info` prints: use `-o json`",
+                output.name()
+            )))
+        }
     }
 }
 

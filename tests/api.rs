@@ -86,14 +86,7 @@ fn app_store(store: Arc<dyn WorkspaceStore>) -> axum::Router {
 }
 
 async fn get_json(uri: &str) -> (StatusCode, serde_json::Value) {
-    let resp = app()
-        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-    (status, json)
+    get_json_on(app(), uri).await
 }
 
 #[tokio::test]
@@ -1995,7 +1988,7 @@ fn advertised(engines: &serde_json::Value) -> Vec<String> {
 async fn engines_names_the_protocol_and_every_engine() {
     let engines = engines_of(app()).await;
     assert_eq!(engines["protocol"], lakeleto::protocol::PROTOCOL_VERSION);
-    assert_eq!(engines["protocol"], "1.0");
+    assert_eq!(engines["protocol"], "1.3");
     // A server that only reads has one engine, and it is the one `engine` names.
     assert_eq!(engines["engines"].as_array().unwrap().len(), 1);
     assert_eq!(engines["engines"][0], engines["engine"]);
@@ -2251,6 +2244,41 @@ async fn info_reports_a_size_for_a_local_file() {
     let on_disk = std::fs::metadata(CSV).unwrap().len();
     assert_eq!(json["size_bytes"].as_u64().unwrap(), on_disk);
     assert_eq!(json["format"], "csv");
+}
+
+/// A table that is a directory — a partitioned Parquet dataset — is sized by the files under it,
+/// as `lakeleto info` sizes it; its own entry is 4 KiB whatever it holds.
+#[tokio::test]
+async fn info_sizes_a_table_directory_by_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = dir.path().join("events");
+    let mut total = 0;
+    for (part, ids) in [
+        ("day=1/part-0.parquet", 0..50),
+        ("day=2/part-0.parquet", 50..200),
+    ] {
+        let out = table.join(part);
+        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+        let batch = arrow_array::RecordBatch::try_from_iter([(
+            "id",
+            std::sync::Arc::new(arrow_array::Int64Array::from_iter_values(ids))
+                as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let mut w = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&out).unwrap(),
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        total += std::fs::metadata(&out).unwrap().len();
+    }
+    let (status, json) = get_json(&format!("/v1/info?path={}", table.display())).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["format"], "parquet", "{json}");
+    assert_eq!(json["size_bytes"].as_u64().unwrap(), total, "{json}");
 }
 
 /// `GET /v1/info` answers in the shape `lakeleto info -o json` prints (`render::SourceInfo`): these
@@ -2799,4 +2827,675 @@ async fn a_catalog_reference_is_refused_under_root() {
             String::from_utf8_lossy(&body)
         );
     }
+}
+
+// ---- new tables: `POST /v1/tables` and saving a run as a table ---------------------------
+
+/// A server that writes new tables under `write_dir`, with the SQL engine when the build has it.
+fn app_writes(
+    root: Option<&std::path::Path>,
+    write_dir: &std::path::Path,
+    store: Arc<dyn WorkspaceStore>,
+) -> axum::Router {
+    let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
+    let registry = EngineRegistry::new(read);
+    #[cfg(feature = "sql")]
+    let registry = registry.with_sql(Arc::new(lakeleto::engine::sql::DataFusionEngine::new()));
+    lakeleto::api::router_with_writes(
+        registry,
+        10_000,
+        None,
+        root.map(|r| std::fs::canonicalize(r).unwrap()),
+        true,
+        store,
+        Some(lakeleto::table_out::WriteDir::open(write_dir).unwrap()),
+    )
+}
+
+fn temp_store() -> (tempfile::TempDir, Arc<dyn WorkspaceStore>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn WorkspaceStore> = Arc::new(LocalStore::at(dir.path()).unwrap());
+    (dir, store)
+}
+
+#[tokio::test]
+async fn a_server_without_a_write_dir_writes_nothing_and_says_so() {
+    let (st, body) = send(
+        app(),
+        "POST",
+        "/v1/tables",
+        Some(serde_json::json!({ "name": "t", "file": CSV })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("--write-dir"),
+        "{body}"
+    );
+
+    let (st, _) = send(
+        app(),
+        "POST",
+        "/v1/workspaces/ws-x/runs/run-y/table",
+        Some(serde_json::json!({ "name": "t" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    let (_, engines) = get_json("/v1/engines").await;
+    assert!(engines.get("writes").is_none(), "{engines}");
+    let endpoints = engines["endpoints"].as_array().unwrap();
+    assert!(
+        !endpoints
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("/table")),
+        "write endpoints advertised by a server that cannot write: {endpoints:?}"
+    );
+}
+
+#[tokio::test]
+async fn post_tables_copies_a_table_and_never_replaces_one() {
+    let out = tempfile::tempdir().unwrap();
+    let (_s, store) = temp_store();
+    let body = serde_json::json!({ "name": "copies/people", "file": CSV });
+
+    let (st, t) = send(
+        app_writes(None, out.path(), store.clone()),
+        "POST",
+        "/v1/tables",
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    assert_eq!(t["rows"], 8);
+    assert_eq!(t["name"], "copies/people");
+    let path = std::path::PathBuf::from(t["path"].as_str().unwrap());
+    assert!(
+        path.ends_with("copies/people.parquet"),
+        "{}",
+        path.display()
+    );
+    let prov = lakeleto::table_out::read_provenance(&path)
+        .unwrap()
+        .expect("provenance in the footer");
+    match &prov.from {
+        lakeleto::table_out::Origin::Query { sql, tables } => {
+            assert_eq!(sql, &None, "a copy has no SQL");
+            assert_eq!(tables.len(), 1);
+            assert!(tables[0].path.ends_with("people.csv"), "{tables:?}");
+        }
+        other => panic!("unexpected origin {other:?}"),
+    }
+
+    // The same name again is refused, and the table is left exactly as it was.
+    let before = std::fs::read(&path).unwrap();
+    let (st, err) = send(
+        app_writes(None, out.path(), store.clone()),
+        "POST",
+        "/v1/tables",
+        Some(body),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // A name that is a path is refused before anything is read.
+    for bad in ["../escape", "/abs", "a/b/c/d", "dot.ted"] {
+        let (st, err) = send(
+            app_writes(None, out.path(), store.clone()),
+            "POST",
+            "/v1/tables",
+            Some(serde_json::json!({ "name": bad, "file": CSV })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "`{bad}`: {err}");
+    }
+    assert!(!out.path().parent().unwrap().join("escape.parquet").exists());
+
+    // The server says it writes, where, and which endpoints do it.
+    let (_, engines) = send(
+        app_writes(None, out.path(), store),
+        "GET",
+        "/v1/engines",
+        None,
+    )
+    .await;
+    let canon = std::fs::canonicalize(out.path()).unwrap();
+    assert_eq!(engines["writes"]["dir"], canon.display().to_string());
+    let endpoints: Vec<&str> = engines["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_str().unwrap())
+        .collect();
+    assert!(endpoints.contains(&"POST /v1/tables"), "{endpoints:?}");
+    assert!(
+        endpoints.contains(&"POST /v1/workspaces/{id}/runs/{run_id}/table"),
+        "{endpoints:?}"
+    );
+}
+
+/// Status and headers of one request, for the tests that are about a header.
+async fn headers_of(app: axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap) {
+    let resp = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    (resp.status(), resp.headers().clone())
+}
+
+#[tokio::test]
+async fn an_export_of_a_new_table_says_which_table_and_when() {
+    let out = tempfile::tempdir().unwrap();
+    let (_s, store) = temp_store();
+    let (st, t) = send(
+        app_writes(None, out.path(), store.clone()),
+        "POST",
+        "/v1/tables",
+        Some(serde_json::json!({ "name": "marts/people", "file": CSV })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    let path = t["path"].as_str().unwrap().to_string();
+    let prov = lakeleto::table_out::read_provenance(std::path::Path::new(&path))
+        .unwrap()
+        .unwrap();
+    let expected = format!(
+        "name=\"marts/people\", created_at_ms={}, rows=8, provenance_version={}, \
+         lakeleto_version=\"{}\"",
+        prov.created_at_ms,
+        prov.provenance_version,
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // Whatever the view: a filtered, projected export still names the table the rows came from,
+    // and its row count, not the view's.
+    for query in [
+        "fmt=csv",
+        "fmt=json&cols=name",
+        "fmt=csv&filter=score:gt:90",
+    ] {
+        let (st, headers) = headers_of(
+            app_writes(None, out.path(), store.clone()),
+            &format!("/v1/export?path={path}&{query}"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{query}");
+        assert_eq!(
+            headers
+                .get(lakeleto::protocol::PROVENANCE_HEADER)
+                .map(|v| v.to_str().unwrap().to_string()),
+            Some(expected.clone()),
+            "{query}"
+        );
+    }
+
+    // A file Lakeleto did not write has no provenance, and the export says nothing about one.
+    let (st, headers) = headers_of(app(), &format!("/v1/export?path={CSV}&fmt=csv")).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(headers.get(lakeleto::protocol::PROVENANCE_HEADER).is_none());
+}
+
+#[tokio::test]
+async fn under_root_a_new_table_reads_only_inside_it_and_opens_like_any_table() {
+    let root = tempfile::tempdir().unwrap();
+    let inside = root.path().join("people.csv");
+    std::fs::copy(CSV, &inside).unwrap();
+    let out = root.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let (_s, store) = temp_store();
+
+    // A source outside `--root` is refused, as it is on every read.
+    let (st, _) = send(
+        app_writes(Some(root.path()), &out, store.clone()),
+        "POST",
+        "/v1/tables",
+        Some(serde_json::json!({ "name": "t", "file": CSV })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert!(!out.join("t.parquet").exists());
+
+    let (st, t) = send(
+        app_writes(Some(root.path()), &out, store.clone()),
+        "POST",
+        "/v1/tables",
+        Some(serde_json::json!({ "name": "t", "file": inside.to_str().unwrap() })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+
+    // The new table is an ordinary source: the same server previews it.
+    let path = t["path"].as_str().unwrap();
+    let (st, preview) = send(
+        app_writes(Some(root.path()), &out, store),
+        "GET",
+        &format!("/v1/preview?path={path}&limit=100"),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{preview}");
+    assert_eq!(preview["num_rows"], 8);
+}
+
+#[tokio::test]
+async fn a_run_records_whether_it_stopped_at_its_cap() {
+    let (_s, store) = temp_store();
+    let out = tempfile::tempdir().unwrap();
+    let app = || app_writes(None, out.path(), store.clone());
+    let (_, ws) = send(
+        app(),
+        "POST",
+        "/v1/workspaces",
+        Some(serde_json::json!({ "name": "caps" })),
+    )
+    .await;
+    let runs = format!("/v1/workspaces/{}/runs", ws["id"].as_str().unwrap());
+    // people.csv has 8 rows: a cap below it truncates, a cap at or above it does not.
+    for (limit, truncated, rows) in [(3, true, 3), (8, false, 8), (100, false, 8)] {
+        let (st, run) = send(
+            app(),
+            "POST",
+            &runs,
+            Some(serde_json::json!({ "path": CSV, "limit": limit, "cache": true })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{run}");
+        assert_eq!(run["run"]["truncated"], truncated, "limit {limit}: {run}");
+        assert_eq!(run["run"]["row_count"], rows, "limit {limit}: {run}");
+    }
+}
+
+#[tokio::test]
+async fn only_a_whole_cached_run_is_saved_as_a_table() {
+    let (_s, store) = temp_store();
+    let out = tempfile::tempdir().unwrap();
+    let app = || app_writes(None, out.path(), store.clone());
+    let (_, ws) = send(
+        app(),
+        "POST",
+        "/v1/workspaces",
+        Some(serde_json::json!({ "name": "save" })),
+    )
+    .await;
+    let id = ws["id"].as_str().unwrap().to_string();
+    let run = |limit: usize, cache: bool| {
+        let uri = format!("/v1/workspaces/{id}/runs");
+        async move {
+            let body = serde_json::json!({ "path": CSV, "limit": limit, "cache": cache });
+            send(app(), "POST", &uri, Some(body)).await
+        }
+    };
+    let save = |run_id: String, name: &'static str| {
+        let uri = format!("/v1/workspaces/{id}/runs/{run_id}/table");
+        async move {
+            send(
+                app(),
+                "POST",
+                &uri,
+                Some(serde_json::json!({ "name": name })),
+            )
+            .await
+        }
+    };
+
+    // Stopped at its cap: the first 3 rows are not the answer, so they are not saved as one.
+    let (_, short) = run(3, true).await;
+    let (st, err) = save(short["run"]["id"].as_str().unwrap().into(), "short").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err["error"].as_str().unwrap().contains("row cap"), "{err}");
+    assert!(!out.path().join("short.parquet").exists());
+
+    // Not cached: nothing to save.
+    let (_, uncached) = run(100, false).await;
+    let (st, err) = save(uncached["run"]["id"].as_str().unwrap().into(), "uncached").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err["error"].as_str().unwrap().contains("cache"), "{err}");
+
+    // An unknown run is a 404.
+    let (st, _) = save("run-does-not-exist".into(), "nope").await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // Whole and cached: saved, with the run named in its provenance.
+    let (_, whole) = run(100, true).await;
+    let run_id = whole["run"]["id"].as_str().unwrap().to_string();
+    let (st, t) = save(run_id.clone(), "from_run").await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    assert_eq!(t["rows"], 8);
+    let prov =
+        lakeleto::table_out::read_provenance(std::path::Path::new(t["path"].as_str().unwrap()))
+            .unwrap()
+            .unwrap();
+    match prov.from {
+        lakeleto::table_out::Origin::Run {
+            workspace,
+            run_id: saved,
+            ..
+        } => {
+            assert_eq!(workspace, id);
+            assert_eq!(saved, run_id);
+        }
+        other => panic!("unexpected origin {other:?}"),
+    }
+    // And once only.
+    let (st, _) = save(run_id, "from_run").await;
+    assert_eq!(st, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+#[cfg(feature = "sql")]
+async fn post_tables_writes_a_query_result_as_a_new_table() {
+    let out = tempfile::tempdir().unwrap();
+    let (_s, store) = temp_store();
+    let sql = "SELECT city, count(*) AS people FROM t GROUP BY city ORDER BY city";
+    let (st, t) = send(
+        app_writes(None, out.path(), store),
+        "POST",
+        "/v1/tables",
+        Some(serde_json::json!({ "name": "marts/people_by_city", "file": CSV, "sql": sql })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    assert_eq!(t["columns"], serde_json::json!(["city", "people"]));
+    assert_eq!(t["rows"], 6, "six distinct cities in people.csv");
+    let prov =
+        lakeleto::table_out::read_provenance(std::path::Path::new(t["path"].as_str().unwrap()))
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        prov.from,
+        lakeleto::table_out::Origin::Query {
+            sql: Some(sql.to_string()),
+            tables: vec![lakeleto::table_out::OriginTable {
+                name: "t".to_string(),
+                path: match &prov.from {
+                    lakeleto::table_out::Origin::Query { tables, .. } => tables[0].path.clone(),
+                    _ => unreachable!(),
+                },
+            }],
+        }
+    );
+
+    // A write is not a way around the read-only SQL guard.
+    let (st, err) = send(
+        app_writes(None, out.path(), temp_store().1),
+        "POST",
+        "/v1/tables",
+        Some(serde_json::json!({
+            "name": "sneaky",
+            "file": CSV,
+            "sql": "COPY (SELECT 1) TO 'x.parquet'"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err}");
+    assert!(!out.path().join("sneaky.parquet").exists());
+}
+
+// ---- GET /v1/diff ---------------------------------------------------------------------------
+
+/// `GET` `uri` on `app`: the status and the JSON body.
+async fn get_json_on(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn enc(s: &str) -> String {
+    lakeleto::api::encode_query(s)
+}
+
+/// `/v1/diff` answers with the report `lakeleto diff -o json` prints for the same two tables,
+/// field for field, and the server lists it among its endpoints.
+#[tokio::test]
+async fn diff_endpoint_answers_what_lakeleto_diff_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = dir.path().join("old.csv");
+    let right = dir.path().join("new.csv");
+    std::fs::write(&left, "id,v\n1,a\n2,b\n").unwrap();
+    std::fs::write(&right, "id,v,w\n1,a,x\n2,c,y\n3,d,z\n").unwrap();
+
+    let (status, report) = get_json(&format!(
+        "/v1/diff?left={}&right={}",
+        enc(&left.display().to_string()),
+        enc(&right.display().to_string())
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+
+    // The same comparison, made by the library the command calls.
+    let engines = EngineRegistry::new(Arc::new(LocalReaderEngine::default()));
+    let direct = lakeleto::diff::diff_snapshots(
+        &RequestContext::detached(),
+        &engines,
+        (&lakeleto::Source::resolve(&left, None).unwrap(), None),
+        (&lakeleto::Source::resolve(&right, None).unwrap(), None),
+        &lakeleto::diff::DiffOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(report, serde_json::to_value(&direct).unwrap());
+    let found: Vec<&str> = report["found"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    assert!(found.contains(&"added-column"), "{report}");
+    assert!(found.contains(&"row-count"), "{report}");
+
+    let (_, engines) = get_json("/v1/engines").await;
+    assert!(
+        engines["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().starts_with("GET /v1/diff")),
+        "{engines}"
+    );
+}
+
+/// What the command line refuses as a usage error, the endpoint refuses as a bad request, saying
+/// why, before reading anything; a key with no SQL engine names the feature.
+#[tokio::test]
+async fn diff_endpoint_refuses_what_the_command_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.csv");
+    std::fs::write(&a, "id\n1\n").unwrap();
+    let a = enc(&a.display().to_string());
+
+    for (query, says) in [
+        (format!("left={a}"), "`left` and `right`"),
+        (format!("left={a}&right={a}&fast=true&scan=10"), "give one"),
+        (format!("left={a}&right={a}&sample=3"), "give a key"),
+        (format!("left={a}&right={a}&scan=0"), "one row or more"),
+        (format!("left={a}&right={a}&scan=many"), "count of rows"),
+    ] {
+        let (status, body) = get_json(&format!("/v1/diff?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains(says),
+            "{query}: {body}"
+        );
+    }
+    // This server runs no SQL, and a key compares rows in it.
+    let (status, body) = get_json(&format!("/v1/diff?left={a}&right={a}&key=id")).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("sql"), "{body}");
+}
+
+/// A copy of the Delta table delta-rs wrote (versions 2 and 3, from a checkpoint), at `to`.
+#[cfg(feature = "delta")]
+fn delta_copy(to: &std::path::Path) {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+    copy(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/delta_checkpointed"),
+        to,
+    );
+}
+
+/// `left=<table>@2` compares a Delta version with the table now, by its metadata, as
+/// `lakeleto diff t@2 t` does; a key with a snapshot is refused, since a snapshot's rows are not
+/// read.
+#[cfg(feature = "delta")]
+#[tokio::test]
+async fn diff_endpoint_compares_a_delta_version_with_the_table_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = dir.path().join("orders");
+    delta_copy(&table);
+    let now = enc(&table.display().to_string());
+    let then = enc(&format!("{}@2", table.display()));
+
+    let (status, report) = get_json(&format!("/v1/diff?left={then}&right={now}")).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["stats"]["method"], "metadata", "{report}");
+    assert_eq!(report["left"]["snapshot"], "2", "{report}");
+    assert_eq!(report["right"]["snapshot"], "3", "{report}");
+    assert_eq!(report["rows"]["left"], 4, "{report}");
+    assert_eq!(report["rows"]["right"], 5, "{report}");
+
+    // Each of these reads rows or footers, which a snapshot's are not.
+    for (extra, says) in [
+        ("scan=10", "`--scan`"),
+        ("fast=true", "`--fast`"),
+        ("key=id", "`--key`"),
+    ] {
+        let (status, body) = get_json(&format!("/v1/diff?left={then}&right={now}&{extra}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains(says),
+            "{extra}: {body}"
+        );
+    }
+}
+
+/// Under `--root` a diff reads tables inside it, and refuses what is outside it the same way
+/// whether or not it exists. A snapshot address is refused there even inside the root: a
+/// snapshot's metadata can name files anywhere, and only the table as it is now is confined.
+#[cfg(feature = "delta")]
+#[tokio::test]
+async fn diff_endpoint_under_root_confines_both_sides_and_refuses_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let table = root.path().join("orders");
+    delta_copy(&table);
+    let inside = std::fs::canonicalize(&table).unwrap();
+    let now = enc(&inside.display().to_string());
+    let app = || app_root(root.path().to_path_buf());
+
+    let (status, report) = get_json_on(app(), &format!("/v1/diff?left={now}&right={now}")).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    assert_eq!(report["found"], serde_json::json!([]), "{report}");
+
+    let then = enc(&format!("{}@2", inside.display()));
+    let (status, body) = get_json_on(app(), &format!("/v1/diff?left={then}&right={now}")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("snapshot"),
+        "{body}"
+    );
+
+    // Outside the root: a table that is there and one that is not answer alike, on either side.
+    let other = tempfile::tempdir().unwrap();
+    let there = other.path().join("orders");
+    delta_copy(&there);
+    let refusals: Vec<String> = [
+        format!("{}@2", there.display()),
+        format!("{}@2", other.path().join("missing").display()),
+        there.display().to_string(),
+    ]
+    .iter()
+    .map(|outside| enc(outside))
+    .collect();
+    let mut errors = Vec::new();
+    for outside in &refusals {
+        for query in [
+            format!("left={outside}&right={now}"),
+            format!("left={now}&right={outside}"),
+        ] {
+            let (status, body) = get_json_on(app(), &format!("/v1/diff?{query}")).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{query}: {body}");
+            errors.push(body["error"].as_str().unwrap().to_string());
+        }
+    }
+    errors.dedup();
+    assert_eq!(
+        errors.len(),
+        1,
+        "outside the root is told one way: {errors:?}"
+    );
+
+    // A link inside the root to a table outside it: `<link>@2` is refused before the link is
+    // followed, so whether what it points at is there does not change the answer.
+    #[cfg(unix)]
+    {
+        let link = inside.parent().unwrap().join("alias");
+        let aliased = enc(&format!("{}@2", link.display()));
+        let mut answers = Vec::new();
+        for target in [there.clone(), other.path().join("missing")] {
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            answers.push(get_json_on(app(), &format!("/v1/diff?left={aliased}&right={now}")).await);
+        }
+        assert_eq!(answers[0].0, StatusCode::FORBIDDEN, "{}", answers[0].1);
+        assert_eq!(
+            answers[0], answers[1],
+            "a link's target outside the root is not told apart"
+        );
+    }
+}
+
+/// Through a remote engine a diff is refused before anything is read, as
+/// `lakeleto diff --remote-url` is.
+#[cfg(feature = "remote")]
+#[test]
+fn diff_endpoint_refuses_a_remote_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.csv");
+    std::fs::write(&a, "id\n1\n").unwrap();
+    let a = enc(&a.display().to_string());
+    // Nothing listens on port 9: a request reaching it would fail, not be refused. The engine
+    // wraps a blocking HTTP client, which must not be dropped inside the runtime: this reference
+    // outlives it, so the router's are never the last.
+    let remote: Arc<dyn Engine> = Arc::new(lakeleto::engine::remote::RemoteEngine::new(
+        "http://127.0.0.1:9",
+        None,
+    ));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let (status, body) = runtime.block_on(async {
+        let app = router(
+            EngineRegistry::new(remote.clone())
+                .with_sql(remote.clone())
+                .with_database(remote.clone()),
+            10_000,
+            None,
+            None,
+            true,
+            generic_store(),
+        );
+        get_json_on(app, &format!("/v1/diff?left={a}&right={a}")).await
+    });
+    drop(runtime);
+    drop(remote);
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("lakeleto diff"),
+        "{body}"
+    );
 }

@@ -182,6 +182,20 @@ impl Catalog for PathCatalog {
     fn load_table(&self, ctx: &RequestContext, table: &Path) -> Result<TableHandle> {
         let path = table;
 
+        // A snapshot address (`<table>@<snapshot>`) is `diff`'s to read, which splits it off
+        // first. Anywhere else it is refused saying so, rather than reported as a file that is not
+        // there. A name that exists whole is a path (ADR-0002): on disk that is told here; in an
+        // object store, where telling it is a request, only once the probes below found nothing.
+        if let Some((name, at)) = path.to_str().and_then(crate::snapshot::split) {
+            if !is_object_uri(name) && !path.exists() && Path::new(name).exists() {
+                return Err(crate::snapshot::only_diff_reads(
+                    &path.to_string_lossy(),
+                    name,
+                    &at,
+                ));
+            }
+        }
+
         // A table a catalog serves: classified without a request, since every catalog this build
         // reads serves Iceberg. Reading it asks the catalog, under the read's own context.
         if path.to_str().is_some_and(is_catalog_uri) {
@@ -201,8 +215,9 @@ impl Catalog for PathCatalog {
             if let Some((format, codec)) = format_from_name(path) {
                 return Ok(TableHandle::new(path, format).with_codec(codec));
             }
-            // No data-file extension: a bare prefix is likely an Iceberg table — one cheap probe
-            // for a `metadata/` child. (Only object stores; a network round-trip, so gated behind
+            // No data-file extension: a bare prefix is likely a table — a cheap probe for a
+            // `_delta_log/` child (Delta), then for a `metadata/` one (Iceberg), in the order a
+            // directory is classified. (Only object stores; network round-trips, so gated behind
             // the feature and reached only when the name gives nothing away.)
             //
             // Whose round-trip it is, is the posture's to decide — see [`RemoteProbe`]. The
@@ -227,7 +242,7 @@ impl Catalog for PathCatalog {
                                     "cannot infer the format of {} from its name, and no \
                                      credentials were vended for this call — probing it would \
                                      read as the server rather than as you. Declare the format \
-                                     (`parquet`/`csv`/`json`/`iceberg`) on this location.",
+                                     (`parquet`/`csv`/`json`/`iceberg`/`delta`) on this location.",
                                     path.display()
                                 ),
                             });
@@ -235,17 +250,38 @@ impl Catalog for PathCatalog {
                     };
                 if let (Some(opts), Some(uri)) = (identity, path.to_str()) {
                     // `?`, not a swallowed `false`: an identity that cannot address this URI is a
-                    // fact about the caller, and reporting it as "not an Iceberg table" would send
-                    // them to fix their `--format` instead of their credentials.
-                    if crate::objstore::looks_like_iceberg_as(uri, &opts)? {
-                        return Ok(TableHandle::new(path, Format::Iceberg));
+                    // fact about the caller, and reporting it as "not a table" would send them to
+                    // fix their `--format` instead of their credentials.
+                    //
+                    // A name ending in a snapshot address is probed strictly: a listing that fails
+                    // is an error too, since "nothing here" would make it a snapshot of another
+                    // table.
+                    let found = if crate::snapshot::split(uri).is_some() {
+                        crate::objstore::table_under_whole_name(uri, &opts)?
+                    } else if crate::objstore::looks_like_delta_as(uri, &opts)? {
+                        Some(Format::Delta)
+                    } else if crate::objstore::looks_like_iceberg_as(uri, &opts)? {
+                        Some(Format::Iceberg)
+                    } else {
+                        None
+                    };
+                    if let Some(format) = found {
+                        return Ok(TableHandle::new(path, format));
                     }
                 }
+            }
+            // Nothing here by its whole name: a trailing `@<snapshot>` is a snapshot address.
+            if let Some((name, at)) = path.to_str().and_then(crate::snapshot::split) {
+                return Err(crate::snapshot::only_diff_reads(
+                    &path.to_string_lossy(),
+                    name,
+                    &at,
+                ));
             }
             return Err(EngineError::UnsupportedFormat {
                 detail: format!(
                     "cannot infer the format of {} from its name — pass \
-                     `--format parquet|csv|json|iceberg`",
+                     `--format parquet|csv|json|iceberg|delta`",
                     path.display()
                 ),
             });

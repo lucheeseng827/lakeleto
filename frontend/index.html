@@ -3,6 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- The app may be opened with ?token=…; it never leaves this page in a Referer. -->
+    <meta name="referrer" content="no-referrer" />
     <!-- The Strata mark, inline as a data URI: the SPA is embedded in the binary and
          served from memory, so a separate favicon request would be one more asset to
          thread through rust-embed for 400 bytes. Same geometry as LakeletoMark in

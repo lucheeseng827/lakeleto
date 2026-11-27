@@ -6,9 +6,245 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **The web app's Diff view, and `GET /v1/diff` (protocol `1.3`).** An open table gets a **Diff**
+  view beside Grid, Schema, Profile and SQL: compare it with another table, or with one of its own
+  snapshots (`@41`), optionally by a key. It shows the columns added, removed and retyped, the row
+  count, each column's nulls, min and max, and with a key the rows added, removed and changed,
+  with a few of each. It reads nothing until **Compare** is pressed.
+  - **The endpoint** answers the report `lakeleto diff -o json` prints, with `key`, `fast`, `scan`,
+    `sample` and `format`, `json_path`, `flatten` as the command's flags; usage errors are `400`.
+  - **Under `--root`** both sides are confined, and a snapshot address is refused (`403`), since a
+    snapshot's manifests are not confined. Through a remote engine a diff is refused (`501`).
+  - **At most two diffs run at once.** A client that gives up does not stop one, so another is
+    refused with `429` until one ends.
+  - **Shown only by a server that lists it** in `GET /v1/engines`; elsewhere it is not offered.
+    A tab saved on Diff reopens on its grid.
+  - **`lakeleto::diff::side`** is the rule the command and the endpoint both read a side by:
+    `<table>@<snapshot>` is a snapshot address unless the whole name exists.
+- **`lakeleto flight`: a read-only Flight SQL server (feature `flight`).**
+  - **Clients:** ADBC drivers (Python, R, Go, Java), JDBC tools and notebooks query the tables
+    named with `--table name=reference`: a path, an object-store URI or a catalog table. A
+    database table is refused for now.
+  - **Statements:** each is one `SELECT`, `WITH` or `EXPLAIN` run by the SQL engine, over only the
+    tables it names. The result is held for one fetch under an unguessable ticket, for up to 60
+    seconds, with at most 16 statements open.
+  - **Bounds:** a result past `--max-rows` (default 1,000,000) is an error, never a short result.
+    `--timeout` holds to the end of reading the result, a client that stops reading included.
+    Rows read in time may still arrive after it.
+  - **Catalog:** `GetCatalogs`, `GetDbSchemas`, `GetTables` (with schemas), `GetTableTypes` and
+    `GetSqlInfo` list the tables as `lakeleto_tables.main.<name>`, the names SQL resolves.
+  - **Refused:** everything else is `UNIMPLEMENTED`, so clients fall back. ADBC's Python driver
+    does: its prepare falls back to a plain statement.
+  - **Auth:** `--token` is checked on every call, as a bearer token or as a log-in's password. An
+    empty token is refused at start.
+  - **Transport:**
+    - `--tls-cert` and `--tls-key` serve TLS (`grpc+tls://`), on the rustls the release set
+      already links.
+    - Plaintext on an address other than loopback is refused unless `--plaintext` says a TLS
+      proxy or tunnel is in front.
+    - HTTP/2 pings and TCP keepalive drop connections whose client has gone.
+  - **Tested:** against arrow-flight's client in `tests/flight.rs`, and against Python's ADBC
+    driver in `ops/flight_adbc_smoke.py`, both over TLS too. CI runs both on every Lakeleto pull
+    request (a pinned driver), and the script monthly on the latest driver.
+  - **Release set:** not in it yet.
+- **OpenLineage events, opt-in (feature `openlineage`).** `check`, `diff` and exports (`head` or
+  `query` writing `--out` to a file, and `serve`'s `/v1/export`) are sent as OpenLineage runs:
+  `START`, then `COMPLETE` or `FAIL` (a failed gate or a diff that found a change completed; an
+  error failed, without its text). Each names the tables it was asked to read, as ADR-0002 §6
+  names them (ADLS as `abfss://<container>@<account>.dfs.core.windows.net`), and an export names
+  the file it wrote; an export's job is named for its file, so its failures and successes are one
+  job's runs. `check` attaches `dataQualityAssertions` (each gate that
+  judged, and each rule a contract declares, at `warn` under `on_violation: warn`) and
+  `dataQualityMetrics` (rows, null counts, bytes, files, last change), as Covenant does; the events are held to the published 2-0-2 schema and
+  facets in the tests. Nothing is sent unless an endpoint is given: `--openlineage <url>` (the
+  endpoint, refused before anything is read when the rule refuses it) or `OPENLINEAGE_URL` (the
+  server, `/api/v1/lineage` added; a value the rule refuses is a warning). The rule is Covenant's:
+  `https`, or `http` only to this machine, and no credentials in the URL; `OPENLINEAGE_API_KEY` is
+  the bearer token. A catalog table is named by its location, with `symlinks` and `catalog`
+  facets; a database by its host and port, never its credentials. An endpoint that fails costs a
+  warning, never the exit code. Not in the release binaries yet.
+- **`lakeleto diff <table>@<snapshot>`: a table against an earlier snapshot of itself.** An Iceberg
+  or Delta table, on disk, in a store or behind a catalog, named at `@<id>` (an Iceberg snapshot id,
+  a Delta version) or `@<RFC 3339 instant>` (the snapshot current then: an Iceberg table's
+  `snapshot-log`, a Delta table's in-commit timestamps, refused without them). Both sides are
+  compared by the table's metadata at the snapshot each names, the other at the newest: the schema
+  the snapshot was written with, its rows, and each column's nulls, minimum and maximum where the
+  metadata makes them exact — text, binary, Delta timestamp and float bounds, and an Iceberg
+  snapshot with delete files, are left out with a note, so a difference found is one in the data. No
+  row or data file is read; a snapshot whose files were since cleaned up still compares. Each side
+  shows the snapshot and commit time it was compared at. `--key`, `--fast` and `--scan` are refused
+  with a snapshot, and a snapshot address anywhere but `diff` is refused pointing at it (a store
+  name read with `--format` skips the probe that tells, and is read whole). A name that exists whole
+  is that name (`orders@2` the directory, or the store prefix with a table under it, `--format` or
+  not); a store that refuses or fails the probe that tells is an error, not a read of another table.
+  A Delta plan can stand at any version its log still holds, and says so when one was cleaned up or
+  is not written yet. Checked: the log's statistics at a table's newest version equal an exact count
+  over every row, for every statistic it gives.
+- **Delta tables in object stores, and Delta checkpoints.** A Delta table at `s3://`, `gs://` or
+  `az://` opens as one on disk does, read as the call's identity, with nothing copied to disk: its
+  log and checkpoint through the store, its data files by ranged requests, only as far as a read
+  goes. A bare prefix with a `_delta_log/` is detected as Delta, before Iceberg, as a directory
+  is. On disk and in a store, the log is replayed from the newest checkpoint
+  (`N.checkpoint.parquet`, or every part of a multi-part one) through the commits after it, so a
+  table whose old commits log cleanup deleted reads correctly; before, it failed to open or read
+  short. `_last_checkpoint` is a hint: in a store the log is listed from the version it names. A
+  commit missing after the checkpoint is an error, never a short read. V2 checkpoints (named with
+  a UUID, or keeping their files in `_sidecars/`) are not read: a table only one can rebuild is
+  refused, naming it. A file's rows come from the log's statistics (`numRecords`) where the writer
+  recorded them, so a count, and a window's skip past whole files, open no footer. `check`'s files
+  gate and freshness now see a Delta table in a store. A log in a store that names a file on the
+  host is refused.
+- **`lakeleto check`: a gate for CI and pipelines.** Measures a table — its columns, its rows and
+  each column's nulls (every row counted, by SQL), its data files and bytes, and when it last
+  changed — and compares it with a baseline file a check with `--update` wrote. It fails (exit
+  `3`) on a column removed, retyped or changed in nullability; rows dropping by more than
+  `--max-row-drop` percent (10); a column's share of nulls rising by more than `--max-null-rise`
+  points (5); the files or their bytes growing or shrinking by more than `--max-file-jump` (2×);
+  or, with `--max-age`, a table that last changed longer ago than that, from an Iceberg table's
+  current snapshot, a Delta table's latest commit or a file's modification time. A column added
+  passes. A gate asked for that cannot be told exits `1`, never `0`. `--update` writes the
+  baseline atomically when the check passes or there is none, never over a failing one, and never
+  from a run whose files could not be listed (the rows are still counted, and a note says why); the
+  baseline holds no value from the table and has a `version`. `-o table`, `json` (`version: 1`) or
+  `junit` (new, `check`'s only: one test case a gate; `--out report.xml` picks it). Counts every
+  row in the SQL engine (the release binaries have it), or a single Parquet file from its footer
+  with `--fast` — the way a build without SQL counts one — where a column whose nulls the footer
+  did not record is unknown. A database table (`sqlite://`, `postgres://`, `mysql://`) is counted
+  in its own database, in its own quoting, with its password masked in the baseline and the
+  report; MySQL is untested. The files gate and freshness reach tables in stores too: an Iceberg
+  table's current snapshot, in a store or behind a catalog, read as the call's identity, and a
+  single object's size and `Last-Modified`. Through `--remote-url` the server counts the rows (one
+  aggregate row, which its result caps do not cut: a test counts 120,000 rows past them and
+  matches the local count); the server's files are not seen, and `--contract` is refused.
+- **`lakeleto check --contract`: every row against a data contract.** An ODCS v3 contract, or a
+  Covenant one, judged by Covenant's Arrow validator (`covenant-data`) in process, over rows the
+  SQL engine streams batch by batch. The `contract` gate fails when the violations pass the
+  contract's `max_violations`; the report counts each rule's violations and gives the row each
+  first broke at, never a value. A contract alone is a check. `--model` picks a model;
+  `--allow-unenforced` checks a contract with rules the validator cannot enforce on the rest, and
+  the gate is marked `partial` in every form. A table of no rows is still checked for the columns
+  it lacks. Behind the new `contracts` feature (it brings `sql`), which the release set does not
+  include yet.
+- **`lakeleto check --unique-memory`: a `unique` rule's memory is bounded.** It holds every
+  distinct value it has seen, so it gets a budget, 512 MiB unless given. Past it, the rest of the
+  table is checked for every rule but uniqueness, and the contract gate is `unknown` (exit 1) and
+  says from which data row, or a partial pass with `--allow-unenforced`. Duplicates found before
+  the stop still fail it. The budget is Lakeleto's estimate from the values' lengths, set on the
+  high side by measurement, until a Covenant release whose tracker counts it itself.
+- **The Iceberg and Delta plans say when a table last changed.** An Iceberg plan carries the
+  current snapshot's `timestamp-ms` (or the metadata's `last-updated-ms`), a Delta plan the latest
+  time its log records (`commitInfo.timestamp`, an `add`'s `modificationTime`, a `remove`'s
+  `deletionTimestamp`), and each Delta file its recorded `size`.
+- **`lakeleto diff`: what changed between two tables.** Any two readable tables, across formats:
+  columns added, removed, retyped or changed in nullability, and the shared ones moved; row
+  counts; and each shared column's null count, minimum and maximum. Those read every row when the
+  SQL engine can query both sides (a build with SQL, and neither side a database table); otherwise,
+  or with `--scan N`, they are a sample of the first rows, reported as `sample` unless it read the
+  whole table, and `--fast` takes them from two Parquet files' footers. With `--key <columns>` (needs SQL) it matches the rows by key and
+  counts them added, removed, changed and unchanged, says which columns changed, and shows a few
+  of each (`--sample N`). A key that repeats on either side, or an integer key against a float
+  one, is refused; columns whose values are not of one kind are listed as not compared. `-o table`, `json` (`version: 1`) or `markdown`
+  (new, for a pull request: everything a table supplies is inline code, so nothing in the data
+  renders). `--fail-on <kinds>` exits `3` when a named kind is found, `0` otherwise. Refused through `--remote-url` for now.
+- **Keep a query's answer as a new table.** `lakeleto create-table <name> --write-dir <dir>
+  --sql …` (or `--sql-file`) writes the result, or a copy of one table, as
+  `<dir>/<name>.parquet`, streamed to disk. On the server, `serve --write-dir <dir>` enables
+  `POST /v1/tables` and `POST /v1/workspaces/{id}/runs/{run_id}/table`, and the web app gets a
+  **Save as table…** button on a cached result, which opens the new table in a tab. It is the one
+  way Lakeleto creates a table, and it only creates: a name that exists is refused (`409`, exit 1),
+  never replaced; names are 1–3 path-safe parts confined to the write directory, which must be
+  inside `--root`; a table appears whole or not at all; a result past the server's 1,000,000-row
+  cap is refused, never shortened. Each table records its provenance (the SQL, the tables it
+  read, the row count, the time, the version) in its Parquet footer under
+  `lakeleto.provenance`. Off unless asked for: a server without `--write-dir` creates no
+  tables, and the flag has no environment variable. (Workspaces, history and cached results are
+  still kept in the workspace store, as before.) `create-table` needs the `parquet-out` feature, as
+  the release binaries have.
+- **A run says whether it is the whole answer.** A workspace run record carries `truncated`:
+  whether it stopped at its row cap with more rows to give. Only a run known to be whole can be
+  saved as a table. A run through the remote engine is never recorded as whole, and neither
+  `create-table` nor `POST /v1/tables` writes a table from a remote result: the peer caps rows
+  without saying so. A write directory on a file system without hard links is refused rather
+  than published by a rename that could replace a file.
+- **Protocol `1.1`:** the two write endpoints, `writes` on `GET /v1/engines` (present only when
+  the server writes), and `truncated` on a run record. A `1.0` client is unaffected.
+- **An export of a new table says which table, made when.** `GET /v1/export` of a table Lakeleto
+  created adds a `lakeleto-provenance` header (`name`, `created_at_ms`, `rows`,
+  `provenance_version`, `lakeleto_version`, as an RFC 8941 dictionary), whatever the view's sort,
+  filter or columns. A dashboard or a report reading the export can show its source beside the
+  numbers without parsing Parquet. **Protocol `1.2`.** No header for any other source, and an
+  export never fails over provenance.
+- **Another program can write the same provenance record.** The `lakeleto.provenance` record
+  takes an optional `writer` (the program and its version) in place of `lakeleto_version`, which
+  is now optional too; a record names one or the other. Lakeleto's own tables still carry
+  `lakeleto_version` and no `writer`. A file another program stamped reads back like one Lakeleto
+  wrote, and its export header carries `writer="…"`. Its `rows` counts the file the record is in.
+
+### Changed
+- **CI runs in this repository.** The `ci` workflow (`.github/workflows/ci.yml`) builds, lints and
+  tests every change to main and every pull request: the default build, the release feature set
+  with `flight`, and the database drivers without `sql`; the Flight SQL server under Python's ADBC
+  driver (pinned, `ops/flight_adbc_requirements.txt`); and the committed `frontend/dist` against a
+  fresh build. The release feature set is read from `release.yml`, so CI tests what ships.
+- **The SQL engine registers a query's tables in catalog `lakeleto_tables`, schema `main`,**
+  where it used DataFusion's defaults, `datafusion.public`. A table is still reached by its bare
+  name. A qualified name, and an error that names a table in full, now read
+  `lakeleto_tables.main.<name>`. Flight SQL lists the tables under these names, and neither is a
+  name a configured catalog can take.
+- **`api::serve` takes a ninth argument,** where the server's exports are sent as OpenLineage runs
+  (`None` for nowhere), and `api::router_with_lineage` builds a router that sends them. A library
+  caller of `serve` adds `None`.
+- **`Engine::metadata` and `diff::diff_snapshots`.** A table described by its metadata at a
+  snapshot, and a diff that takes one on either side; `diff::Side` gained `snapshot` and
+  `committed_ms`, and `StatsMethod` gained `Metadata`. A JSON report's `stats.method` can now be
+  `"metadata"`, so a script that switches on it needs that case. The report's `version` stays 1:
+  fields and a value were added, none changed meaning.
+- **`engine::delta`'s library surface.** `row_count` and `read_window` are gone: the engine reads a
+  Delta plan's files itself, from disk or from a store, through `LocalReaderEngine`. `TablePlan`
+  gained `log_files` (the log files it was read from), `version` (the version it stands at) and
+  `in_commit_ms` (that version's in-commit timestamp), and `AddFile` gained `num_records` (the rows
+  the log's statistics record) and `stats`.
+- **The SQL engine's column statistics honour the grid's filters.** `Engine::stats` on the
+  DataFusion engine used to fall back to an unfiltered profile; it now applies the filters (a
+  `WHERE`) and profiles the matching rows, and reports `filtered_stats: true`.
+- **A token the web app is opened with leaves the address bar on load.** `#token=` (a fragment,
+  never sent to a server) is accepted beside `?token=`; either is kept in the tab's `sessionStorage`
+  (so a reload still works) and sent only in the `Authorization` header, and the page sets
+  `Referrer-Policy: no-referrer`.
+
+### Fixed
+- **A capped `EXPLAIN` describes its plan.** `serve`'s `POST /v1/query` and MCP's `query` cap
+  their results, and the cap was planned as a limit above the `EXPLAIN`, which DataFusion refuses:
+  `Explain must be root of the plan`. The cap now applies to a query's rows only; an `EXPLAIN`'s
+  rows are bounded by its plan.
+- **A Delta partition value written as an empty string reads as null.** The protocol says so for
+  every type; a string partition column read it as `""`.
+
 ## [0.4.1] - 2026-11-04
 
 ### Fixed
+- **A Parquet footer's missing null count is no longer read as 0.** A footer that did not record
+  a column's nulls in every row group — a list column's, always — gave a footer profile 0 nulls.
+  `profile --fast` now prints `?` for them, `diff --fast` leaves them not counted rather than
+  comparing 0 with 0, and MCP's `describe` leaves them out. A profile on the wire says so with
+  `null_count_known: false`; one without the field was counted, as before.
+- **`lakeleto info` sizes a table directory by its files.** A Parquet dataset, an Iceberg table
+  and a Delta table are directories, and `info` and `GET /v1/info` reported the directory's own
+  entry — `4.0 KiB` on most filesystems, whatever the table held. They now report the sum of the
+  files under it, metadata and logs included, as `du --apparent-size` does. Symlinks inside the
+  table are not followed, so a server under `--root` sizes only the table's own files; a
+  directory past a million entries, or one with anything unreadable, reports no size (`?`)
+  rather than a partial one. With `--remote-url` nothing is sized locally: the path is the
+  server's reference, and a local directory of the same name is not the table.
+- **`lakeleto query` takes SQL that starts with a comment.** A query pasted from a `.sql` file
+  often opens with `-- …`, and the command line refused it as an unknown option before any engine
+  saw it; `create-table --sql` already took one. And the `database` engine's read-only guard
+  (SQLite, Postgres, MySQL) read the comment as the statement's first word, so `/* … */ SELECT`
+  was refused there as not a read. It now skips leading comments — only the forms all three
+  dialects read as comments: `--` followed by a space, and `/* … */` to its first `*/`. MySQL's
+  executable `/*! … */`, its `#` comments and an unterminated `/*` are still refused, so nothing
+  a database would run is skipped.
 - **`lakeleto open <file>` opens that file.** The command has always pointed the browser at
   `/?path=<file>`, but the web app never read the parameter, so it showed whatever the workspace
   restored, or the folder's first file on a fresh one. The linked file now opens as the active

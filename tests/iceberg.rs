@@ -318,6 +318,42 @@ fn reads_a_minimal_iceberg_table() {
     assert_eq!(ids.value(0), 1);
 }
 
+/// When a table last changed is its current snapshot's `timestamp-ms` — from the metadata, never a
+/// file's modification time — or, for a table with no snapshot, the metadata's `last-updated-ms`.
+#[test]
+fn a_plan_says_when_the_table_last_changed_from_its_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = build_table(dir.path());
+    let metadata_path = tbl.join("metadata").join("v1.metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(lakeleto::iceberg::plan(&tbl).unwrap().committed_ms, None);
+
+    metadata["last-updated-ms"] = serde_json::json!(1_700_000_000_500_i64);
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert_eq!(
+        lakeleto::iceberg::plan(&tbl).unwrap().committed_ms,
+        Some(1_700_000_000_500),
+        "no snapshot time: the metadata's"
+    );
+
+    metadata["snapshots"][0]["timestamp-ms"] = serde_json::json!(1_700_000_000_000_i64);
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert_eq!(
+        lakeleto::iceberg::plan(&tbl).unwrap().committed_ms,
+        Some(1_700_000_000_000),
+        "the current snapshot's"
+    );
+
+    metadata["current-snapshot-id"] = serde_json::json!(-1);
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert_eq!(
+        lakeleto::iceberg::plan(&tbl).unwrap().committed_ms,
+        Some(1_700_000_000_500),
+        "an empty table: the metadata's"
+    );
+}
+
 #[test]
 fn iceberg_windowed_scan_offsets() {
     use lakeleto::engine::ScanSpec;
@@ -1769,4 +1805,384 @@ fn a_window_longer_than_a_batch_takes_every_batch() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(ids.value(ids.len() - 1), 9_999);
+}
+
+// ---- snapshots, described by their metadata ---------------------------------------------
+
+/// A manifest list naming `manifests` (path, content: 0 data, 1 deletes).
+fn write_manifest_list(path: &Path, manifests: &[(&Path, i32)]) {
+    write_avro(
+        path,
+        MANIFEST_LIST_SCHEMA,
+        manifests
+            .iter()
+            .map(|(m, content)| {
+                Value::Record(vec![
+                    (
+                        "manifest_path".into(),
+                        Value::String(m.display().to_string()),
+                    ),
+                    ("content".into(), Value::Int(*content)),
+                ])
+            })
+            .collect(),
+    );
+}
+
+/// A table written twice, with every statistic a writer records, and **no data file at all**: a
+/// snapshot is described by its metadata, so none is needed, and none can be read.
+///
+/// - Snapshot 1, at 1000 ms, schema 0 (`x long`, `s string`, `f double`): file `a`, 11 rows, `x`
+///   0–10, one null `s`, `f` 0.5–2.5 with no NaN counted.
+/// - Snapshot 2, at 2000 ms, schema 1 adds `y int`: file `b` too, 11 rows, `x` 100–110, `y`
+///   7–9, and `f` with no NaN count recorded.
+fn build_snapshotted_table(dir: &Path) -> PathBuf {
+    let tbl = dir.join("snapped");
+    let meta = tbl.join("metadata");
+    fs::create_dir_all(&meta).unwrap();
+    fs::create_dir_all(tbl.join("data")).unwrap();
+    let a = tbl.join("data/a.parquet");
+    let b = tbl.join("data/b.parquet");
+    let le32 = |v: i32| v.to_le_bytes().to_vec();
+    let f64le = |v: f64| v.to_le_bytes().to_vec();
+    let file_a = stats_entry(
+        &a,
+        11,
+        &[(1, 0), (2, 1), (3, 0)],
+        &[(3, 0)],
+        &[(1, le64(0)), (2, b"aa".to_vec()), (3, f64le(0.5))],
+        &[(1, le64(10)), (2, b"zz".to_vec()), (3, f64le(2.5))],
+    );
+    let file_b = stats_entry(
+        &b,
+        11,
+        &[(1, 0), (2, 0), (3, 0), (4, 0)],
+        &[],
+        &[(1, le64(100)), (3, f64le(1.0)), (4, le32(7))],
+        &[(1, le64(110)), (3, f64le(9.0)), (4, le32(9))],
+    );
+    let m1 = meta.join("manifest-1.avro");
+    let m2 = meta.join("manifest-2.avro");
+    write_avro(&m1, MANIFEST_STATS_SCHEMA, vec![file_a.clone()]);
+    write_avro(&m2, MANIFEST_STATS_SCHEMA, vec![file_a, file_b]);
+    let s1 = meta.join("snap-1.avro");
+    let s2 = meta.join("snap-2.avro");
+    write_manifest_list(&s1, &[(&m1, 0)]);
+    write_manifest_list(&s2, &[(&m2, 0)]);
+    let fields0 = serde_json::json!([
+        {"id": 1, "name": "x", "required": true, "type": "long"},
+        {"id": 2, "name": "s", "required": false, "type": "string"},
+        {"id": 3, "name": "f", "required": false, "type": "double"}
+    ]);
+    let mut fields1 = fields0.as_array().unwrap().clone();
+    fields1.push(serde_json::json!({"id": 4, "name": "y", "required": false, "type": "int"}));
+    let metadata = serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "00000000-0000-0000-0000-000000000002",
+        "location": tbl.display().to_string(),
+        "current-snapshot-id": 2,
+        "current-schema-id": 1,
+        "schemas": [
+            {"schema-id": 0, "type": "struct", "fields": fields0},
+            {"schema-id": 1, "type": "struct", "fields": fields1}
+        ],
+        "snapshots": [
+            {"snapshot-id": 1, "timestamp-ms": 1000, "schema-id": 0,
+             "manifest-list": s1.display().to_string()},
+            {"snapshot-id": 2, "timestamp-ms": 2000, "schema-id": 1,
+             "manifest-list": s2.display().to_string()}
+        ],
+        "snapshot-log": [
+            {"timestamp-ms": 1000, "snapshot-id": 1},
+            {"timestamp-ms": 2000, "snapshot-id": 2}
+        ]
+    });
+    fs::write(
+        meta.join("v2.metadata.json"),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    fs::write(meta.join("version-hint.text"), "2").unwrap();
+    tbl
+}
+
+fn column(meta: &lakeleto::snapshot::TableMetadata, name: &str) -> lakeleto::diff::ColumnStats {
+    meta.stats
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, s)| s.clone())
+        .unwrap_or_else(|| panic!("no column {name}"))
+}
+
+#[test]
+fn a_snapshot_is_described_by_its_manifests_with_its_own_schema() {
+    use lakeleto::snapshot::SnapshotRef;
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = build_snapshotted_table(dir.path());
+    let source = Source::detect(&tbl).unwrap();
+    let engine = LocalReaderEngine::default();
+    let ctx = RequestContext::detached();
+
+    let one = engine
+        .metadata(&ctx, &source, Some(&SnapshotRef::Id(1)))
+        .unwrap();
+    assert_eq!(one.snapshot.as_deref(), Some("1"));
+    assert_eq!(one.committed_ms, Some(1000));
+    assert_eq!((one.rows, one.files), (Some(11), 1));
+    let names: Vec<_> = one.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["x", "s", "f"], "snapshot 1's own schema");
+    let x = column(&one, "x");
+    assert_eq!(
+        (x.nulls, x.min.as_deref(), x.max.as_deref()),
+        (Some(0), Some("0"), Some("10"))
+    );
+    let s = column(&one, "s");
+    assert_eq!((s.nulls, s.min, s.max), (Some(1), None, None));
+    assert!(
+        one.notes.iter().any(|n| n.contains("truncates")),
+        "{:?}",
+        one.notes
+    );
+    let f = column(&one, "f");
+    assert_eq!(
+        (f.min.as_deref(), f.max.as_deref()),
+        (Some("0.5"), Some("2.5"))
+    );
+
+    let now = engine.metadata(&ctx, &source, None).unwrap();
+    assert_eq!(now.snapshot.as_deref(), Some("2"));
+    assert_eq!((now.rows, now.files), (Some(22), 2));
+    let names: Vec<_> = now.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["x", "s", "f", "y"]);
+    let x = column(&now, "x");
+    assert_eq!(
+        (x.min.as_deref(), x.max.as_deref()),
+        (Some("0"), Some("110"))
+    );
+    // File `a` predates `y` and records nothing of it. A manifest that records nothing reads the
+    // same as one whose writer kept no metrics for the column, so `y` is not given: unknown,
+    // never guessed to be all nulls.
+    let y = column(&now, "y");
+    assert_eq!((y.nulls, y.min, y.max), (None, None, None));
+    // File `b` counted no NaN in `f`, so its bounds could leave one out: none are given.
+    let f = column(&now, "f");
+    assert_eq!((f.min, f.max), (None, None));
+    // Each statistic left out is said why.
+    let notes = now.notes.join("\n");
+    for why in ["NaN", "no null count", "no bounds"] {
+        assert!(notes.contains(why), "{why}: {notes}");
+    }
+
+    // No data file was needed, and none exists.
+    assert_eq!(fs::read_dir(tbl.join("data")).unwrap().count(), 0);
+}
+
+/// The table now has its current schema, which a schema change makes without a snapshot; a
+/// snapshot has the schema it records. One that records none, or one whose schema is gone from the
+/// metadata, is refused: which columns it was written with is not recorded.
+#[test]
+fn a_snapshot_has_its_own_schema_and_the_table_now_its_current_one() {
+    use lakeleto::snapshot::SnapshotRef;
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = build_snapshotted_table(dir.path());
+    let path = tbl.join("metadata/v2.metadata.json");
+    let rewrite = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        change(&mut meta);
+        fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    };
+    let engine = LocalReaderEngine::default();
+    let ctx = RequestContext::detached();
+    let names = |at: Option<&SnapshotRef>| -> Vec<String> {
+        let source = Source::detect(&tbl).unwrap();
+        let meta = engine.metadata(&ctx, &source, at).unwrap();
+        meta.columns.into_iter().map(|c| c.name).collect()
+    };
+
+    // A column added after the current snapshot: in the table now, not in that snapshot.
+    rewrite(&|meta| {
+        let mut fields = meta["schemas"][1]["fields"].as_array().unwrap().clone();
+        fields.push(serde_json::json!({"id": 5, "name": "z", "required": false, "type": "long"}));
+        meta["schemas"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"schema-id": 2, "type": "struct", "fields": fields}));
+        meta["current-schema-id"] = serde_json::json!(2);
+    });
+    assert_eq!(names(None), ["x", "s", "f", "y", "z"]);
+    assert_eq!(names(Some(&SnapshotRef::Id(2))), ["x", "s", "f", "y"]);
+
+    // Snapshot 1 records no schema-id: refused, since its writer kept no schema history.
+    rewrite(&|meta| {
+        meta["snapshots"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("schema-id");
+    });
+    let source = Source::detect(&tbl).unwrap();
+    let err = engine
+        .metadata(&ctx, &source, Some(&SnapshotRef::Id(1)))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("records no schema-id"), "{err}");
+    // One whose schema is gone from the metadata is refused too.
+    rewrite(&|meta| {
+        meta["snapshots"][1]["schema-id"] = serde_json::json!(9);
+    });
+    let source = Source::detect(&tbl).unwrap();
+    let err = engine
+        .metadata(&ctx, &source, Some(&SnapshotRef::Id(2)))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("schema 9"), "{err}");
+    // Even with one schema listed, or a v1 table's legacy `schema` alone: a later writer's list
+    // starts at the schema it found, not at the one the snapshot was written with.
+    let refused = |change: &dyn Fn(&mut serde_json::Value)| {
+        rewrite(change);
+        let source = Source::detect(&tbl).unwrap();
+        let err = engine
+            .metadata(&ctx, &source, Some(&SnapshotRef::Id(1)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("records no schema-id"), "{err}");
+    };
+    refused(&|meta| {
+        let first = meta["schemas"][0].clone();
+        meta["schemas"] = serde_json::json!([first]);
+        meta["current-schema-id"] = serde_json::json!(0);
+    });
+    refused(&|meta| {
+        let only = meta["schemas"][0].clone();
+        let object = meta.as_object_mut().unwrap();
+        object.remove("schemas");
+        object.remove("current-schema-id");
+        object.insert("schema".to_string(), only);
+        meta["format-version"] = serde_json::json!(1);
+    });
+    // The table now still has its current schema.
+    assert_eq!(names(None), ["x", "s", "f"]);
+}
+
+#[test]
+fn an_instant_names_the_snapshot_its_log_says_was_current() {
+    use lakeleto::snapshot::SnapshotRef;
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = build_snapshotted_table(dir.path());
+    let source = Source::detect(&tbl).unwrap();
+    let engine = LocalReaderEngine::default();
+    let ctx = RequestContext::detached();
+    let at = |ms: i64| SnapshotRef::At {
+        ms,
+        text: format!("{ms}ms"),
+    };
+    let snapshot = |ms| {
+        engine
+            .metadata(&ctx, &source, Some(&at(ms)))
+            .map(|m| m.snapshot.unwrap())
+    };
+    assert_eq!(snapshot(1000).unwrap(), "1");
+    assert_eq!(snapshot(1999).unwrap(), "1");
+    assert_eq!(snapshot(2000).unwrap(), "2");
+    let before = snapshot(999).unwrap_err().to_string();
+    assert!(before.contains("had no snapshot at 999ms"), "{before}");
+
+    let missing = engine
+        .metadata(&ctx, &source, Some(&SnapshotRef::Id(99)))
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("no snapshot 99"), "{missing}");
+    assert!(missing.contains("2, 1"), "names the ones it has: {missing}");
+}
+
+/// Delete files remove rows only reading them would count: rows and column statistics are left
+/// unknown, never taken from the data files' manifests as if nothing were deleted.
+#[test]
+fn a_snapshot_with_delete_files_counts_no_rows_by_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = build_snapshotted_table(dir.path());
+    let meta = tbl.join("metadata");
+    let deletes = meta.join("deletes.avro");
+    write_avro(
+        &deletes,
+        MANIFEST_SCHEMA,
+        vec![Value::Record(vec![
+            ("status".into(), Value::Int(1)),
+            (
+                "data_file".into(),
+                Value::Record(vec![
+                    ("content".into(), Value::Int(1)),
+                    ("file_path".into(), Value::String("pos-del.parquet".into())),
+                    ("file_format".into(), Value::String("PARQUET".into())),
+                ]),
+            ),
+        ])],
+    );
+    write_manifest_list(
+        &meta.join("snap-2.avro"),
+        &[(&meta.join("manifest-2.avro"), 0), (&deletes, 1)],
+    );
+    let source = Source::detect(&tbl).unwrap();
+    let now = LocalReaderEngine::default()
+        .metadata(&RequestContext::detached(), &source, None)
+        .unwrap();
+    assert_eq!(now.rows, None);
+    assert_eq!(column(&now, "x").nulls, None);
+    assert_eq!(column(&now, "x").max, None);
+    assert!(
+        now.notes.iter().any(|n| n.contains("delete file")),
+        "{:?}",
+        now.notes
+    );
+}
+
+/// `diff` of a snapshot with the table now: both by metadata, the schema the snapshot was written
+/// with against today's, and what changed between them, found as it would be from the rows.
+#[test]
+fn diff_compares_a_snapshot_with_the_table_now() {
+    use lakeleto::diff::{diff_snapshots, Change, DiffOptions, StatsMethod};
+    use lakeleto::snapshot::SnapshotRef;
+    let dir = tempfile::tempdir().unwrap();
+    let tbl = build_snapshotted_table(dir.path());
+    let source = Source::detect(&tbl).unwrap();
+    let report = diff_snapshots(
+        &RequestContext::detached(),
+        &lakeleto::EngineRegistry::local(),
+        (&source, Some(&SnapshotRef::Id(1))),
+        (&source, None),
+        &DiffOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(report.stats.method, StatsMethod::Metadata);
+    assert_eq!(report.left.snapshot.as_deref(), Some("1"));
+    assert_eq!(report.right.snapshot.as_deref(), Some("2"));
+    assert_eq!((report.rows.left, report.rows.right), (Some(11), Some(22)));
+    assert_eq!(
+        report.stats.left_rows_read + report.stats.right_rows_read,
+        0
+    );
+    for change in [Change::AddedColumn, Change::RowCount, Change::Stats] {
+        assert!(
+            report.found.contains(&change),
+            "{change:?}: {:?}",
+            report.found
+        );
+    }
+    // Rows are read, and a snapshot is compared by its metadata: refused, naming both.
+    let keyed = diff_snapshots(
+        &RequestContext::detached(),
+        &lakeleto::EngineRegistry::local(),
+        (&source, Some(&SnapshotRef::Id(1))),
+        (&source, None),
+        &DiffOptions {
+            key: vec!["x".into()],
+            ..DiffOptions::default()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        keyed.contains("`--key`") && keyed.contains("metadata"),
+        "{keyed}"
+    );
 }

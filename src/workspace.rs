@@ -151,6 +151,13 @@ pub struct RunRecord {
     /// rows and columns the SQL sees, so the run cannot be repeated without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_path: Option<String>,
+    /// Whether the run stopped at its row cap with more rows to give: `Some(false)` means the
+    /// result is the whole answer, `Some(true)` that it is its first `row_count` rows, `None` that
+    /// the run did not say (a record from before this field, or from a writer that does not track
+    /// it). Only a run known to be whole is saved as a table — see
+    /// [`table_out`](crate::table_out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -662,6 +669,7 @@ mod tests {
             cached: true,
             flatten: None,
             json_path: None,
+            truncated: Some(false),
         };
         s.append_run(&ws.id, &run, Some(&sample_batch())).unwrap();
 
@@ -695,6 +703,7 @@ mod tests {
                 cached: true,
                 flatten: None,
                 json_path: None,
+                truncated: Some(false),
             },
             Some(&sample_batch()),
         )

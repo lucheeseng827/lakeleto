@@ -3,7 +3,7 @@
 // file tree), and the run-history panel. The client tab model round-trips through the backend
 // `Tab.view` (opaque grid state), so open tabs + their sort/filter/sql survive a reload.
 import { useEffect, useMemo, useState, type CSSProperties, type DragEvent as ReactDragEvent, type ReactNode, type SyntheticEvent } from "react";
-import type { Conn, Filters, Row, RunRecord, RunResponse, Sort, Workspace, WsConnection, WsMeta, WsSavedQuery, WsVariable, QueryResp } from "./api";
+import type { Conn, DiffReport, Filters, Row, RunRecord, RunResponse, Sort, Workspace, WsConnection, WsMeta, WsSavedQuery, WsVariable, QueryResp } from "./api";
 import { Button, Chip, filterRows, LakeletoMark, Select, StatTable, TextInput, ThemeToggle } from "./components";
 import { displayPath, isDatabaseUri } from "./api";
 
@@ -24,7 +24,8 @@ export function usedVars(text: string): string[] {
   return [...out];
 }
 
-export type SubView = "Grid" | "Schema" | "Profile" | "SQL";
+/** A tab's view of its source. `Diff` is offered only by a server that answers `GET /v1/diff`. */
+export type SubView = "Grid" | "Schema" | "Profile" | "Diff" | "SQL";
 
 export interface OpenTab {
   id: string;
@@ -45,6 +46,20 @@ export interface OpenTab {
   sqlOut?: RunResponse | null;
   sqlErr?: string | null;
   sqlBusy?: boolean;
+  /** The Diff view's form and its last report: what to compare this table with (a path, a URI,
+   *  or `@<snapshot>` for this table at one), the key, how to take statistics, and which side this
+   *  table is. Never persisted: a restored tab opens on its grid. */
+  diffWith?: string;
+  diffKey?: string;
+  diffStats?: "auto" | "fast" | "scan";
+  diffThisIsOld?: boolean;
+  diffOut?: DiffReport | null;
+  diffErr?: string | null;
+  /** How the table was read (path, flatten, records path) for `diffOut`, and for `diffErr`: each
+   *  is shown only while the tab still reads it that way. Kept apart, since a failed Compare
+   *  leaves the last report as it was. */
+  diffFor?: string;
+  diffErrFor?: string;
   // result tab (opened from history)
   runId?: string;
   run?: RunRecord;
@@ -103,7 +118,9 @@ export function buildDoc(ws: Workspace, tabs: OpenTab[]): Workspace {
     ...ws,
     tabs: persistable.map((t) => ({
       id: t.id, kind: "connection", ref_id: t.connId || "",
-      view: { v: 1, path: t.path, sub: t.sub, sort: t.sort, filters: t.filters, sql: t.sql, title: t.title, flatten: t.flatten || undefined, jsonPath: t.jsonPath } satisfies TabView,
+      // A diff is not kept, so a tab saved on it reopens on its grid — also on a server, or in an
+      // older app, that has no Diff view.
+      view: { v: 1, path: t.path, sub: t.sub === "Diff" ? "Grid" : t.sub, sort: t.sort, filters: t.filters, sql: t.sql, title: t.title, flatten: t.flatten || undefined, jsonPath: t.jsonPath } satisfies TabView,
     })),
   };
 }
@@ -734,7 +751,9 @@ export function HistoryPanel({ history, onOpenRun, onCompare, compareId, onRefre
 // ======================================================================
 // ResultView — a read-only grid over a cached run result (opened from history)
 // ======================================================================
-export function ResultView({ tab, onOpenRow }: { tab: OpenTab; onOpenRow: (r: Row) => void }) {
+export function ResultView({ tab, onOpenRow, onSaveAsTable }: { tab: OpenTab; onOpenRow: (r: Row) => void;
+  /** Present when the server writes new tables; the button shows only for a run known to be whole. */
+  onSaveAsTable?: () => void }) {
   const [search, setSearch] = useState("");
   const pane: CSSProperties = { flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column" };
   const meta: CSSProperties = { padding: "var(--pad-toolbar)", borderBottom: "var(--border-hairline)", color: "var(--muted)", fontSize: "var(--text-12)", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" };
@@ -750,6 +769,12 @@ export function ResultView({ tab, onOpenRow }: { tab: OpenTab; onOpenRow: (r: Ro
         <span style={{ flex: 1 }} />
         {tab.result && <div style={{ width: 180 }}><TextInput value={search} onChange={setSearch} placeholder="search…" size="sm" /></div>}
         {r && <span>{fmtInt(r.row_count)} rows · {r.duration_ms}ms · {agoStr(r.at_ms)}</span>}
+        {onSaveAsTable && r?.cached && r.truncated === false && (
+          <Button size="sm" onClick={onSaveAsTable} title="write this result as a new Parquet table under the server's --write-dir (never replaces one)">Save as table…</Button>
+        )}
+        {onSaveAsTable && r?.cached && r.truncated === true && (
+          <span title="the run stopped at its row cap, so its result is not the whole answer — run it again with a higher limit to save it">first {fmtInt(r.row_count)} rows only · not saveable</span>
+        )}
       </div>
       {tab.resultErr && <div style={{ padding: "var(--gutter)", color: "var(--err-fg)", fontSize: "var(--text-base)" }}>{tab.resultErr}</div>}
       {!tab.resultErr && tab.result && (

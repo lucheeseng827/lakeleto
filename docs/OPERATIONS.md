@@ -73,6 +73,14 @@ lakeleto open data/events.parquet    # start server + launch a browser tab deep-
   login, and refuses a table whose catalog requires row filters or column masks it cannot apply.
 - **Read-only.** `query` / `POST /v1/query` / the MCP `query` tool reject anything that isn't
   `SELECT`/`WITH`/`EXPLAIN`. Lakeleto never mutates your data.
+- **One write, opt-in, create-only.** `lakeleto create-table` and, on a server started with
+  `--write-dir`, `POST /v1/tables` write a query's result as a *new* Parquet file under that
+  directory. A name that exists is refused, never replaced; names are confined to the directory;
+  with `--root`, the directory must be inside it. A server without `--write-dir` creates no
+  tables, and the flag has no environment variable, so only a command line turns it on. (The
+  workspace store under `$LAKELETO_HOME` — workspaces, history, and results you choose to cache —
+  is separate, and unchanged.) The MCP
+  server has no write tool.
 - **`lakeleto mcp` opens no socket.** It speaks only to the client that started it, on its stdin
   and stdout, and reads with that user's permissions and credentials. `--root` confines it
   exactly as it confines `serve`, with the same checks, and every tool is read-only. What a tool

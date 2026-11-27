@@ -112,6 +112,15 @@ pub struct Cli {
     )]
     pub max_decompressed: u64,
 
+    /// Send this run to an OpenLineage endpoint (Marquez's `/api/v1/lineage`, say) as START and
+    /// COMPLETE, or FAIL, events naming the datasets it read and wrote: for `check` (with each
+    /// gate and contract rule as an assertion, and what it measured), `diff`, `head` or `query`
+    /// writing `--out` to a file, and `serve`'s `/v1/export`. Without it, OPENLINEAGE_URL names a
+    /// server to send them to (its `/api/v1/lineage`). The key is OPENLINEAGE_API_KEY's. A failure
+    /// to send is one warning, and the exit code stands. In builds with the `openlineage` feature.
+    #[arg(long, global = true, value_name = "URL")]
+    pub openlineage: Option<String>,
+
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -120,7 +129,18 @@ impl Cli {
     /// The output format: `-o` when given, else the one `--out`'s extension names, else `table`.
     pub fn output(&self) -> Output {
         self.output
-            .or_else(|| self.out_file().and_then(Output::for_path))
+            .or_else(|| {
+                // `.md` asks for Markdown only of `diff`, and `.xml` for JUnit only of `check`, the
+                // commands with those forms: any other writes its usual text to such a file, as it
+                // always has.
+                self.out_file()
+                    .and_then(Output::for_path)
+                    .filter(|o| match o {
+                        Output::Markdown => matches!(self.cmd, Cmd::Diff { .. }),
+                        Output::Junit => matches!(self.cmd, Cmd::Check { .. }),
+                        _ => true,
+                    })
+            })
             .unwrap_or(Output::Table)
     }
 
@@ -178,10 +198,149 @@ pub enum Cmd {
         cmd: CatalogCmd,
     },
 
+    /// Compare two tables, of any formats: their columns, their row counts, and each shared
+    /// column's null count, minimum and maximum. Statistics read every row of each side when the
+    /// build runs SQL (the release binaries do); `--fast` takes them from Parquet footers, and
+    /// `--scan N` from the first N rows. Exits 3 when a kind of difference `--fail-on` names is
+    /// found, 0 otherwise. `-o table` (the default), `json` or `markdown`.
+    Diff {
+        /// The table to compare from: the old one, or the reference. `<table>@<snapshot>` names an
+        /// Iceberg or Delta table at one of its snapshots (`@<id>`, a Delta version, or
+        /// `@<RFC 3339 instant>`); both sides are then compared by their table metadata, with no
+        /// row read.
+        left: PathBuf,
+        /// The table to compare it with: the new one. Takes `@<snapshot>` as the left side does.
+        right: PathBuf,
+        /// Statistics from Parquet footers: exact over each file, with no row read. Single
+        /// Parquet files only.
+        #[arg(long, conflicts_with = "scan")]
+        fast: bool,
+        /// Statistics from the first N rows of each side instead of every row: quicker, and a
+        /// difference it finds may not be one between the tables.
+        #[arg(long, value_name = "N")]
+        scan: Option<std::num::NonZeroUsize>,
+        /// Compare the rows too, matched by these columns, which must name one row on each side:
+        /// rows added, removed and changed, and in which columns. Comma-separated or repeated,
+        /// so a column whose name holds a comma cannot be a key. Runs in the SQL engine, which
+        /// holds the left side's key and compared columns in memory.
+        #[arg(long, value_delimiter = ',', value_name = "COLUMNS")]
+        key: Vec<String>,
+        /// With `--key`, how many rows of each kind to show.
+        #[arg(long, value_name = "N", default_value_t = crate::diff::SAMPLE_ROWS, requires = "key")]
+        sample: usize,
+        /// Exit 3 when any of these is found: added-column, removed-column, type-change,
+        /// nullability, column-order, row-count, stats, added-rows, removed-rows, changed-rows,
+        /// or the groups schema (the first four), rows (the last three) and any.
+        /// Comma-separated or repeated.
+        #[arg(long, value_enum, value_delimiter = ',', value_name = "KINDS")]
+        fail_on: Vec<crate::diff::FailOn>,
+    },
+
+    /// Check a table against a baseline file of what it was, and how long ago it changed: a gate
+    /// for CI and pipelines. Fails (exit 3) on a column removed, retyped or changed in
+    /// nullability, rows dropping by more than `--max-row-drop`, a column's share of nulls rising
+    /// by more than `--max-null-rise`, its files or their bytes growing or shrinking by more than
+    /// `--max-file-jump`, with `--max-age` a table that changed longer ago than that, or with
+    /// `--contract` rows that break a data contract (feature `contracts`). Counts
+    /// every row in the SQL engine, which the release binaries have, or a single Parquet file from
+    /// its footer (`--fast`). `-o table` (the default), `json` or `junit`.
+    #[command(group = clap::ArgGroup::new("against").required(true).multiple(true).args(["baseline", "max_age", "contract"]))]
+    Check {
+        /// The table to check.
+        path: PathBuf,
+        /// The baseline file: what the table was, as a check with `--update` wrote it. A JSON
+        /// file with no value the table holds in it, meant to be committed.
+        #[arg(long, value_name = "FILE")]
+        baseline: Option<PathBuf>,
+        /// Write what the table is now as the baseline, when the check passes or there is no
+        /// baseline yet. A check that fails leaves the baseline as it was: to accept the change,
+        /// remove the file and run `--update` again.
+        #[arg(long, requires = "baseline")]
+        update: bool,
+        /// Count a single Parquet file from its footer, with no row read: exact, and quick. A
+        /// column whose nulls the footer did not record is not counted, and the nulls gate is
+        /// then unknown. A build without SQL counts a Parquet file this way anyway.
+        #[arg(long)]
+        fast: bool,
+        /// Fail when the rows drop by more than this share, in percent. Exactly this passes.
+        #[arg(long, value_name = "PCT", default_value_t = crate::check::DEFAULT_MAX_ROW_DROP,
+              value_parser = clap::value_parser!(u32).range(0..=100))]
+        max_row_drop: u32,
+        /// Fail when a column's share of nulls rises by more than this many percentage points.
+        #[arg(long, value_name = "POINTS", default_value_t = crate::check::DEFAULT_MAX_NULL_RISE,
+              value_parser = clap::value_parser!(u32).range(0..=100))]
+        max_null_rise: u32,
+        /// Fail when the table's data files, or their bytes, grow or shrink by more than this
+        /// factor: `2` (the default), `1.5`. Named, it also fails a table whose files are not
+        /// counted here instead of skipping it.
+        #[arg(long, value_name = "FACTOR", value_parser = crate::check::parse_factor)]
+        max_file_jump: Option<u64>,
+        /// Fail when the table last changed longer ago than this: `30m`, `24h`, `7d`. From an
+        /// Iceberg table's current snapshot, a Delta table's latest commit, or a file's
+        /// modification time.
+        #[arg(long, value_name = "AGE", value_parser = crate::check::parse_age)]
+        max_age: Option<u64>,
+        /// Check every row against this data contract — an ODCS v3 document, or Covenant's own —
+        /// with Covenant's validator, and fail when it finds more violations than the contract
+        /// allows. Needs the `contracts` feature.
+        #[arg(long, value_name = "FILE")]
+        contract: Option<PathBuf>,
+        /// The model of the contract this table is, when the contract has more than one.
+        #[arg(long, value_name = "NAME", requires = "contract")]
+        model: Option<String>,
+        /// Check a contract that has rules this checker cannot enforce, on the rules it can; the
+        /// report says the check was partial. Without it such a contract is refused.
+        #[arg(long, requires = "contract")]
+        allow_unenforced: bool,
+        /// The most memory the contract's `unique` rules may hold the values they have seen in,
+        /// by estimate: a number of bytes, or one with a suffix in powers of 1024 — `512M`,
+        /// `2GiB`. Past it uniqueness is not checked for the rest of the table, and the contract
+        /// gate is unknown, or partial with `--allow-unenforced`.
+        #[arg(
+            long,
+            value_name = "BYTES",
+            requires = "contract",
+            default_value = "512MiB",
+            value_parser = parse_bytes
+        )]
+        unique_memory: u64,
+    },
+
     /// Run SQL over one or more tables (needs `--features sql`, or `--engine remote`).
     Query {
-        /// The SQL to run, e.g. "SELECT city, count(*) FROM t GROUP BY city".
+        /// The SQL to run, e.g. "SELECT city, count(*) FROM t GROUP BY city". May start with a
+        /// `--` comment, as a query pasted from a `.sql` file often does.
+        #[arg(allow_hyphen_values = true)]
         sql: String,
+        /// Register a table: `--table name=path` (repeatable).
+        #[arg(long = "table", value_name = "NAME=PATH")]
+        tables: Vec<String>,
+        /// Shorthand for a single table registered as `t`.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+
+    /// Write a query's result, or a copy of one table, as a NEW Parquet table under a write
+    /// directory, with its provenance in the file. Never replaces anything: a name that exists is
+    /// refused, and the table appears whole or not at all. Needs `--features parquet-out`, as the
+    /// release binaries have.
+    #[cfg(feature = "parquet-out")]
+    CreateTable {
+        /// The new table's name: 1 to 3 `/`-separated parts of letters, digits, `_` and `-`.
+        /// `marts/revenue_by_city` is written as `<write-dir>/marts/revenue_by_city.parquet`.
+        name: String,
+        /// The directory new tables are written under. It must exist. Env: LAKELETO_WRITE_DIR.
+        #[arg(long, env = "LAKELETO_WRITE_DIR")]
+        write_dir: PathBuf,
+        /// SQL whose result becomes the table, e.g. "SELECT city, sum(amount) AS revenue FROM t
+        /// GROUP BY city" (needs `--features sql`, or `--engine remote`). Without it or
+        /// `--sql-file`, the one table given is copied. May start with a `--` comment.
+        #[arg(long, allow_hyphen_values = true, conflicts_with = "sql_file")]
+        sql: Option<String>,
+        /// Read the SQL from this file instead: a mart kept as a `.sql` file beside the
+        /// pipeline that builds it.
+        #[arg(long, value_name = "FILE")]
+        sql_file: Option<PathBuf>,
         /// Register a table: `--table name=path` (repeatable).
         #[arg(long = "table", value_name = "NAME=PATH")]
         tables: Vec<String>,
@@ -218,6 +377,12 @@ pub enum Cmd {
         /// gives the tray launcher and `serve` a way not to collide over one home.
         #[arg(long, env = "LAKELETO_WORKSPACE_HOME")]
         workspace_home: Option<PathBuf>,
+        /// Let the API write NEW tables under this directory (`POST /v1/tables`, and saving a
+        /// run as a table). Off by default, when the server creates no tables. A new table never
+        /// replaces a file; with `--root`, this directory must be inside it. Deliberately not
+        /// read from the environment: a server creates tables only when its command line says so.
+        #[arg(long, value_name = "DIR")]
+        write_dir: Option<PathBuf>,
     },
 
     /// Open a file in the embedded SPA: start the server and launch a browser tab. Needs `--features serve`.
@@ -264,6 +429,57 @@ pub enum Cmd {
               value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
         timeout: u64,
     },
+    /// Serve the tables named here to Flight SQL clients — ADBC (Python, R, Go, Java), JDBC tools,
+    /// notebooks — read-only, over gRPC: each statement one `SELECT`, `WITH` or `EXPLAIN` over
+    /// them, run by the SQL engine. Needs `--features flight`.
+    #[cfg(feature = "flight")]
+    Flight {
+        /// Bind address for the gRPC listener. Loopback by default; any other address needs
+        /// --tls-cert and --tls-key, or --plaintext.
+        #[arg(long, default_value = "127.0.0.1:50051", env = "LAKELETO_FLIGHT_ADDR")]
+        addr: String,
+        /// Speak TLS with this certificate chain (PEM, leaf first). Needs --tls-key.
+        /// Env: LAKELETO_FLIGHT_TLS_CERT.
+        #[arg(
+            long,
+            value_name = "PEM",
+            env = "LAKELETO_FLIGHT_TLS_CERT",
+            requires = "tls_key",
+            conflicts_with = "plaintext"
+        )]
+        tls_cert: Option<std::path::PathBuf>,
+        /// The private key of --tls-cert (PEM). Env: LAKELETO_FLIGHT_TLS_KEY.
+        #[arg(
+            long,
+            value_name = "PEM",
+            env = "LAKELETO_FLIGHT_TLS_KEY",
+            requires = "tls_cert",
+            hide_env_values = true
+        )]
+        tls_key: Option<std::path::PathBuf>,
+        /// Serve plaintext gRPC on an address other than loopback: for a TLS proxy or tunnel in
+        /// front of this server. Without it, such an address needs --tls-cert and --tls-key.
+        #[arg(long)]
+        plaintext: bool,
+        /// Require this token on every call: `authorization: Bearer <token>`, or a login with it
+        /// as the password. Env: LAKELETO_TOKEN.
+        #[arg(long, env = "LAKELETO_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// A table to serve, as `name=reference` (repeatable): a path, an object-store URI or a
+        /// catalog reference (not a database's, yet). SQL reaches it as `name`.
+        #[arg(long = "table", value_name = "NAME=REF", required = true)]
+        tables: Vec<String>,
+        /// The most rows one statement returns. A result with more is an error, never a short
+        /// one.
+        #[arg(long, default_value_t = 1_000_000,
+              value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+        max_rows: usize,
+        /// Seconds a statement may take, from the request that runs it to the end of its fetch
+        /// (at most a week).
+        #[arg(long, default_value_t = 300,
+              value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..=604_800))]
+        timeout: u64,
+    },
 }
 
 /// `lakeleto catalog …`.
@@ -279,8 +495,175 @@ pub enum CatalogCmd {
     },
 }
 
+/// What a command read, for the OpenLineage events its run is sent as: each input as its
+/// reference names it (for a `diff` side at a snapshot, its table), and a check's report with
+/// the rules its contract holds the rows to.
+#[cfg_attr(not(feature = "openlineage"), allow(dead_code))]
+struct Record {
+    inputs: Vec<PathBuf>,
+    #[cfg(feature = "openlineage")]
+    check: Option<(crate::check::CheckReport, crate::lineage::ContractRules)>,
+}
+
+impl Record {
+    /// What `cmd` was asked to read, named before anything can refuse it, so a run that fails
+    /// says what it was for; the command refines it once it has resolved what it reads.
+    fn asked(cmd: &Cmd) -> Record {
+        Record {
+            inputs: asked_inputs(cmd),
+            #[cfg(feature = "openlineage")]
+            check: None,
+        }
+    }
+}
+
 /// Run the CLI. Returns a process exit code.
 pub fn run(cli: Cli) -> Result<i32> {
+    #[cfg(feature = "openlineage")]
+    let lineage = lineage_for(&cli)?;
+    #[cfg(not(feature = "openlineage"))]
+    lineage_for(&cli)?;
+    let mut record = Record::asked(&cli.cmd);
+    let result = run_command(&cli, &mut record);
+    #[cfg(feature = "openlineage")]
+    if let Some(lineage) = lineage {
+        send_lineage(&cli, lineage, &record, &result);
+    }
+    result
+}
+
+/// The command a run is sent to OpenLineage as: `check`, `diff`, an `export` (`head` or `query`
+/// writing `--out` to a file), or `serve`, whose exports the server sends.
+fn lineage_command(cli: &Cli) -> Option<&'static str> {
+    match &cli.cmd {
+        Cmd::Check { .. } => Some("check"),
+        Cmd::Diff { .. } => Some("diff"),
+        Cmd::Head { .. } | Cmd::Query { .. } if cli.out_file().is_some() => Some("export"),
+        #[cfg(feature = "serve")]
+        Cmd::Serve { .. } => Some("serve"),
+        _ => None,
+    }
+}
+
+/// `--openlineage` on a command that sends nothing is refused, since it could only be a mistake.
+/// OPENLINEAGE_URL is not: a scheduler sets it for every command it runs.
+fn refuse_lineage_elsewhere(cli: &Cli) -> Result<()> {
+    match (&cli.openlineage, lineage_command(cli)) {
+        (Some(_), None) => Err(EngineError::Other(format!(
+            "--openlineage sends a run of `check`, `diff`, an export (`head` or `query` writing \
+             `--out` to a file) or `serve`'s exports, and `{}` is none of them",
+            command_name(&cli.cmd)
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The run to send, if one is asked for: refused before anything is read when `--openlineage`
+/// names an endpoint the rule refuses. `serve` sends its own.
+#[cfg(feature = "openlineage")]
+fn lineage_for(cli: &Cli) -> Result<Option<(crate::lineage::Run, &'static str)>> {
+    refuse_lineage_elsewhere(cli)?;
+    match lineage_command(cli) {
+        None | Some("serve") => Ok(None),
+        Some(command) => Ok(crate::lineage::destination(cli.openlineage.as_deref())?
+            .map(|to| (crate::lineage::Run::start(to), command))),
+    }
+}
+
+/// Without the feature, `--openlineage` is refused, naming it; OPENLINEAGE_URL warns, once.
+#[cfg(not(feature = "openlineage"))]
+fn lineage_for(cli: &Cli) -> Result<()> {
+    refuse_lineage_elsewhere(cli)?;
+    if cli.openlineage.is_some() {
+        return Err(EngineError::missing_feature(
+            "send a run to OpenLineage",
+            "openlineage",
+        ));
+    }
+    if lineage_command(cli).is_some()
+        && std::env::var_os("OPENLINEAGE_URL").is_some_and(|v| !v.is_empty())
+    {
+        eprintln!(
+            "lakeleto: warning: OPENLINEAGE_URL is set, but this build has no `openlineage` \
+             feature: no OpenLineage event is sent"
+        );
+    }
+    Ok(())
+}
+
+/// Where `serve` sends each `/v1/export`, if anywhere: `--openlineage`, or OPENLINEAGE_URL, by
+/// the rule a run of any other command is sent by.
+#[cfg(all(feature = "serve", feature = "openlineage"))]
+fn serve_lineage(cli: &Cli) -> Result<Option<crate::api::Lineage>> {
+    crate::lineage::destination(cli.openlineage.as_deref())
+}
+
+/// Without the feature a server sends nothing; [`lineage_for`] has said so.
+#[cfg(all(feature = "serve", not(feature = "openlineage")))]
+fn serve_lineage(_: &Cli) -> Result<Option<crate::api::Lineage>> {
+    Ok(None)
+}
+
+/// Send the run `record` describes, once its result is whole (an export's file in place): START,
+/// then COMPLETE, or FAIL for an error. A failed gate, or a diff that found a change, completed.
+/// Nothing is sent when an input has no OpenLineage name, and a failure to send changes nothing
+/// but a warning on stderr.
+#[cfg(feature = "openlineage")]
+fn send_lineage(
+    cli: &Cli,
+    (run, command): (crate::lineage::Run, &'static str),
+    record: &Record,
+    result: &Result<i32>,
+) {
+    use crate::lineage::{self, Input, Outcome};
+    let ctx = RequestContext::detached();
+    let remote = uses_remote(cli);
+    let mut inputs = Vec::with_capacity(record.inputs.len());
+    for path in &record.inputs {
+        let named = path
+            .to_str()
+            .ok_or_else(|| format!("{} is not UTF-8, so it has no name", path.display()))
+            .and_then(|reference| lineage::dataset(&ctx, reference, remote));
+        match named {
+            Ok(dataset) => inputs.push(Input {
+                dataset,
+                facets: None,
+            }),
+            Err(why) => return lineage::warn(&format!("no OpenLineage event is sent: {why}")),
+        }
+    }
+    if let (Some((report, rules)), Some(input)) = (&record.check, inputs.first_mut()) {
+        input.facets = Some(lineage::check_facets(report, rules));
+    }
+    // An export is named for its file, written or not; only a written one is an output.
+    let file = match (command, cli.out_file()) {
+        ("export", Some(file)) => match lineage::local(file) {
+            Ok(dataset) => Some(dataset),
+            Err(why) => return lineage::warn(&format!("no OpenLineage event is sent: {why}")),
+        },
+        _ => None,
+    };
+    let outputs: Vec<_> = file.iter().filter(|_| result.is_ok()).cloned().collect();
+    let outcome = match result {
+        Ok(_) => Outcome::Complete,
+        Err(_) => Outcome::Fail,
+    };
+    let job = lineage::Job {
+        command,
+        named_for: file.as_ref(),
+    };
+    let events = run.events(&job, &inputs, &outputs, outcome);
+    let to = run.destination().shown();
+    match run.send(&events) {
+        Ok(()) => eprintln!(
+            "lakeleto: openlineage: START and {} sent → {to}",
+            outcome.event_type()
+        ),
+        Err(why) => lineage::warn(&format!("OpenLineage events not sent to {to}: {why}")),
+    }
+}
+
+fn run_command(cli: &Cli, record: &mut Record) -> Result<i32> {
     // A one-shot CLI invocation genuinely has nothing to say about the call: no deadline, no
     // canceller, no tenant. `detached()` names that rather than pretending otherwise — and it
     // is the context on which `RequestContext::check` short-circuits, so threading it through
@@ -301,39 +684,46 @@ pub fn run(cli: Cli) -> Result<i32> {
     )?;
     // Everything a command prints goes through this, so `--out` captures it whole or not at all.
     let mut sink = Sink::open(cli.out_file())?;
+    // What the process exits with once the output is whole: 0, or what a command found says.
+    let mut code = 0;
     match &cli.cmd {
         Cmd::Schema { path } => {
-            let source = source_for(&cli, path)?;
-            let engine = engines_for(&cli)?.resolve(Need::Read(&source))?;
+            let source = source_for(cli, path)?;
+            let engine = engines_for(cli)?.resolve(Need::Read(&source))?;
             let schema = engine.schema(&ctx, &source)?;
             write!(sink, "{}", render::schema(&schema, output)?)?;
         }
         Cmd::Head { path, rows } => {
-            let source = source_for(&cli, path)?;
-            let engine = engines_for(&cli)?.resolve(Need::Read(&source))?;
+            let source = source_for(cli, path)?;
+            let engine = engines_for(cli)?.resolve(Need::Read(&source))?;
             let batch = engine.preview(&ctx, &source, *rows)?;
             // The streaming writer, over a batch already in hand: byte for byte what the buffered
             // renderer prints for the text formats, and the only writer of the binary ones.
             render::stream_rows(RowStream::from_batch(batch), output, &mut sink)?;
         }
         Cmd::Profile { path, scan, fast } => {
-            let source = source_for(&cli, path)?;
-            let engine = engines_for(&cli)?.resolve(Need::Read(&source))?;
+            let source = source_for(cli, path)?;
+            let engine = engines_for(cli)?.resolve(Need::Read(&source))?;
             // `--fast` selects the footer-statistics path (scan_limit 0).
             let scan_limit = if *fast { 0 } else { *scan };
             let prof = engine.profile(&ctx, &source, scan_limit)?;
             write!(sink, "{}", render::profile(&prof, output)?)?;
         }
         Cmd::Info { path } => {
-            let source = source_for(&cli, path)?;
-            let engine = engines_for(&cli)?.resolve(Need::Read(&source))?;
+            let source = source_for(cli, path)?;
+            let engine = engines_for(cli)?.resolve(Need::Read(&source))?;
             let schema = engine.schema(&ctx, &source)?;
             let info = render::SourceInfo {
                 path: source.display(),
                 // With `--remote-url` the server detects the format, so there is none here.
                 format: (!source.is_unresolved()).then(|| source.format.to_string()),
                 engine: engine.name().to_string(),
-                size_bytes: std::fs::metadata(&source.path).map(|m| m.len()).ok(),
+                // Only a source resolved here is sized here. With `--remote-url` the path is a
+                // reference for the server, and a local directory that happens to share its name
+                // is somebody else's: walking it would report its size beside the remote schema.
+                size_bytes: (!source.is_unresolved())
+                    .then(|| crate::source::size_on_disk(&source.path))
+                    .flatten(),
                 row_count: schema.row_count,
                 columns: schema.columns.len(),
                 credentials: schema.credentials,
@@ -342,8 +732,8 @@ pub fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Engines => {
             write!(sink, "{}", render_engines())?;
-            if uses_remote(&cli) {
-                write!(sink, "{}", render_server(&cli, &ctx)?)?;
+            if uses_remote(cli) {
+                write!(sink, "{}", render_server(cli, &ctx)?)?;
             }
         }
         #[cfg(feature = "catalog")]
@@ -353,6 +743,249 @@ pub fn run(cli: Cli) -> Result<i32> {
             let catalogs = crate::catalog::Catalogs::configured();
             let rows = catalog_ls(&catalogs, &ctx, reference.as_deref())?;
             render::stream_rows(RowStream::from_batch(rows), output, &mut sink)?;
+        }
+        Cmd::Diff {
+            left,
+            right,
+            fast,
+            scan,
+            key,
+            sample,
+            fail_on,
+        } => {
+            use crate::diff::{DiffOptions, StatsMode};
+            // Through a server, every read and query is capped and answered by its own catalog of
+            // sources; nothing yet shows a diff made that way comes out whole. Refused rather than
+            // trusted until a test does.
+            if uses_remote(cli) {
+                return Err(EngineError::UnsupportedOperation {
+                    engine: "remote".to_string(),
+                    op: "diff two tables".to_string(),
+                    hint: "run `lakeleto diff` where the tables are: on that machine, or over \
+                           paths and object-store URIs this machine can read"
+                        .to_string(),
+                });
+            }
+            // A row kind with no key could never be found, so the job it guards could never fail.
+            if key.is_empty() {
+                use crate::diff::FailOn;
+                if let Some(rows) = fail_on.iter().find(|f| {
+                    matches!(
+                        f,
+                        FailOn::AddedRows
+                            | FailOn::RemovedRows
+                            | FailOn::ChangedRows
+                            | FailOn::Rows
+                    )
+                }) {
+                    return Err(EngineError::Other(format!(
+                        "`--fail-on {}` needs `--key`: without one no row is compared, so it could \
+                         never fail",
+                        rows.to_possible_value()
+                            .map(|v| v.get_name().to_string())
+                            .unwrap_or_default()
+                    )));
+                }
+            } else if cli.engine == EngineChoice::Local {
+                return Err(EngineError::Other(
+                    "`--key` compares rows in the SQL engine, and `--engine local` reads with none: \
+                     drop `--engine local`"
+                        .to_string(),
+                ));
+            }
+            let (left, left_at) = diff_side(cli, left)?;
+            let (right, right_at) = diff_side(cli, right)?;
+            // A side at a snapshot is its table: the dataset is the table, read as it was then.
+            record.inputs = vec![left.path.clone(), right.path.clone()];
+            let stats = match (*fast, *scan) {
+                (true, _) => StatsMode::Footer,
+                (false, Some(n)) => StatsMode::Sample(n.get()),
+                (false, None) => StatsMode::Auto,
+            };
+            let report = crate::diff::diff_snapshots(
+                &ctx,
+                &engines_for(cli)?,
+                (&left, left_at.as_ref()),
+                (&right, right_at.as_ref()),
+                &DiffOptions {
+                    stats,
+                    key: key.clone(),
+                    sample_rows: *sample,
+                },
+            )?;
+            let text = match output {
+                Output::Json => {
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| EngineError::Other(format!("encode the diff: {e}")))?
+                        + "\n"
+                }
+                Output::Markdown => crate::diff::render_markdown(&report),
+                _ => crate::diff::render_text(&report),
+            };
+            write!(sink, "{text}")?;
+            if report.fails(fail_on) {
+                code = crate::diff::EXIT_FOUND;
+            }
+        }
+        Cmd::Check {
+            path,
+            baseline,
+            update,
+            fast,
+            max_row_drop,
+            max_null_rise,
+            max_file_jump,
+            max_age,
+            contract,
+            model,
+            allow_unenforced,
+            unique_memory,
+        } => {
+            use crate::check;
+            // Through a server a check's counts are one aggregate row, which the server's caps on
+            // a result never cut. A contract streams every row, which they would: refused.
+            if uses_remote(cli) && contract.is_some() {
+                return Err(EngineError::UnsupportedOperation {
+                    engine: "remote".to_string(),
+                    op: "check a data contract".to_string(),
+                    hint: "a server caps the rows it answers with, so a contract would see only \
+                           some of them: run `lakeleto check --contract` where the table is"
+                        .to_string(),
+                });
+            }
+            // Refused before anything is read: a build without the validator cannot keep the
+            // promise `--contract` makes, whatever else the check could do.
+            if contract.is_some() && !cfg!(feature = "contracts") {
+                return Err(EngineError::missing_feature(
+                    "check a data contract",
+                    "contracts",
+                ));
+            }
+            let source = source_for(cli, path)?;
+            // A contract is read, compiled and resolved before the table is counted, and a
+            // database table's refused: either stops the check before it spends a scan.
+            let prepared = match contract {
+                Some(_) if source.format == crate::source::Format::Database => {
+                    return Err(check::database_contract())
+                }
+                Some(path) => Some(check::prepare_contract(&check::ContractArgs {
+                    path: path.clone(),
+                    model: model.clone(),
+                    allow_unenforced: *allow_unenforced,
+                    unique_memory: *unique_memory,
+                })?),
+                None => None,
+            };
+            // Read before the table is: a baseline that does not read stops the check before it
+            // spends a scan.
+            let old = match baseline {
+                Some(file) => check::read_baseline(file, *update)?,
+                None => None,
+            };
+            let now = check::now_ms();
+            let counting = if *fast {
+                check::Counting::Footer
+            } else {
+                check::Counting::Auto
+            };
+            let check::Measurement {
+                fingerprint: measured,
+                engine,
+                mut notes,
+                listed,
+            } = check::measure(&ctx, &engines_for(cli)?, &source, counting, now)?;
+            let limits = check::Limits {
+                max_row_drop_pct: *max_row_drop,
+                max_null_rise_points: *max_null_rise,
+                max_file_jump: max_file_jump.unwrap_or(check::DEFAULT_MAX_FILE_JUMP),
+                files_asked: max_file_jump.is_some(),
+                max_age_ms: *max_age,
+            };
+            let no_baseline = if baseline.is_some() {
+                "no baseline yet: this check writes the first"
+            } else {
+                "no `--baseline`"
+            };
+            let (mut gates, schema) =
+                check::judge(&measured, old.as_ref(), &limits, now, no_baseline);
+            let contract = match &prepared {
+                Some(prepared) => {
+                    let result = check::run_contract(&ctx, &engines_for(cli)?, &source, prepared)?;
+                    gates.push(check::contract_gate(&result));
+                    Some(result)
+                }
+                None => None,
+            };
+            let status = check::overall(&gates);
+            if let Some(base) = &old {
+                if base.source != measured.source {
+                    notes.push(format!(
+                        "the baseline was taken of {}, and this is {}",
+                        base.source, measured.source
+                    ));
+                }
+            }
+            let mut report = check::CheckReport {
+                version: check::REPORT_VERSION,
+                engine,
+                measured,
+                baseline_path: baseline.as_ref().map(|p| p.display().to_string()),
+                baseline: old,
+                schema,
+                gates,
+                status,
+                baseline_written: false,
+                contract,
+                notes,
+            };
+            // A baseline that cannot be written is said in the report, which is still printed,
+            // and the check errs: the next run would compare with the old one. Nor is one
+            // written whose files went unlisted: it would turn the files gate off for good.
+            let mut unwritten = false;
+            if *update && status == check::Status::Pass {
+                if let Some(file) = baseline {
+                    if !listed {
+                        report.notes.push(
+                            "the baseline was not updated: without the table's files it would \
+                             leave the files gate nothing to compare in the checks after it"
+                                .to_string(),
+                        );
+                        unwritten = true;
+                    } else if let Err(e) = check::write_baseline(file, &report.measured) {
+                        report
+                            .notes
+                            .push(format!("the baseline could not be written: {e}"));
+                        unwritten = true;
+                    } else {
+                        report.baseline_written = true;
+                    }
+                }
+            }
+            #[cfg(feature = "openlineage")]
+            {
+                let rules = match &prepared {
+                    Some(p) => crate::lineage::ContractRules {
+                        declared: p.declared_rules(),
+                        warn_only: p.warn_only(),
+                    },
+                    None => crate::lineage::ContractRules::default(),
+                };
+                record.check = Some((report.clone(), rules));
+            }
+            let text = match output {
+                Output::Json => {
+                    serde_json::to_string_pretty(&report)
+                        .map_err(|e| EngineError::Other(format!("encode the check: {e}")))?
+                        + "\n"
+                }
+                Output::Junit => check::render_junit(&report),
+                _ => check::render_text(&report, now),
+            };
+            write!(sink, "{text}")?;
+            code = report.exit_code();
+            if unwritten && code == 0 {
+                code = 1;
+            }
         }
         Cmd::Query { sql, tables, file } => {
             if cli.engine == EngineChoice::Local {
@@ -364,8 +997,8 @@ pub fn run(cli: Cli) -> Result<i32> {
                         .to_string(),
                 });
             }
-            let named = build_named_sources(&cli, tables, file)?;
-            let engine = engines_for(&cli)?.resolve(Need::Query(&named))?;
+            let named = build_named_sources(cli, tables, file)?;
+            let engine = engines_for(cli)?.resolve(Need::Query(&named))?;
             // Streamed, and uncapped: on your own machine a `SELECT *` you typed is a `SELECT *`
             // you meant. With `--output csv|tsv|ndjson|json` the rows reach stdout as the engine
             // produces them, so memory is one batch rather than the whole answer and `| head`
@@ -377,6 +1010,87 @@ pub fn run(cli: Cli) -> Result<i32> {
             let stream = engine.query_stream(&ctx, sql, &named, None)?;
             render::stream_rows(stream, output, &mut sink)?;
         }
+        #[cfg(feature = "parquet-out")]
+        Cmd::CreateTable {
+            name,
+            write_dir,
+            sql,
+            sql_file,
+            tables,
+            file,
+        } => {
+            use crate::table_out::{Origin, OriginTable, WriteDir};
+            // A server caps the rows it returns (`query` without a limit gets its default, a
+            // preview its ceiling) and the remote engine cannot tell this client when it did, so a
+            // table written from a remote result could hold the first rows of an answer under a
+            // name that claims the whole of it. The server can tell, so the write belongs there.
+            if uses_remote(cli) {
+                return Err(EngineError::UnsupportedOperation {
+                    engine: "remote".to_string(),
+                    op: "write a new table from a remote result".to_string(),
+                    hint: "a server caps the rows it returns, so the table could be the first \
+                           rows of the answer — write it where the data is: `POST /v1/tables` on \
+                           a server started with `--write-dir`, or `lakeleto create-table` on \
+                           that machine"
+                        .to_string(),
+                });
+            }
+            let wd = WriteDir::open(write_dir)?;
+            // Checked before anything is read, so a bad name costs no query.
+            wd.target(name)?;
+            let from_file = match sql_file {
+                Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
+                    EngineError::Other(format!("--sql-file {}: {e}", path.display()))
+                })?),
+                None => None,
+            };
+            let named = build_named_sources(cli, tables, file)?;
+            let sql = sql
+                .as_deref()
+                .or(from_file.as_deref())
+                .filter(|s| !s.trim().is_empty());
+            let from = Origin::Query {
+                sql: sql.map(str::to_string),
+                tables: named
+                    .iter()
+                    .map(|n| OriginTable {
+                        name: n.name.clone(),
+                        path: n.source.display(),
+                    })
+                    .collect(),
+            };
+            let stream = match sql {
+                Some(q) => {
+                    if cli.engine == EngineChoice::Local {
+                        return Err(EngineError::UnsupportedOperation {
+                            engine: "local".to_string(),
+                            op: "run SQL".to_string(),
+                            hint: "the local reader has no SQL planner — use `--engine sql` \
+                                   (build with `--features sql`) or `--engine remote`, or leave \
+                                   out `--sql` to copy one table"
+                                .to_string(),
+                        });
+                    }
+                    let engine = engines_for(cli)?.resolve(Need::Query(&named))?;
+                    // Streamed and uncapped, as `query` is: the rows go to disk as the engine
+                    // produces them, so memory is one batch however big the table.
+                    engine.query_stream(&ctx, q, &named, None)?
+                }
+                None => {
+                    let [one] = named.as_slice() else {
+                        return Err(EngineError::Other(
+                            "without `--sql` a new table is a copy of one table — give exactly \
+                             one, or the SQL that combines them"
+                                .to_string(),
+                        ));
+                    };
+                    let engine = engines_for(cli)?.resolve(Need::Read(&one.source))?;
+                    RowStream::from_batch(engine.preview(&ctx, &one.source, usize::MAX)?)
+                }
+            };
+            let table = wd.write(name, stream, from)?;
+            write!(sink, "{}", render_new_table(&table, output)?)?;
+        }
         #[cfg(feature = "serve")]
         Cmd::Serve {
             addr,
@@ -386,8 +1100,13 @@ pub fn run(cli: Cli) -> Result<i32> {
             workspace_remote,
             workspace_remote_token,
             workspace_home,
+            write_dir,
         } => {
             let store = workspace_store(workspace_remote, workspace_remote_token, workspace_home)?;
+            let write_dir = write_dir
+                .as_deref()
+                .map(crate::table_out::WriteDir::open)
+                .transpose()?;
             crate::api::serve(
                 addr,
                 EngineRegistry::local(),
@@ -396,6 +1115,8 @@ pub fn run(cli: Cli) -> Result<i32> {
                 token.clone(),
                 canon_root(root)?,
                 store,
+                write_dir,
+                serve_lineage(cli)?,
             )?;
         }
         #[cfg(feature = "serve")]
@@ -420,6 +1141,8 @@ pub fn run(cli: Cli) -> Result<i32> {
                 token.clone(),
                 canon_root(root)?,
                 None,
+                None,
+                None,
             )?;
         }
         #[cfg(feature = "mcp")]
@@ -439,9 +1162,45 @@ pub fn run(cli: Cli) -> Result<i32> {
             let tools = crate::mcp::Tools::new(EngineRegistry::local(), canon_root(root)?, limits);
             crate::mcp::serve_stdio(tools)?;
         }
+        #[cfg(feature = "flight")]
+        Cmd::Flight {
+            addr,
+            tls_cert,
+            tls_key,
+            plaintext,
+            token,
+            tables,
+            max_rows,
+            timeout,
+        } => {
+            // The tables are read where this server runs; a second server between would cap them.
+            if uses_remote(cli) {
+                return Err(EngineError::UnsupportedOperation {
+                    engine: "remote".to_string(),
+                    op: "serve Flight SQL".to_string(),
+                    hint: "a Flight SQL server reads its tables itself: run `lakeleto flight` \
+                           where they are, without `--remote-url`"
+                        .to_string(),
+                });
+            }
+            let named = build_named_sources(cli, tables, &None)?;
+            let limits = crate::flight::Limits {
+                max_rows: *max_rows,
+                timeout: std::time::Duration::from_secs(*timeout),
+                held_for: crate::flight::HELD_FOR,
+            };
+            // A certificate or key that cannot be read stops the start.
+            let tls = match (tls_cert, tls_key) {
+                (Some(cert), Some(key)) => Some(crate::flight::Tls::read(cert, key)?),
+                _ => None,
+            };
+            let flight =
+                crate::flight::Flight::new(EngineRegistry::local(), named, limits, token.clone())?;
+            crate::flight::serve(addr, flight, tls, *plaintext)?;
+        }
     }
     sink.finish()?;
-    Ok(0)
+    Ok(code)
 }
 
 /// Refuse an output a command cannot give, before anything is read or any file is created.
@@ -456,9 +1215,35 @@ pub fn run(cli: Cli) -> Result<i32> {
 fn check_output(cmd: &Cmd, output: Output, out: bool, stdout_is_terminal: bool) -> Result<()> {
     let refuse = |msg: String| Err(EngineError::Other(msg));
     let name = command_name(cmd);
-    if out && matches!(name, "serve" | "open" | "mcp") {
+    if out && matches!(name, "serve" | "open" | "mcp" | "flight") {
         return refuse(format!(
             "`{name}` takes no `--out`: it serves until stopped and prints a log, not a result"
+        ));
+    }
+    // A diff is a report with three forms; Markdown is only a diff's.
+    if name == "diff" && !matches!(output, Output::Table | Output::Json | Output::Markdown) {
+        return refuse(format!(
+            "`diff` prints a report: `-o table`, `json` or `markdown`, not `{}`",
+            output.name()
+        ));
+    }
+    // A check is a report with three forms; JUnit is only a check's.
+    if name == "check" && !matches!(output, Output::Table | Output::Json | Output::Junit) {
+        return refuse(format!(
+            "`check` prints a report: `-o table`, `json` or `junit`, not `{}`",
+            output.name()
+        ));
+    }
+    if output == Output::Markdown && name != "diff" {
+        return refuse(format!(
+            "`-o markdown` is `diff`'s report for a pull request; `{name}` has no Markdown form: \
+             use `-o table` or `-o json`"
+        ));
+    }
+    if output == Output::Junit && name != "check" {
+        return refuse(format!(
+            "`-o junit` is `check`'s report for a CI system; `{name}` has no JUnit form: use \
+             `-o table` or `-o json`"
         ));
     }
     if output.is_binary() {
@@ -525,16 +1310,22 @@ fn command_name(cmd: &Cmd) -> &'static str {
         Cmd::Head { .. } => "head",
         Cmd::Profile { .. } => "profile",
         Cmd::Info { .. } => "info",
+        Cmd::Diff { .. } => "diff",
+        Cmd::Check { .. } => "check",
         Cmd::Engines => "engines",
         #[cfg(feature = "catalog")]
         Cmd::Catalog { .. } => "catalog",
         Cmd::Query { .. } => "query",
+        #[cfg(feature = "parquet-out")]
+        Cmd::CreateTable { .. } => "create-table",
         #[cfg(feature = "serve")]
         Cmd::Serve { .. } => "serve",
         #[cfg(feature = "serve")]
         Cmd::Open { .. } => "open",
         #[cfg(feature = "mcp")]
         Cmd::Mcp { .. } => "mcp",
+        #[cfg(feature = "flight")]
+        Cmd::Flight { .. } => "flight",
     }
 }
 
@@ -803,6 +1594,52 @@ fn uses_remote(cli: &Cli) -> bool {
     }
 }
 
+/// What a command was asked to read, as its command line names each table: its run's inputs
+/// until the command resolves them. Only the commands a run is sent for name any.
+fn asked_inputs(cmd: &Cmd) -> Vec<PathBuf> {
+    match cmd {
+        Cmd::Check { path, .. } | Cmd::Head { path, .. } => vec![path.clone()],
+        Cmd::Diff { left, right, .. } => vec![lineage_side(left), lineage_side(right)],
+        Cmd::Query { tables, file, .. } => file
+            .iter()
+            .cloned()
+            .chain(
+                tables
+                    .iter()
+                    .filter_map(|spec| spec.split_once('=').map(|(_, p)| PathBuf::from(p))),
+            )
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// What a `diff` side reads, before [`diff_side`] has resolved it: a name that is not on disk and
+/// ends in a snapshot address is its table. A store table named whole with an `@` is told only by
+/// a probe, which this does not send; [`diff_side`]'s answer replaces it.
+fn lineage_side(path: &Path) -> PathBuf {
+    match path.to_str().and_then(crate::snapshot::split) {
+        Some((table, _)) if !path.exists() && !crate::source::is_database_uri(table) => {
+            PathBuf::from(table)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
+/// A `diff` side's table, and the snapshot it names when it names one, by
+/// [`crate::diff::side`]'s rule, with `--format`, `--json-path` and `--flatten`. A remote engine's
+/// sources are the server's to resolve, so an object URI goes to it whole.
+fn diff_side(cli: &Cli, path: &Path) -> Result<(Source, Option<crate::snapshot::SnapshotRef>)> {
+    let remote = uses_remote(cli);
+    crate::diff::side(path, cli.format.as_deref(), remote, |path, format| {
+        let source = if remote {
+            Source::unresolved(path, format)?
+        } else {
+            Source::resolve(path, format)?
+        };
+        with_source_flags(cli, source)
+    })
+}
+
 /// Turn a command-line path into the [`Source`] the selected engine should be handed.
 ///
 /// This is the whole of the local-vs-remote resolution rule, in one place because every command
@@ -822,13 +1659,18 @@ fn source_for(cli: &Cli, path: &Path) -> Result<Source> {
     } else {
         Source::resolve(path, cli.format.as_deref())?
     };
+    with_source_flags(cli, source)
+}
+
+/// `source` as the flags that shape any source say: `--json-path` and `--flatten`.
+fn with_source_flags(cli: &Cli, source: Source) -> Result<Source> {
     let flatten = match cli.flatten.as_deref() {
         Some(value) => Flatten::parse(value)?,
         None => None,
     };
-    Ok(source
-        .with_json_path(cli.json_path.as_deref())?
-        .with_flatten(flatten))
+    source
+        .with_json_path(cli.json_path.as_deref())
+        .map(|source| source.with_flatten(flatten))
 }
 
 /// The engines this invocation reads with, as `--engine` and `--remote-url` choose them.
@@ -902,6 +1744,29 @@ fn make_remote(_cli: &Cli) -> Result<std::sync::Arc<dyn Engine>> {
 }
 
 // ---- helpers --------------------------------------------------------------------------
+
+/// What `create-table` prints: a summary for a person, or the [`NewTable`] for a program.
+///
+/// [`NewTable`]: crate::table_out::NewTable
+#[cfg(feature = "parquet-out")]
+fn render_new_table(table: &crate::table_out::NewTable, output: Output) -> Result<String> {
+    let json = |v: std::result::Result<String, serde_json::Error>| {
+        v.map(|s| s + "\n")
+            .map_err(|e| EngineError::Other(format!("encode the new table: {e}")))
+    };
+    match output {
+        Output::Json => json(serde_json::to_string_pretty(table)),
+        Output::Ndjson => json(serde_json::to_string(table)),
+        _ => Ok(format!(
+            "created table {}\n  path:    {}\n  rows:    {}\n  bytes:   {}\n  columns: {}\n",
+            table.name,
+            table.path,
+            table.rows,
+            table.bytes,
+            table.columns.join(", ")
+        )),
+    }
+}
 
 fn build_named_sources(
     cli: &Cli,
@@ -1065,11 +1930,11 @@ fn render_engines() -> String {
     ));
     out.push_str(&cap_line(
         "delta (reader)",
-        "delta lake tables (JSON transaction log)",
+        "delta lake tables (log and checkpoints)",
         feature_state(cfg!(feature = "delta")),
     ));
-    // The file formats the local reader opens, read as objects. (An Iceberg table in a store is
-    // the iceberg reader's to list; Delta is read from local disk only.)
+    // The file formats the local reader opens, read as objects. (An Iceberg or Delta table in a
+    // store is its own reader's to list.)
     out.push_str(&cap_line(
         "object-store (s3/gs/az)",
         "remote parquet, csv, tsv, json and arrow via your own creds",
@@ -1182,6 +2047,64 @@ fn cap_line(name: &str, formats: &str, state: CapState) -> String {
 mod tests {
     use super::*;
 
+    /// What `diff` reads `<name>@<snapshot>` as, for the names whose telling takes no request:
+    /// a path that exists is itself, as are a database URI, a ref a remote engine resolves, and a
+    /// store object named with a format that keeps no snapshot. (A store name the probes tell is
+    /// tested against a stand-in store, in `tests/object_store_delta.rs`.)
+    #[test]
+    fn a_diff_side_names_a_snapshot_only_where_its_whole_name_is_nothing() {
+        use crate::snapshot::SnapshotRef;
+        let dir = tempfile::tempdir().unwrap();
+        let there = dir.path().join("there@2");
+        std::fs::write(&there, "id\n1\n").unwrap();
+        let gone = dir.path().join("gone@2");
+        let side = |argv: &[&str], name: &str| {
+            let mut args = vec!["lakeleto"];
+            args.extend_from_slice(argv);
+            args.extend(["diff", name, name]);
+            let cli = Cli::try_parse_from(&args).unwrap();
+            diff_side(&cli, Path::new(name))
+                .map(|(source, at)| (source.path.to_string_lossy().into_owned(), at))
+        };
+        let (there, gone) = (there.to_str().unwrap(), gone.to_str().unwrap());
+        assert_eq!(
+            side(&["--format", "csv"], there).unwrap(),
+            (there.to_string(), None)
+        );
+        assert_eq!(
+            side(&["--format", "csv"], gone).unwrap(),
+            (
+                gone.trim_end_matches("@2").to_string(),
+                Some(SnapshotRef::Id(2))
+            )
+        );
+        let database = "sqlite:///nowhere.db?table=t@2";
+        assert_eq!(side(&[], database).unwrap(), (database.to_string(), None));
+        let object = "s3://bucket/data@7";
+        for argv in [
+            &["--remote-url", "http://127.0.0.1:9"][..],
+            &["--format", "csv"][..],
+            &["--format", "parquet"][..],
+        ] {
+            assert_eq!(
+                side(argv, object).unwrap(),
+                (object.to_string(), None),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// The `--unique-memory` default the help shows is the library's.
+    #[test]
+    fn the_unique_memory_default_is_the_library_budget() {
+        let cli =
+            Cli::try_parse_from(["lakeleto", "check", "t.csv", "--contract", "c.yaml"]).unwrap();
+        let Cmd::Check { unique_memory, .. } = cli.cmd else {
+            panic!("not a check");
+        };
+        assert_eq!(unique_memory, crate::check::DEFAULT_UNIQUE_MEMORY);
+    }
+
     /// `lakeleto engines` has a row for the catalog backend, which says whether this build has it.
     #[test]
     fn engines_lists_the_catalog_backend_as_this_build_has_it() {
@@ -1252,6 +2175,34 @@ mod tests {
             let query = engines.resolve(Need::Query(&tables)).unwrap();
             assert_eq!(query.name(), "database", "{mode}");
         }
+    }
+
+    /// `create-table` through a remote engine is refused before anything is sent: a server caps
+    /// the rows it returns without telling the remote engine, so the table could be the answer's
+    /// first rows. Port 1 is closed, so a request would fail differently; and nothing is written.
+    #[cfg(feature = "parquet-out")]
+    #[test]
+    fn create_table_refuses_a_remote_result_that_could_be_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let wd = dir.path().to_str().unwrap();
+        let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/people.csv");
+        for extra in [&["--sql", "SELECT * FROM t"][..], &[][..]] {
+            for engine in [
+                &["--remote-url", "http://127.0.0.1:1"][..],
+                &["--engine", "remote"],
+            ] {
+                let mut argv = vec!["lakeleto"];
+                argv.extend_from_slice(engine);
+                argv.extend_from_slice(&["create-table", "t", "--write-dir", wd, "--file", csv]);
+                argv.extend_from_slice(extra);
+                let err = run(Cli::try_parse_from(&argv).unwrap()).unwrap_err();
+                assert!(
+                    matches!(&err, EngineError::UnsupportedOperation { engine, .. } if engine == "remote"),
+                    "{argv:?}: {err}"
+                );
+            }
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     /// `query` runs on the engine `--engine` chooses. `--engine local` has none, and refuses
@@ -1369,7 +2320,10 @@ mod tests {
         );
         let other = server("2.0".into(), both);
         assert!(
-            other.contains("protocol: 2.0 (this client speaks 1.0"),
+            other.contains(&format!(
+                "protocol: 2.0 (this client speaks {}",
+                crate::protocol::PROTOCOL_VERSION
+            )),
             "{other}"
         );
         // A server from before versioning, and before the engine list: its read engine stands in.

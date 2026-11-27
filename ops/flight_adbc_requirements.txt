@@ -1,0 +1,7 @@
+# What ops/flight_adbc_smoke.py drives `lakeleto flight` with in CI (the public repository's `ci`
+# workflow, .github/workflows/ci.yml, on every change that lands). Pinned, so a red run is a
+# change in Lakeleto, never a new driver. A monthly catalog run installs the latest instead, to
+# catch the drift; taking a new release is a pull request that bumps these.
+adbc-driver-flightsql==1.13.0
+adbc-driver-manager==1.13.0
+pyarrow==26.0.1

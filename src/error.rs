@@ -72,6 +72,11 @@ pub enum EngineError {
     #[error("too large: {0}")]
     TooLarge(String),
 
+    /// The thing to create already exists — a new table's name is taken. Lakeleto refuses rather
+    /// than replace, so the caller picks another name; retrying the same call cannot succeed.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// The call stopped before finishing because its [`RequestContext`](crate::RequestContext)
     /// said to — a deadline passed, or someone asked.
     ///

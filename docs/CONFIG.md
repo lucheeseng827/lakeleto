@@ -23,6 +23,7 @@ Available on every subcommand (clap `global = true`).
 | `--engine <choice>` | — | `auto` | Which engine reads: `auto` \| `local` \| `sql` \| `remote`. `auto` = local, unless `--remote-url` is set (then remote). |
 | `--remote-url <url>` | `LAKELETO_REMOTE_URL` | unset | A Lakeleto server speaking the `/v1/*` contract — in practice a `lakeleto serve` you run. Setting it implies `--engine remote`. Needs `--features remote`, which the release binaries have. |
 | `--remote-token <tok>` | `LAKELETO_REMOTE_TOKEN` | unset | Bearer token for the Lakeleto Cloud endpoint. |
+| `--openlineage <url>` | `OPENLINEAGE_URL` (the server: `/api/v1/lineage` is added) | unset (**nothing is sent**) | Send the run of a `check`, a `diff` or an export (`head` or `query` writing `--out` to a file, and `serve`'s `/v1/export`) to this endpoint as OpenLineage events. The flag is the endpoint itself; on any other command it is refused. `OPENLINEAGE_API_KEY` authenticates. Needs `--features openlineage`, which the release binaries do not have yet. See [OpenLineage events](#openlineage-events). |
 | `--format <name>` | — | inferred | Read the source as this format instead of inferring it (see [Supported inputs](#supported-inputs)); `?format=` on the API. |
 | `--json-path <pointer>` | — | detected | Read a JSON document's rows from this place: a JSON Pointer (`/response/items`) or a top-level member name (`data`); `""` unwraps nothing. `?json_path=` on the API. See [JSON layouts](#json-layouts). |
 | `--flatten[=<levels>]` | — | off | Read struct columns as one column per field, named by its path (`user.geo.lat`); `--flatten` is every level, `--flatten=1` the first only. Any format. `?flatten=` on the API. See [Flattening nested columns](#flattening-nested-columns). |
@@ -35,12 +36,14 @@ Available on every subcommand (clap `global = true`).
 | `schema <path>` | `path` | — | Columns, types, nullability, row count (exact for Parquet and Arrow files, from the footer). |
 | `head <path>` | `path` | `-n`, `--rows <N>` (default `10`) | Preview the first N rows. |
 | `profile <path>` | `path` | `--scan <N>` (default `10000`), `--fast` | Per-column null %, distinct, min/max, samples from a bounded scan of `--scan` rows. `--fast` uses the Parquet footer statistics (no row scan; exact nulls/min/max over the whole file, distinct/samples not computed). |
-| `info <path>` | `path` | — | Quick source info: path, format, engine, file size, row count, column count. |
+| `info <path>` | `path` | — | Quick source info: path, format, engine, size (a table directory: the files under it), row count, column count. |
 | `engines` | — | — | List the engine backends compiled into this binary and their capabilities. |
 | `query <sql>` | `sql` | `--file <path>`, `--table <NAME=PATH>` (repeatable) | Run read-only SQL over one or more tables. Needs `--engine sql` (`--features sql`) or `--engine remote`. `--file` registers the source as table `t`; `--table name=path` registers a named table. Rejects non-`SELECT`/`WITH`/`EXPLAIN`. |
+| `create-table <name>` | `name` | `--write-dir <dir>` (env `LAKELETO_WRITE_DIR`), `--sql <sql>` or `--sql-file <file>`, `--file <path>`, `--table <NAME=PATH>` (repeatable) | Write a query's result, or a copy of one table, as a **new** Parquet table at `<write-dir>/<name>.parquet`. Never replaces anything: a name that exists is refused (exit 1). Streams to disk, with no row cap. See [New tables](#new-tables). **Needs `--features parquet-out`**, as the release binaries have. |
 | `serve` | — | see [`serve` flags](#serve-flags) | Serve the HTTP/JSON API + embedded SPA. **Needs `--features serve`.** |
 | `open <path>` | `path` | `--addr`, `--default-scan`, `--token`, `--root` | Start the server and launch a browser tab deep-linked to `path` (`?path=`). **Needs `--features serve`.** |
 | `mcp` | — | see [`mcp` flags](#mcp-flags) | Serve the tables to an AI agent over the Model Context Protocol, on stdin and stdout: the read-only tools in [`mcp` tools](#mcp-tools). An MCP client starts it. **Needs `--features mcp`.** |
+| `flight` | — | see [`flight` flags](#flight-flags) | Serve the tables named with `--table` to Flight SQL clients (ADBC in Python, R, Go and Java; JDBC tools; notebooks), read-only, over gRPC. See [Flight SQL server](#flight-sql-server). **Needs `--features flight`.** |
 
 `query` on `--engine local` is an error (the local reader has no SQL planner). Without
 the `sql`/`remote` feature, `query` returns a "rebuild with `--features sql`" message.
@@ -57,6 +60,7 @@ The `serve` subcommand exists only when built with `--features serve`.
 | `--root <dir>` | — | unset (any path) | Confine `/v1/*` file access to this directory; reads/browse outside it (and all object-store URIs) are refused with a uniform 403. Canonicalized at startup — a missing/non-dir path fails fast. |
 | `--workspace-remote <url>` | `LAKELETO_WORKSPACE_REMOTE` | unset (local store) | Sync the workspace data plane (`/v1/workspaces/*`) to another server instead of the on-disk store. Needs `--features remote`, which the release binaries have. |
 | `--workspace-remote-token <tok>` | `LAKELETO_WORKSPACE_REMOTE_TOKEN` | unset | Bearer token for `--workspace-remote`. |
+| `--write-dir <dir>` | — (deliberately no env var) | unset (**creates no tables**) | Let the API write **new** tables under `<dir>`: `POST /v1/tables` and saving a run as a table. With `--root`, `<dir>` must be inside it. A table is never replaced. See [New tables](#new-tables). |
 
 `open` takes the same `--addr`/`--default-scan`/`--token`/`--root` flags as `serve`
 (no workspace-remote flags).
@@ -73,6 +77,23 @@ build has, as `serve` does; the global `--engine`, `--remote-url` and `-o` flags
 | `--max-rows <N>` | `1000` | The most rows `preview` and `query` return in one call (at least 1). |
 | `--max-bytes <N>` | `32768` | The most bytes of JSON one call returns (at least 1024); rows, entries or columns past it are left out, and the result says `truncated`, even if none are left (a single row bigger than the room). Any tool's result whose other fields alone come within 256 bytes of the cap, such as a `preview`'s `columns` for thousands of columns, is refused as `too_large` rather than sent over it. |
 | `--timeout <secs>` | `30` | How long a call may run. The engines stop at the deadline; a call one doesn't stop is answered with a `deadline` error a second after it, and its late result is dropped. |
+
+### `flight` flags
+
+The `flight` subcommand exists only when built with `--features flight`. It reads with the build's
+engines, its statements run by the SQL engine; `--remote-url` is refused, and `-o` and `--out` don't
+apply.
+
+| Flag | Env | Default | What it does |
+|---|---|---|---|
+| `--addr <host:port>` | `LAKELETO_FLIGHT_ADDR` | `127.0.0.1:50051` | Bind address for the gRPC listener. Loopback by default. Any other address needs `--tls-cert` and `--tls-key`, or `--plaintext`; one with no `--token` is warned about on start. |
+| `--tls-cert <PEM>` | `LAKELETO_FLIGHT_TLS_CERT` | unset | Speak TLS (`grpc+tls://`) with this certificate chain, leaf first. Needs `--tls-key`. A certificate or key that cannot be read or used stops the start. |
+| `--tls-key <PEM>` | `LAKELETO_FLIGHT_TLS_KEY` | unset | The private key of `--tls-cert`. |
+| `--plaintext` | — | off | Serve plaintext gRPC on an address other than loopback, for a TLS proxy or tunnel in front of the server. Refused with `--tls-cert`. |
+| `--token <TOKEN>` | `LAKELETO_TOKEN` | unset (**open**) | Require this token on every call: `authorization: Bearer <TOKEN>`, or a log-in with it as the password. Constant-time compared. An empty one is refused at start, not taken for no token. |
+| `--table <NAME=REF>` | — | required, repeatable | A table to serve: a path, an object-store URI or a catalog reference, reached in SQL as `NAME`. A database URI is refused at start: its tables are queried in the database, past the SQL engine's names, read-only check and cap, so query the database with its own ADBC driver. A name is letters, digits and `_`, not starting with a digit, and is lowercased as SQL folds it (`Items` is `items`); two that come out the same are refused. |
+| `--max-rows <N>` | — | `1000000` | The most rows one statement returns (at least 1). A result with more ends in a `RESOURCE_EXHAUSTED` error, never a short result. |
+| `--timeout <secs>` | — | `300` | How long a statement may take, from the request that runs it to the end of reading its result, a client that stops reading included (at most `604800`, a week). |
 
 ### `mcp` tools
 
@@ -230,7 +251,8 @@ catalog://<catalog>/<level>/…/<level>/<table>
   names a namespace: `catalog://prod/` lists prod's namespaces, and `catalog://prod/sales/` lists
   what is in `sales`.
 - **Segments are percent-encoded:** a `/` in a name is `%2F`, an `@` is `%40` and a `%` is `%25`.
-- **A snapshot suffix (`@<id>` or `@<timestamp>`) is refused** until 0.5.0, which reads it.
+- **A snapshot suffix (`@<id>` or `@<timestamp>`) is read by `lakeleto diff` only**, which compares
+  the table at that snapshot by its metadata (see the guide). Anywhere else it is refused.
 - **A reference never carries a credential.**
 
 ### Where catalogs are configured
@@ -318,6 +340,8 @@ and Arrow IPC), which always compiles fast with no C++ toolchain.
 | `mcp` | `lakeleto mcp` (no new crate) | The MCP server for agents: [`mcp` tools](#mcp-tools) over stdio, read-only. Its tools read what the build's other features read. |
 | `parquet-out` | Parquet output from the CLI (no new crate) | `-o parquet`, and `--out` to a `.parquet` file. Every build writes the Arrow formats (`-o arrow`, `-o arrows`); Parquet is a feature because its writer is about 530 KB of the default build. |
 | `compression` | zstd, bzip2, xz and Brotli (zstd, bzip2, liblzma, brotli; zstd and xz are C) | `.zst`, `.bz2` and `.xz` text, zstd-compressed buffers in Arrow files, and Parquet pages compressed with zstd (Polars' default) or Brotli. gzip text, and Snappy, gzip and LZ4 Parquet, read in every build. With `sql` it adds no crate, as DataFusion links the same four. |
+| `flight` | `lakeleto flight` (arrow-flight, tonic; brings `sql`) | The read-only [Flight SQL server](#flight-sql-server) for ADBC and JDBC clients. arrow-flight is held to the Arrow version in the lock. |
+| `openlineage` | OpenLineage events (reqwest) | `--openlineage` and `OPENLINEAGE_URL`: `check`, `diff` and exports sent as runs. Off unless an endpoint is given. See [OpenLineage events](#openlineage-events). |
 | `duckdb` | *(inert — no code)* | Nothing, and nothing is planned: the `sql` (DataFusion) engine covers what a DuckDB backend would. A no-op feature. |
 
 The release binaries and the published image are built with
@@ -331,6 +355,165 @@ the Windows and macOS installers add `desktop`. The container image the
 other zone (`Europe/Paris`) needs the tz database, which `sql` links through DataFusion, so the
 release binaries and the image print every zone; a build without `sql` refuses such a column in
 text output, naming the zone. `schema`, and `-o arrow|arrows|parquet`, keep the zone the file has.
+
+## Flight SQL server
+
+`lakeleto flight` serves the tables named on its command line to any Flight SQL client: ADBC
+drivers (Python, R, Go, Java), JDBC tools, notebooks. It is read-only.
+
+```bash
+lakeleto flight --token "$LAKELETO_TOKEN" \
+  --table orders=warehouse/orders --table events=s3://lake/events/
+```
+
+**What it answers.**
+- **Statements** (`CommandStatementQuery`).
+  - Each is one `SELECT`, `WITH` or `EXPLAIN` (without `ANALYZE`) over the declared tables, run by
+    the SQL engine. Anything else is `INVALID_ARGUMENT`.
+  - Only the tables a statement names are registered for it. An Iceberg, Delta or JSON table is
+    loaded whole for each query that reads it, as `lakeleto query` loads it.
+  - The query runs when the client asks for its `FlightInfo`, so the schema sent back is the
+    result's own, a zero-row result's included.
+  - The result waits for the client's `DoGet` under a ticket no client can guess, which one fetch
+    uses up. One not fetched within 60 seconds is dropped.
+  - At most 16 statements are open at once, waiting or streaming. One more is
+    `RESOURCE_EXHAUSTED`, for the client to try again.
+- **The catalog.** `GetCatalogs`, `GetDbSchemas`, `GetTables`, `GetTableTypes` (`TABLE`) and
+  `GetSqlInfo` (the server's name and version, and that it is read-only).
+  - `GetTables` keeps to the request's catalog, schema and table-name patterns before it reads
+    anything. A pattern longer than 1024 characters is `INVALID_ARGUMENT`.
+  - Asked for schemas, it gives each table the one its queries return. An Iceberg or Delta table,
+    or a Parquet directory, is read from its metadata, never loaded.
+  - A listing with schemas counts as an open statement while it runs. A table whose schema cannot
+    be read is left out of it, with a warning on stderr.
+  - Every table is in catalog `lakeleto_tables`, schema `main`. These are the names the SQL
+    engine itself registers tables under, so a name a client reads from the listing queries back,
+    quoted and qualified or not: `SELECT * FROM "lakeleto_tables"."main"."orders"`.
+  - A configured catalog's name is letters, digits and `-`, so `lakeleto_tables` can never be one.
+- **Everything else is `UNIMPLEMENTED`:** prepared statements, Substrait plans, updates and ingest,
+  transactions, and the key and type-info queries. That status lets a client fall back: ADBC's
+  Python driver prepares a plain `execute` first, and on `UNIMPLEMENTED` sends it as a statement.
+
+**Bounds.**
+- A result past `--max-rows` is an error at the row that passes it, never a short result that
+  looks whole.
+- `--timeout` holds from the request that runs a statement to the end of reading its result. A
+  client that stops reading keeps its statement open only until then: the read stops, the result
+  ends in `DEADLINE_EXCEEDED`, and its place is free. Rows read out before the deadline can
+  still reach the client after it; what the deadline ends is the read and the place, not the
+  delivery of what was read in time.
+- A client that hangs up mid-fetch stops the read. HTTP/2 pings (every 30 s, answered within
+  10 s) and TCP keepalive (60 s) drop a connection whose client has gone, with whatever was
+  waiting to be sent on it. A client that is there but does not read keeps up to two batches per
+  stream waiting to be sent (and, until the deadline, the one the read holds while it waits for
+  room), plus what HTTP/2 buffers, until it reads or goes.
+
+**Who may call.** With `--token`, every call carries it, checked before any method runs:
+`authorization: Bearer <token>`, or `Basic` credentials whose password is the token. A client that
+logs in with a user name and password does a handshake, and the server answers with the bearer
+token. An empty token is refused at start. A loopback bind needs no token. A non-loopback bind
+without one is warned about on start, as `serve` warns, since every declared table is open to
+anyone who reaches it.
+
+**How it is reached.**
+- With `--tls-cert` and `--tls-key`, the server speaks TLS: clients connect to
+  `grpc+tls://host:port` and verify the certificate.
+- Without them it speaks plaintext gRPC, on loopback by default.
+- On any other address, plaintext is refused at start: the token and the rows would cross the
+  network in the clear. `--plaintext` allows it, for a TLS proxy or tunnel in front, and says so
+  on start.
+
+```bash
+lakeleto flight --addr 0.0.0.0:50051 --token "$LAKELETO_TOKEN" \
+  --tls-cert /etc/lakeleto/flight.crt --tls-key /etc/lakeleto/flight.key \
+  --table orders=s3://lake/orders
+```
+
+**Checked with.**
+- `tests/flight.rs` drives the server with arrow-flight's own client, over TLS and in plaintext.
+- `ops/flight_adbc_smoke.py` drives it with Python's ADBC driver, over TLS too:
+  `pip install -r ops/flight_adbc_requirements.txt`, then
+  `python3 ops/flight_adbc_smoke.py target/debug/lakeleto`. It makes the run's certificate with
+  OpenSSL 1.1.1 or later (for `-addext`); macOS's LibreSSL `openssl` lacks it.
+- CI (the `ci` workflow, `.github/workflows/ci.yml`) runs both on every change to main and every
+  pull request, on a pinned driver. A monthly catalog run takes the latest driver, to catch the
+  drift.
+
+## OpenLineage events
+
+With the `openlineage` feature, Lakeleto sends the runs of `check`, `diff` and exports to an
+OpenLineage endpoint (Marquez, or any server that takes `POST /api/v1/lineage`). They are the only
+data the binary sends anywhere but to what it reads, and **nothing is sent unless an endpoint is
+given**: no default names one.
+
+**Where to.**
+- `--openlineage <url>` is the endpoint itself, as Covenant's `check --openlineage` takes it.
+- Without it, `OPENLINEAGE_URL` names the server, as dagron and the OpenLineage clients read it, and
+  events go to its `/api/v1/lineage`. Empty is unset.
+- `OPENLINEAGE_API_KEY`, when set, is sent as `Authorization: Bearer <key>`. It is never printed.
+- `OPENLINEAGE_NAMESPACE` is the job namespace; it is `lakeleto` unless set.
+- The endpoint is `https`, or plain `http` only to this machine (`localhost`, `127.0.0.1`, `::1`),
+  and carries no user or password: the key goes in `OPENLINEAGE_API_KEY`. `--openlineage` that
+  breaks the rule is refused before anything is read (exit 1). An `OPENLINEAGE_URL` that does is a
+  warning, and the command runs and sends nothing, since a scheduler sets it for every command. So
+  `http://marquez:5000` is refused: reach Marquez over `https`, or through a tunnel to this machine.
+- A redirect is not followed. A proxy the environment names is used for the network, never for this
+  machine. Each event waits at most 10 seconds to connect and 30 in all.
+
+**What is sent.** Each run is two events, sent once the command has finished (an export once its
+file is in place): `START`, then `COMPLETE` or `FAIL`.
+- A check whose gates failed, or a diff that found a change, **completed**: its result is the
+  report and the exit code. A run the command ends with an error is `FAIL`, whether a flag
+  refused it or a read failed. The error's text is not sent.
+- Both are sent when the command ends, so a run killed before then is never sent. A command waits
+  for its events to be sent, at most 10 seconds to connect and 30 in all for each event.
+- `serve` sends each `/v1/export` the same way, off the response path. An export refused before
+  its table resolved, such as a path outside `--root`, is no run.
+- `serve`'s exports are sent one at a time, by one thread. At most 64 runs wait while an endpoint
+  is slow or down, and one that finds them all waiting is dropped with a warning. An endpoint
+  holds that one thread, never the threads that read tables.
+- Nothing that goes wrong sending changes what the command did. It is one warning on stderr, and
+  the exit code and output stand. An endpoint that refuses `START` gets no end event. A message
+  names the endpoint without its query, so a token put there does not reach a log.
+- Each event has `eventTime` (UTC, to the millisecond), `run.runId` (a UUIDv7 shared by the two),
+  `job`, `inputs`, `outputs`, `producer` (Lakeleto's release at its tag) and `schemaURL`
+  (OpenLineage 2-0-2).
+- `job` is the namespace above and a name: the command and what it is about. Examples are
+  `check file:/data/orders.parquet`, `diff s3://lake/a s3://lake/b` and
+  `export file:/out/q.parquet`. An export to a file is named for the file whether or not it was
+  written, so its failed runs are runs of the same job. `/v1/export` is named for the table it
+  read.
+- `inputs` is each table the command was asked to read, named even when it was refused before
+  reading. A table read twice, such as a diff against its own snapshot, is one input.
+- `outputs` is the file an export wrote. It is empty for an export that failed, and for
+  `/v1/export`, whose file is wherever the browser saved it.
+- `check`'s input carries two facets in its end event, as Covenant's does:
+  - `dataQualityAssertions`: each gate that passed or failed, by its name (`row-count`,
+    `freshness`…; a gate that judged nothing is left out), at severity `error`. With `--contract`,
+    also the `contract` gate and each rule the contract declares, by field, under Covenant's rule
+    names, failed if any row broke it. A rule's severity is `error`, or `warn` when the contract's
+    policy is `on_violation: warn`, as Covenant sends it. The `contract` gate fails the check
+    either way.
+  - `dataQualityMetrics`: `rowCount`; `columnMetrics` with each column's `nullCount` where it is
+    known; and `bytes`, `fileCount` and `lastUpdated` when the check measured them.
+- No row, no value and no credential is sent.
+
+**How a table is named** (ADR-0002 §6, and dagron's names for what it schedules):
+
+| Table | Namespace | Name |
+|---|---|---|
+| A file or directory here | `file` | its absolute path |
+| An object or prefix | `s3://<bucket>` (`s3a://` too), `gs://<bucket>` (`gcs://` too) | the key, without a trailing `/` |
+| An ADLS object | `abfss://<container>@<account>.dfs.core.windows.net` | the path. An `az://<container>/…` name takes the account from `AZURE_STORAGE_ACCOUNT_NAME`, as the read does; without it, no event is sent |
+| A catalog table | its location, named as above | as above, with a `symlinks` facet naming it `<namespace>.<table>` in the catalog's URI, and a `catalog` facet (`iceberg`, the catalog's type, name and URI, and its warehouse when that is a URI) |
+| Postgres | `postgres://<host>:<port>` | `<database>.<schema>.<table>`: the table names its schema |
+| MySQL | `mysql://<host>:<port>` | `<database>.<table>` |
+| A `diff` side at `@<snapshot>` | | its table |
+
+No name carries a user, password or query. A table with no name in OpenLineage's naming
+conventions (SQLite), or one read through `--remote-url` by a relative path, sends no event and
+says why on stderr. The OpenLineage conventions name a local file `file://<host>`; Lakeleto uses
+`file`, as Covenant does, so the two name the same file alike.
 
 ## `serve` HTTP/JSON endpoints
 
@@ -352,12 +535,41 @@ IO. Non-API paths fall back to the SPA's `index.html`.
 | `GET` | `/v1/profile?path=&scan=&format=` | Per-column null %, distinct, min/max (`scan=0` = Parquet footer fast path). |
 | `GET` | `/v1/rows?path=&offset=&limit=&sort=&desc=&filter=col:op:value&cols=a,b` | Grid window: filter → sort → page → project. `limit` clamped to 10000. Arrow IPC on request (see below). |
 | `GET` | `/v1/stats?path=&filter=col:op:value` | Column profile over the **filtered** view. |
-| `GET` | `/v1/export?path=&fmt=csv\|tsv\|json\|ndjson\|parquet&sort=&filter=&cols=` | Current view as a download (row cap 1,000,000; byte cap 512 MiB → 413). |
+| `GET` | `/v1/diff?left=&right=&key=&fast=&scan=&sample=&format=` | What changed between two tables: the report `lakeleto diff -o json` prints (see [below](#diff-over-http)). |
+| `GET` | `/v1/export?path=&fmt=csv\|tsv\|json\|ndjson\|parquet&sort=&filter=&cols=` | Current view as a download (row cap 1,000,000; byte cap 512 MiB → 413). Exporting a [new table](#new-tables) adds a [`lakeleto-provenance`](#provenance-on-an-export) header. A server sending [OpenLineage events](#openlineage-events) sends each export as a run. |
 | `GET` | `/v1/list?dir=` | File browser: subdirs + readable data files (defaults to `--root`, else cwd). |
 | `POST` | `/v1/query` | `{ sql, file?, tables[] }` → `{ columns, rows }`, or Arrow IPC (see below). Needs `sql`, or over database tables `sqlite`, `postgres` or `mysql`. |
 
 Every endpoint that reads a source also takes `json_path=` and `flatten=` (as the `--json-path` and
 `--flatten` flags), and so does each entry of `/v1/query`'s `tables[]`.
+
+#### Diff over HTTP
+
+`GET /v1/diff` answers with the report `lakeleto diff -o json` prints (`version: 1`), for the same
+two tables. The web app's **Diff** view is built on it.
+
+- **The sides.** `left` is the table compared from, the old one or the reference. `right` is the one
+  compared with. Either can be `<table>@<snapshot>`, which is read by its table's metadata, with no
+  row read, by the same rule as the command (ADR-0002).
+- **Options.** As the command's flags:
+  - `key=` (repeated, or comma-separated) compares the rows too, and needs `sql`.
+  - `fast=true` takes the statistics from Parquet footers.
+  - `scan=N` takes them from the first N rows of each side, up to 100,000.
+  - `sample=N` sets how many rows of each kind a keyed diff shows, up to 100.
+  - `format=`, `json_path=` and `flatten=` read both sides.
+  - A usage error (`fast` with `scan`, `sample` with no key, `key` or `scan` with a snapshot) is a
+    `400`, saying which.
+- **Cost.** With `sql` and none of `fast` or `scan`, statistics are exact: both tables are read
+  whole. A key holds the left side's key and compared columns in memory. A server sets no deadline
+  on a diff, and a client that gives up does not stop it, as with every other buffered endpoint.
+  So **at most two diffs run at once**: another is refused with `429` until one ends, a diff its
+  client stopped waiting for included. On large tables, use `fast` or `scan`.
+- **Under `--root`.** Both sides are confined like any read. A snapshot address is refused (`403`):
+  an Iceberg snapshot's manifests can name files anywhere, and only the table as it is now is
+  confined.
+- **Remote engine.** A server reading through a remote engine refuses a diff (`501`), as
+  `lakeleto diff --remote-url` does.
+- **Lineage.** A diff over HTTP sends no OpenLineage run: it is a look, not a pipeline step.
 
 Filter ops: `eq ne lt le gt ge contains notcontains startswith endswith in isnull notnull`
 (aliases `= != < <= > >= ~ !~ ^ $`); `in` takes a comma-separated list (`status:in:new,open`).
@@ -377,18 +589,41 @@ in the system's temporary directory (`TMPDIR` moves it), for the second to read 
 a 256 MB CSV — and the source is read again if that file can't be written. A Parquet object's
 first pass downloads only the columns it sorts and filters by.)
 
+#### Provenance on an export
+
+An export of one table that Lakeleto [created](#new-tables) carries what the table says about
+itself, so a dashboard or a report reading the export can show which table and when without
+parsing Parquet. It is an [RFC 8941](https://www.rfc-editor.org/rfc/rfc8941) dictionary:
+
+```text
+lakeleto-provenance: name="marts/revenue_by_city", created_at_ms=1762700000000, rows=24, provenance_version=1, lakeleto_version="0.4.1"
+```
+
+It describes the **table** the rows came from, whatever `sort`, `filter` or `cols` the export
+applied: `rows` is the table's row count, not the export's. Other programs can write the same
+record into the Parquet files they make; such a file names its writer in `writer="…"` (for example
+`writer="example-writer 1.0.0"`) in place of `lakeleto_version`, and its `rows` counts that file.
+Members may be added, and a client ignores members it does not know. The full record (the SQL and the tables it read) stays in the
+Parquet footer under `lakeleto.provenance`. There is no header for a Parquet file whose footer
+holds no such record or one that does not read, for anything but a single local Parquet file, or for a footer whose name or version a header
+cannot carry or whose numbers are past RFC 8941's 15 digits; an export never fails over
+provenance.
+
 #### The protocol version, and `/v1/engines`
 
-The HTTP contract is versioned as `major.minor`, today `1.0`. The major is the path: a change
+The HTTP contract is versioned as `major.minor`, today `1.3`. The major is the path: a change
 that would break a client is served under `/v2`, beside `/v1`, and doesn't change what `/v1`
 means. The minor counts additions: it goes up when `/v1` gains an endpoint, a field or a
 parameter, so a client written against `1.0` works against any `1.x` and ignores fields it
 doesn't know.
 
-The server sends its version on **every response**, as `X-Lakeleto-Protocol: 1.0`: answers,
+The server sends its version on **every response**, as `X-Lakeleto-Protocol: 1.3`: answers,
 errors, `401`s, `/healthz` and the page alike, so a client learns it from whatever it asked
 first. A server that sends no version predates versioning (Lakeleto 0.3 and earlier), and speaks
-a subset of `1.0`.
+a subset of `1.0`. `1.1` added the [new-table](#new-tables) endpoints, `writes` below, and
+`truncated` on a run record. `1.2` added the [`lakeleto-provenance`](#provenance-on-an-export)
+header on an export of a new table. `1.3` added [`GET /v1/diff`](#diff-over-http), which a client
+offers only when `endpoints` lists it.
 
 `GET /v1/engines` says what the server is and does:
 
@@ -401,7 +636,8 @@ a subset of `1.0`.
 | `sql_available` | Whether it runs SQL over files. |
 | `ee` | Whether it is a Lakeleto Cloud (`ee`) build. |
 | `limits` | The caps it enforces: export rows and bytes, query rows (and the default), workspace run rows, database connections per workspace (`null` for unlimited). |
-| `endpoints` | The endpoints it answers. `POST /v1/query` is left out when no engine runs SQL. |
+| `endpoints` | The endpoints it answers. `POST /v1/query` is left out when no engine runs SQL, and the two [new-table](#new-tables) endpoints when it has no `--write-dir`. |
+| `writes` | Present only when the server was started with `--write-dir`: `{dir, max_rows, max_bytes}`, where new tables go and how big one may be. Absent, the server creates no tables. |
 
 One set of rules, which the CLI shares, decides which engine answers a request: a database table
 goes to the database engine, SQL to the SQL engine, a sorted or filtered `/v1/rows` window to the
@@ -497,6 +733,40 @@ Persisted through a `WorkspaceStore` (local JSON + Parquet result cache by defau
 | `PUT` / `GET` | `/v1/workspaces/{id}/runs/{run_id}/result` | Raw Parquet result bytes (sync up/down; upload cap 128 MiB). |
 | `GET` | `/v1/workspaces/{id}/export` | Download a portable workspace bundle. |
 | `POST` | `/v1/workspaces/import` | Import a bundle (mints a fresh id). |
+| `POST` | `/v1/workspaces/{id}/runs/{run_id}/table` | `{name}` → save a cached run as a new table. Only with `--write-dir`; only a run that succeeded, was cached, and is known to be whole (`truncated: false`). |
 
 The local store lives under `$LAKELETO_HOME` (`~/.lakeleto/workspaces/<id>/` —
 `workspace.json` · `history.jsonl` · `results/*.parquet`).
+
+A run record carries `truncated`: `false` when its result is the whole answer, `true` when the
+run stopped at its row cap with more rows to give. Records from before protocol `1.1` have none.
+
+### New tables
+
+The one way Lakeleto creates a table: a query's result kept as a table that every tool can open
+by name. It never touches a table that exists. (The workspace store, which keeps workspaces,
+history and cached results under `$LAKELETO_HOME`, is separate and unchanged by this.)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/tables` | `{name, sql?, file?, tables[]}` → run the SQL (read-only, as `POST /v1/query`) or copy the one table, and write the result as `<write-dir>/<name>.parquet`. `201` with `{name, path, rows, bytes, columns, provenance}`. |
+
+- **Off unless `serve --write-dir` is given.** Without it both write endpoints answer `403`, and
+  `GET /v1/engines` neither lists them nor carries `writes`. With it, `writes` says
+  `{dir, max_rows, max_bytes}`.
+- **A name is 1–3 `/`-separated parts** of letters, digits, `_` and `-`, each starting with a
+  letter or digit: `marts/revenue_by_city`. Never a path: `..`, a leading `/`, a dot or an
+  extension is a `400`.
+- **New only.** A name that exists, as any file, is a `409`, decided atomically when the file is
+  published, so two writers racing for one name cannot both win.
+- **Whole or absent.** Rows are written to a hidden temporary file beside the destination and
+  published only once complete; a failure leaves no table. Publishing is a hard link, so a write
+  directory on a file system without them (FAT, some network mounts) is refused.
+- **Never from a remote result.** A server or CLI reading through the remote engine writes no
+  table (`501`, or exit 1): the peer caps the rows it returns without saying so. Write the table
+  on the server that holds the data.
+- **Complete or refused.** The server holds the result in memory, so a table it writes is capped
+  at 1,000,000 rows and 512 MiB; a bigger result is a `413`, never a shortened table.
+  `lakeleto create-table` streams to disk and has no cap.
+- **Self-describing.** The Parquet footer carries `lakeleto.provenance`: the name, the SQL and the
+  tables it read (or the workspace run), the row count, the time and the Lakeleto version.

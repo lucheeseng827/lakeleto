@@ -83,7 +83,7 @@ fn csv_records(rows: usize) -> String {
 }
 
 /// A CSV object's schema, a preview and a window past the inference sample are each one `HEAD`
-/// and one `GET`, stopped before half the object is sent.
+/// and one `GET`, whose transfer the read cuts short where it stops reading.
 #[test]
 fn the_grid_reads_a_csv_object_only_as_far_as_its_window() {
     use lakeleto::engine::ScanSpec;
@@ -93,12 +93,17 @@ fn the_grid_reads_a_csv_object_only_as_far_as_its_window() {
     let engine = LocalReaderEngine::default().with_store_options(s3.options());
     let source = Source::resolve("s3://bucket/big.csv", None).unwrap();
     let ctx = RequestContext::detached();
-    let half = body.len() as u64 / 2;
     let one_request = |what: &str| {
         assert_eq!(s3.requests(), ["HEAD big.csv", "GET big.csv"], "{what}");
+        // Not a count of the bytes sent, which once read 51% of the object for a read of 12% of
+        // it: the rest was in socket buffers, as capping them showed (the window then sent 5.4 MB
+        // for the 4.8 MB it reads). The reader closing the transfer early is what stops it. The
+        // check needs the object bigger than what the read leaves buffered, so that the sender is
+        // still writing when the reader hangs up: about 10.5 MB of the 38 MB was sent normally,
+        // 19.5 MB at worst under full-suite load.
         assert!(
-            s3.sent() < half,
-            "{what}: sent {} of {}",
+            s3.cut_short("big.csv", std::time::Duration::from_secs(10)),
+            "{what}: the whole object was sent, {} of {} bytes",
             s3.sent(),
             body.len()
         );

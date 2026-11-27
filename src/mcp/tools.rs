@@ -84,6 +84,7 @@ impl From<EngineError> for Refusal {
             EngineError::UnsupportedFormat { .. } => "unsupported_format",
             EngineError::UnsupportedOperation { .. } => "unsupported",
             EngineError::TooLarge(_) => "too_large",
+            EngineError::Conflict(_) => "conflict",
             EngineError::Remote(_) => "remote",
             _ => "failed",
         };
@@ -360,10 +361,9 @@ impl Tools {
                     .as_ref()
                     .and_then(|p| p.columns.iter().find(|s| s.name == c.name));
                 if let Some(stats) = stats {
-                    // A null count of 0 is also what the footer gives when a row group didn't
-                    // record one, so it is only reported alongside a min or max, or when not 0.
-                    let known = stats.min.is_some() || stats.max.is_some();
-                    if known || stats.null_count > 0 {
+                    // Only a counted null count: a footer that did not record a column's nulls
+                    // in every row group counted none, which is not 0.
+                    if stats.null_count_known {
                         column["null_count"] = json!(stats.null_count);
                     }
                     if let Some(min) = &stats.min {

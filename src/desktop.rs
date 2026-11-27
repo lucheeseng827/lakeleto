@@ -195,6 +195,8 @@ pub fn serve_at(port: u16, root: Option<PathBuf>) -> crate::Result<()> {
         None,
         root,
         None,
+        None,
+        None,
     )
 }
 

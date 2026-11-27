@@ -613,6 +613,45 @@ pub struct DirListing {
     pub entries: Vec<DirEntry>,
 }
 
+/// The most entries [`size_on_disk`] walks before it gives up and reports no size.
+const SIZE_WALK_MAX_ENTRIES: usize = 1_000_000;
+
+/// The bytes a local source takes: a file's length or, for a table that is a directory — a
+/// Parquet dataset, an Iceberg or a Delta table — the sum of the files under it, its metadata and
+/// log included, as `du --apparent-size` counts them. A directory's own length is the size of its
+/// entry, 4 KiB on most filesystems, and that is what `info` used to report for every table.
+///
+/// Symlinks under the directory are not followed: the walk stays inside it, so what a server
+/// reports for a table under its `--root` is that table's own files, and a link cycle cannot loop
+/// it. `None` when the path, or anything under it, cannot be read, or when the directory holds more
+/// than [`SIZE_WALK_MAX_ENTRIES`] entries: `info` then prints `?`, which is true, where a partial
+/// sum would not be.
+pub fn size_on_disk(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_dir() {
+        return Some(meta.len());
+    }
+    let (mut total, mut seen) = (0u64, 0usize);
+    let mut dirs = vec![path.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let entry = entry.ok()?;
+            seen += 1;
+            if seen > SIZE_WALK_MAX_ENTRIES {
+                return None;
+            }
+            // The entry's own type: a symlink is a symlink here, not what it points at.
+            let kind = entry.file_type().ok()?;
+            if kind.is_dir() {
+                dirs.push(entry.path());
+            } else if kind.is_file() {
+                total = total.saturating_add(entry.metadata().ok()?.len());
+            }
+        }
+    }
+    Some(total)
+}
+
 /// Collect the `.parquet` files under `dir` (recursively, so Hive-partitioned subdirs work),
 /// sorted for a deterministic read order. Sidecar/marker entries whose name starts with `.` or
 /// `_` (`_SUCCESS`, `_common_metadata`, `.crc`, …) are skipped.
@@ -733,6 +772,43 @@ pub(crate) fn sniff_magic(path: &Path) -> Result<Format> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table directory is the sum of the files under it, metadata included, at any depth —
+    /// not its own entry's 4 KiB. A file is its length; a path that is not there has no size.
+    #[test]
+    fn a_table_directory_is_sized_by_the_files_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("orders");
+        std::fs::create_dir_all(table.join("data/region=north")).unwrap();
+        std::fs::create_dir_all(table.join("metadata")).unwrap();
+        std::fs::write(
+            table.join("data/region=north/part-0.parquet"),
+            vec![0u8; 1000],
+        )
+        .unwrap();
+        std::fs::write(table.join("data/part-1.parquet"), vec![0u8; 234]).unwrap();
+        std::fs::write(table.join("metadata/v1.metadata.json"), vec![0u8; 66]).unwrap();
+        std::fs::create_dir_all(table.join("empty")).unwrap();
+        assert_eq!(size_on_disk(&table), Some(1300));
+        assert_eq!(size_on_disk(&table.join("data/part-1.parquet")), Some(234));
+        assert_eq!(size_on_disk(&dir.path().join("gone")), None);
+    }
+
+    /// A symlink under the table is not followed: the walk stays inside the table, so a link out
+    /// of a server's root cannot size what it points at, and a link back up cannot loop it.
+    #[cfg(unix)]
+    #[test]
+    fn a_table_directory_walk_follows_no_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("t");
+        std::fs::create_dir_all(&table).unwrap();
+        std::fs::write(table.join("part-0.parquet"), vec![0u8; 10]).unwrap();
+        let outside = dir.path().join("outside.bin");
+        std::fs::write(&outside, vec![0u8; 5000]).unwrap();
+        std::os::unix::fs::symlink(&outside, table.join("link.parquet")).unwrap();
+        std::os::unix::fs::symlink(&table, table.join("loop")).unwrap();
+        assert_eq!(size_on_disk(&table), Some(10));
+    }
 
     /// `Source::unresolved` must touch nothing and interpret nothing: whatever the caller typed
     /// is what the server is asked about. The strings below are deliberately unrelated — this

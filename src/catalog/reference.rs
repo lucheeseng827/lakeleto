@@ -111,9 +111,9 @@ impl CatalogRef {
                 return Err(if last && !names_namespace {
                     EngineError::UnsupportedFormat {
                         detail: format!(
-                            "`{s}` asks for snapshot `{snapshot}`. Reading a table as it was at \
-                             a snapshot arrives in Lakeleto 0.5.0, so drop `@{snapshot}` to read \
-                             the table as it is now"
+                            "`{s}` asks for snapshot `{snapshot}`. A snapshot is compared by \
+                             `lakeleto diff`, by its metadata, and its rows are not read: drop \
+                             `@{snapshot}` to read the table as it is now"
                         ),
                     }
                 } else {
@@ -365,15 +365,16 @@ mod tests {
         assert!(CatalogRef::parse(&format!("catalog://{}/", "a".repeat(63))).is_ok());
     }
 
-    /// A snapshot suffix is part of the grammar, read from 0.5.0. Until then it is refused with
-    /// the release that reads it, rather than taken as part of the table's name.
+    /// A snapshot suffix is part of the grammar, and `diff` alone reads one, having split it off
+    /// before the reference is parsed. Anything else is refused pointing at `diff`, rather than
+    /// taking it as part of the table's name.
     #[test]
-    fn a_snapshot_is_refused_with_the_release_that_reads_it() {
+    fn a_snapshot_is_refused_pointing_at_diff() {
         let err = CatalogRef::parse("catalog://prod/sales/orders@4182309823479")
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("0.5.0") && err.contains("@4182309823479"),
+            err.contains("lakeleto diff") && err.contains("@4182309823479"),
             "{err}"
         );
     }

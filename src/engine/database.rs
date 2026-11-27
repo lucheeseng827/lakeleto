@@ -781,6 +781,61 @@ fn fetch_batch(uri: &DbUri, sql: &str, params: &[Bound]) -> Result<RowBatch> {
     }
 }
 
+/// Every row of `source`'s table counted in its own database: the rows, and each column's nulls,
+/// by `count(*)` and a `count(<column>)` a column in one statement, quoted in the dialect's own
+/// way. What `check` measures a database table by: a profile reads a bounded window, and the SQL
+/// engine does not query a database's tables.
+///
+/// # Errors
+///
+/// A URI that names no table; whatever the database answers with.
+pub fn count_rows_and_nulls(
+    ctx: &RequestContext,
+    source: &Source,
+) -> Result<(u64, Vec<(String, u64)>)> {
+    ctx.check()?;
+    let raw = source_uri(source);
+    let uri = parse_db_uri_as(&raw, ctx.database_credentials())?;
+    let table = require_table(&uri, &raw)?;
+    let syntax = engine_syntax(uri.dialect);
+    let names: Vec<String> = schema_of(&uri, &table)?
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let mut select = vec!["count(*) AS a0".to_string()];
+    for (i, name) in names.iter().enumerate() {
+        select.push(format!(
+            "count({}) AS a{}",
+            quote_ident(syntax, name),
+            i + 1
+        ));
+    }
+    let sql = format!(
+        "SELECT {} FROM {}",
+        select.join(", "),
+        quote_ident(syntax, &table)
+    );
+    let answer = fetch_batch(&uri, &sql, &[])?;
+    let row = answer
+        .batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .ok_or_else(|| EngineError::Query("a count answered no row".to_string()))?;
+    let count = |at: usize| -> Result<u64> {
+        let value = crate::diff::cell(row.column(at).as_ref()).unwrap_or_default();
+        value
+            .parse::<u64>()
+            .map_err(|_| EngineError::Query(format!("a count answered `{value}`, not a number")))
+    };
+    let rows = count(0)?;
+    let mut nulls = Vec::with_capacity(names.len());
+    for (i, name) in names.into_iter().enumerate() {
+        nulls.push((name, rows.saturating_sub(count(i + 1)?)));
+    }
+    Ok((rows, nulls))
+}
+
 /// Read `table`'s Arrow schema, robust for an **empty** table (SQLite via `PRAGMA table_info`,
 /// Postgres/MySQL via `describe(SELECT * … LIMIT 0)` — neither needs any rows to exist).
 fn schema_of(uri: &DbUri, table: &str) -> Result<SchemaRef> {
@@ -1521,7 +1576,13 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 /// the pool's `default_transaction_read_only`. For MySQL (no portable read-only pool) this guard
 /// *is* the read-only guarantee.
 pub fn ensure_read_only(sql: &str) -> Result<()> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
+    // A query often opens with a comment — a title, a ticket, why it exists — and the checks
+    // below read the statement after it. Only comments every dialect agrees on are skipped (see
+    // `skip_leading_comments`), so nothing a database would run escapes them.
+    let trimmed = skip_leading_comments(sql)
+        .trim()
+        .trim_end_matches(';')
+        .trim();
     // A `;` that isn't the (already-stripped) trailing one implies multiple statements.
     // (A `;` inside a string literal would false-positive; acceptable for an explorer guard.)
     if trimmed.contains(';') {
@@ -1532,9 +1593,18 @@ pub fn ensure_read_only(sql: &str) -> Result<()> {
     let upper = trimmed.to_ascii_uppercase();
     let head = upper.split_whitespace().next().unwrap_or("");
     if !matches!(head, "SELECT" | "WITH" | "EXPLAIN") {
-        return Err(EngineError::Query(
-            "only read queries are allowed — SELECT / WITH, or EXPLAIN".to_string(),
-        ));
+        // A comment this guard would not skip — `--` with no space after it, MySQL's `#`, an
+        // executable `/*!` — is named as such rather than left to read as a stray keyword.
+        let hint = if head.starts_with("--") {
+            " (a `--` comment needs a space after it, as MySQL requires)"
+        } else if head.starts_with('#') || head.starts_with("/*") {
+            " (start the comment with `-- ` or `/* */`; MySQL's `#` and `/*!` are not skipped)"
+        } else {
+            ""
+        };
+        return Err(EngineError::Query(format!(
+            "only read queries are allowed — SELECT / WITH, or EXPLAIN{hint}"
+        )));
     }
     // Close the CTE / EXPLAIN-ANALYZE write vectors: a write verb anywhere is a hard reject.
     if let Some(verb) = FORBIDDEN_WRITE_WORDS
@@ -1547,6 +1617,48 @@ pub fn ensure_read_only(sql: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// `sql` past the comments it opens with — only those that SQLite, Postgres and MySQL all read
+/// as comments, so that what is skipped is never something one of them would run:
+///
+/// - **`--` followed by whitespace**, to the end of the line. MySQL needs the whitespace (`--x`
+///   is two minus signs there), and a line ends at `\n` or `\r`, whichever comes first, since
+///   Postgres ends a comment at either.
+/// - **`/* … */`**, ending at its first `*/`. Postgres nests block comments and may read on
+///   further; stopping at the first only leaves more for the checks to see.
+///
+/// Not skipped: MySQL's executable comments, `/*!` and MariaDB's `/*M!`, whose contents MySQL
+/// runs; MySQL's `#`, which Postgres reads as an operator; and an unterminated `/*`. Each is left
+/// as the statement's head, which the guard then refuses.
+fn skip_leading_comments(sql: &str) -> &str {
+    let mut rest = sql;
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("--") {
+            // MySQL's rule, which is the strictest: an ASCII space or control character, not
+            // any Unicode whitespace.
+            let comment = after.is_empty()
+                || after.starts_with(|c: char| c.is_ascii_whitespace() || c.is_ascii_control());
+            if !comment {
+                return rest;
+            }
+            rest = match after.find(['\n', '\r']) {
+                Some(end) => &after[end..],
+                None => "",
+            };
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            if after.starts_with('!') || after.starts_with("M!") {
+                return rest;
+            }
+            match after.find("*/") {
+                Some(end) => rest = &after[end + 2..],
+                None => return rest,
+            }
+        } else {
+            return rest;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2599,6 +2711,23 @@ mod tests {
         assert_eq!(rb.num_rows(), 1);
     }
 
+    /// End to end: SQLite runs a query that opens with comments, as the guard now lets it.
+    #[test]
+    fn a_query_that_starts_with_a_comment_runs() {
+        let (_dir, src) = fixture();
+        let rb = DatabaseEngine::new()
+            .query(
+                &ctx(),
+                "-- how many, from the fixture\n/* t has three */ SELECT count(*) AS c FROM t",
+                &[NamedSource {
+                    name: "t".into(),
+                    source: src.clone(),
+                }],
+            )
+            .expect("a commented query runs");
+        assert_eq!(rb.num_rows(), 1);
+    }
+
     #[test]
     fn rejects_writes() {
         assert!(ensure_read_only("SELECT 1").is_ok());
@@ -2634,6 +2763,60 @@ mod tests {
         ] {
             assert!(ensure_read_only(bad).is_err(), "should reject: {bad}");
         }
+    }
+
+    /// A query that opens with a comment is a read like any other: the guard reads the
+    /// statement after it. A comment's own words — a `;`, a write verb in "last update" — are
+    /// not the statement's.
+    #[test]
+    fn a_query_that_starts_with_a_comment_is_read() {
+        for good in [
+            "-- revenue by city\nSELECT city, sum(amount) FROM t GROUP BY city",
+            "-- last update: 2026-11; owner: data team\n-- second line\r\nSELECT 1",
+            "/* monthly mart */ SELECT * FROM t",
+            "/* one */ /* two\n spans lines */\n  -- and a line\nWITH a AS (SELECT 1) SELECT * FROM a",
+            "--\nSELECT 1",
+            "-- a trailing semicolon is still the one allowed\nSELECT 1;",
+        ] {
+            assert!(ensure_read_only(good).is_ok(), "should accept: {good:?}");
+        }
+    }
+
+    /// What the guard skips, every dialect skips. Anything one of them would run — or that only
+    /// some of them read as a comment — stays in front of the checks.
+    #[test]
+    fn only_comments_every_dialect_skips_are_skipped() {
+        for bad in [
+            // The statement after the comment is still checked.
+            "-- just a read\nDELETE FROM t",
+            "/* harmless */ DROP TABLE t",
+            "-- one\nSELECT 1; DROP TABLE t",
+            // MySQL runs the inside of `/*! … */`; MariaDB the inside of `/*M! … */`.
+            "/*! DELETE FROM t */ SELECT 1",
+            "/*M! DELETE FROM t */ SELECT 1",
+            // `--x` is not a comment in MySQL: two minus signs, and then whatever follows.
+            "--x\nSELECT 1",
+            // Nor is `--` before a Unicode space.
+            "--\u{2028}x\nSELECT 1",
+            // `#` is MySQL's alone; Postgres reads it as an operator.
+            "# note\nSELECT 1",
+            // Postgres ends a `--` comment at `\r`: what follows it is code there.
+            "-- note\rDELETE FROM t\nSELECT 1",
+            // Postgres nests block comments: ending at the first `*/` leaves the rest in view.
+            "/* outer /* inner */ DELETE FROM t */ SELECT 1",
+            // An unterminated comment is not skipped into an empty statement.
+            "/* never closed SELECT 1",
+            "-- only a comment",
+        ] {
+            assert!(ensure_read_only(bad).is_err(), "should reject: {bad:?}");
+        }
+        // And a comment the guard does not skip is named, not left to read as a keyword.
+        let why = ensure_read_only("--x\nSELECT 1").unwrap_err().to_string();
+        assert!(why.contains("needs a space"), "{why}");
+        let why = ensure_read_only("# note\nSELECT 1")
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("`#`"), "{why}");
     }
 
     /// A filter value can never break out of its literal to inject SQL, because values are **bound**,

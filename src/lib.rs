@@ -27,20 +27,28 @@
 #[cfg(feature = "serve")]
 pub mod api;
 pub mod catalog;
+pub mod check;
 pub mod cli;
 pub mod confine;
 pub mod context;
 /// The double-click launcher's port/reuse logic (see `bin/lakeleto-desktop.rs`).
 #[cfg(feature = "serve")]
 pub mod desktop;
+pub mod diff;
 pub mod engine;
 pub mod error;
+/// `lakeleto flight`: the tables named on its command line, read-only, to Flight SQL clients.
+#[cfg(feature = "flight")]
+pub mod flight;
 pub(crate) mod format;
 #[cfg(feature = "iceberg")]
 pub mod iceberg;
 /// PNG/ICO encoding for the installer icon sets (see `examples/gen_icons.rs`).
 #[cfg(feature = "serve")]
 pub mod icon;
+/// OpenLineage events: a run of `check`, `diff` or an export, sent where one is asked for.
+#[cfg(feature = "openlineage")]
+pub mod lineage;
 /// `lakeleto mcp`: the tables, read-only, to an AI agent over the Model Context Protocol.
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -48,7 +56,9 @@ pub mod mcp;
 pub mod objstore;
 pub mod protocol;
 pub mod render;
+pub mod snapshot;
 pub mod source;
+pub mod table_out;
 pub mod workspace;
 #[cfg(feature = "remote")]
 pub mod workspace_remote;

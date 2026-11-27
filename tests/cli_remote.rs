@@ -79,6 +79,7 @@ fn head_cli(path: &str, remote_url: Option<String>, format: Option<&str>) -> Cli
         json_path: None,
         flatten: None,
         max_decompressed: lakeleto::source::DEFAULT_MAX_DECOMPRESSED,
+        openlineage: None,
         cmd: Cmd::Head {
             path: path.into(),
             rows: 3,
@@ -230,4 +231,66 @@ fn engines_asks_the_server_what_it_runs() {
         request.starts_with("GET /v1/engines HTTP/1.1"),
         "unexpected request: {request}"
     );
+}
+
+/// A server that answers one `GET /v1/schema` with a schema of one column, and reports the
+/// request line back through `rx`.
+fn one_schema_server() -> (SocketAddr, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).expect("request line");
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).unwrap_or(0) == 0 || header.trim().is_empty() {
+                break;
+            }
+        }
+        let body = br#"{"source":"orders","format":"parquet","engine":"local","row_count":7,"columns":[{"name":"id","data_type":"Int64","nullable":false}]}"#;
+        let mut stream = reader.into_inner();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+        let _ = tx.send(request_line);
+    });
+    (addr, rx)
+}
+
+/// `info` with `--remote-url` sizes nothing locally. The path is the server's to resolve, so a
+/// local directory that happens to share its name is not the table: reporting the files under it
+/// beside the remote schema would be a number about somebody else's data.
+#[test]
+fn a_remote_info_does_not_size_a_local_directory_of_the_same_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = dir.path().join("orders");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(local.join("part-0.parquet"), vec![0u8; 4096]).unwrap();
+
+    let (addr, rx) = one_schema_server();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_lakeleto"))
+        .args(["--remote-url", &format!("http://{addr}"), "info"])
+        .arg(&local)
+        .args(["-o", "json"])
+        .output()
+        .expect("lakeleto runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let request = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the schema comes from the server");
+    assert!(request.starts_with("GET /v1/schema?"), "{request}");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["row_count"], 7, "{json}");
+    assert!(json["size_bytes"].is_null(), "{json}");
 }

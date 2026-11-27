@@ -59,6 +59,7 @@ async fn remote_store_round_trips_against_a_live_server() {
             cached: true,
             flatten: None,
             json_path: None,
+            truncated: Some(false),
         };
         rs.append_run(&ws.id, &rec, Some(&rb)).unwrap();
 
@@ -121,6 +122,7 @@ async fn failed_result_upload_never_records_history() {
             cached: true,
             flatten: None,
             json_path: None,
+            truncated: Some(false),
         };
         assert!(rs.append_run(&ws.id, &rec, Some(&rb)).is_err());
         // The upload failed first, so the lying history record was never posted.

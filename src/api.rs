@@ -21,7 +21,7 @@
 //! | GET  | `/v1/profile?path=&scan=&format=` | [`TableProfile`] |
 //! | GET  | `/v1/rows?path=&offset=&limit=&sort=&desc=&filter=&cols=` | grid window (filter→sort→page→project; or Arrow, see below) |
 //! | GET  | `/v1/stats?path=&filter=` | column profile over the *filtered* view |
-//! | GET  | `/v1/export?path=&fmt=&sort=&filter=&cols=` | current view as a CSV/TSV/JSON/NDJSON/Parquet download |
+//! | GET  | `/v1/export?path=&fmt=&sort=&filter=&cols=` | current view as a CSV/TSV/JSON/NDJSON/Parquet download (+ `lakeleto-provenance` for a table Lakeleto wrote) |
 //! | GET  | `/v1/list?dir=` | file browser: subdirs + readable data files |
 //! | POST | `/v1/query` | `{sql, file?, tables[], limit?}` → `{columns, rows, capped}` (or Arrow, see below; needs `sql`) |
 //! | GET/POST | `/v1/workspaces` | list / create a workspace (the "Postman" data plane) |
@@ -32,6 +32,8 @@
 //! | PUT/GET | `/v1/workspaces/{id}/runs/{run_id}/result` | raw Parquet result bytes (sync up/down) |
 //! | GET  | `/v1/workspaces/{id}/export` | download a portable [`WorkspaceBundle`] |
 //! | POST | `/v1/workspaces/import` | import a bundle (always mints a fresh id) |
+//! | POST | `/v1/tables` | `{name, sql?, file?, tables[]}` → write the result as a NEW table (needs `--write-dir`) |
+//! | POST | `/v1/workspaces/{id}/runs/{run_id}/table` | `{name}` → save a cached, complete run as a NEW table (needs `--write-dir`) |
 //! | GET  | `/` and any non-API path | the embedded SPA shell (with SPA fallback) |
 //!
 //! Workspace endpoints persist through a [`WorkspaceStore`] (the data-plane seam mirroring
@@ -93,13 +95,14 @@ use crate::catalog::{Catalog, PathCatalog};
 use crate::context::RequestContext;
 use crate::engine::registry::{EngineRegistry, Need};
 use crate::engine::{
-    Capabilities, ColumnSchema, Engine, FilterOp, FilterSpec, NamedSource, RowBatch, ScanResult,
-    ScanSpec, SortSpec, TableProfile, TableSchema,
+    Capabilities, ColumnSchema, Engine, NamedSource, RowBatch, RowStream, ScanResult, ScanSpec,
+    TableProfile, TableSchema,
 };
 use crate::error::{CancelReason, EngineError};
 use crate::protocol::{PROTOCOL_HEADER, PROTOCOL_VERSION};
 use crate::render::SourceInfo;
 use crate::source::{DirListing, Flatten, RemoteProbe, Source};
+use crate::table_out::{NewTable, Origin, OriginTable, WriteDir};
 use crate::workspace::{RunRecord, RunStatus, Workspace, WorkspaceBundle, WorkspaceStore};
 
 /// Export view cap — the most rows `GET /v1/export` will materialize.
@@ -121,6 +124,15 @@ const MAX_EXPORT_BYTES: usize = 512 * 1024 * 1024;
 /// which is the point. `GET /v1/export` remains the way to pull a large result, bounded by
 /// [`EXPORT_CAP`] and [`MAX_EXPORT_BYTES`] and rendered as a stream-shaped format rather than JSON.
 const QUERY_CAP: usize = 100_000;
+
+/// How many `GET /v1/diff`s run at once. A diff with exact statistics reads both tables whole, and
+/// a client that gives up does not stop it: what bounds the work is how many may run, and a diff
+/// asked for past it is refused (429) rather than queued behind the others.
+const DIFFS_AT_ONCE: usize = 2;
+
+/// The most rows of each kind — added, removed, changed — `GET /v1/diff` shows with `key`.
+/// The counts are whole whatever this is; it bounds only the rows the report carries.
+const DIFF_SAMPLE_CAP: usize = 100;
 
 /// Default rows for `POST /v1/query` when the body names no `limit`. Deliberately well under
 /// [`QUERY_CAP`]: the interactive caller is a grid or a REPL that shows a screenful, and one that
@@ -144,6 +156,7 @@ const ENDPOINTS: &[&str] = &[
     "GET /v1/profile?path=&scan=&format=",
     "GET /v1/rows?path=&offset=&limit=&sort=&desc=&filter=col:op:value&cols=a,b",
     "GET /v1/stats?path=&filter=col:op:value",
+    "GET /v1/diff?left=&right=&key=&fast=&scan=&sample=&format=",
     "GET /v1/export?path=&fmt=csv|tsv|json|ndjson|parquet&sort=&filter=&cols=",
     "GET /v1/list?dir=",
     "POST /v1/query",
@@ -155,6 +168,14 @@ const ENDPOINTS: &[&str] = &[
     "POST /v1/workspaces/{id}/runs",
     "GET /v1/workspaces/{id}/runs/{run_id}?offset=&limit=",
     "PUT|GET /v1/workspaces/{id}/runs/{run_id}/result",
+    "POST /v1/tables",
+    "POST /v1/workspaces/{id}/runs/{run_id}/table",
+];
+
+/// The endpoints that write a new table, advertised only by a server started with `--write-dir`.
+const WRITE_ENDPOINTS: &[&str] = &[
+    "POST /v1/tables",
+    "POST /v1/workspaces/{id}/runs/{run_id}/table",
 ];
 
 /// Shared server state: the engines, and what every request is confined, authorized and stored
@@ -178,10 +199,99 @@ pub struct AppState {
     /// Persistent workspaces + query history + result cache (the "Postman" data plane). Behind the
     /// [`WorkspaceStore`] trait so a synced cloud store drops in later without a route change.
     store: Arc<dyn WorkspaceStore>,
+    /// Where new tables are written, when this server writes any (`--write-dir`). `None` — the
+    /// default — refuses both write endpoints with 403, so a server creates no table unless its
+    /// operator said where. See [`crate::table_out`].
+    write_dir: Option<Arc<WriteDir>>,
     /// The catalogs `/v1/list?dir=catalog://…` browses: the process's, as the engines read them.
     #[cfg(feature = "catalog")]
     catalogs: Arc<crate::catalog::Catalogs>,
+    /// Where each `/v1/export` is sent as an OpenLineage run, when one is (`serve --openlineage`,
+    /// or OPENLINEAGE_URL). `None`, the default, sends nothing.
+    #[cfg_attr(not(feature = "openlineage"), allow(dead_code))]
+    lineage: Option<ExportLineage>,
+    /// The diffs running, at most [`DIFFS_AT_ONCE`]: each holds a permit until its work ends,
+    /// whether or not its client is still there.
+    diffs: Arc<tokio::sync::Semaphore>,
 }
+
+/// Where a server sends its exports as OpenLineage runs: the endpoint `serve` was given.
+#[cfg(feature = "openlineage")]
+pub type Lineage = crate::lineage::Destination;
+
+/// Where a server's export runs go: one thread that sends them in turn, fed by a queue of at most
+/// [`EXPORT_RUNS_WAITING`]. An endpoint that is slow or down holds that one thread, never the
+/// pool the reads run on, and a run that finds the queue full is dropped with a warning.
+#[cfg(feature = "openlineage")]
+#[derive(Clone)]
+struct ExportLineage {
+    to: Lineage,
+    queue: std::sync::mpsc::SyncSender<QueuedExport>,
+}
+
+/// An export's run, waiting to be sent: what it read, and whether it was exported.
+#[cfg(feature = "openlineage")]
+struct QueuedExport {
+    run: crate::lineage::Run,
+    path: String,
+    exported: bool,
+}
+
+/// How many export runs may wait to be sent.
+#[cfg(feature = "openlineage")]
+const EXPORT_RUNS_WAITING: usize = 64;
+
+#[cfg(feature = "openlineage")]
+impl ExportLineage {
+    fn start(to: Lineage) -> ExportLineage {
+        ExportLineage::with_capacity(to, EXPORT_RUNS_WAITING)
+    }
+
+    /// The sender, with room for `waiting` runs. Its thread ends with the last server holding it.
+    fn with_capacity(to: Lineage, waiting: usize) -> ExportLineage {
+        let (queue, runs) = std::sync::mpsc::sync_channel::<QueuedExport>(waiting);
+        let spawned = std::thread::Builder::new()
+            .name("lakeleto-openlineage".to_string())
+            .spawn(move || {
+                for queued in runs {
+                    send_export_lineage(queued);
+                }
+            });
+        if let Err(e) = spawned {
+            crate::lineage::warn(&format!(
+                "no export is sent to OpenLineage: its sender did not start: {e}"
+            ));
+        }
+        ExportLineage { to, queue }
+    }
+
+    /// Queue `run`; `false` when it was dropped instead.
+    fn offer(&self, run: QueuedExport) -> bool {
+        use std::sync::mpsc::TrySendError;
+        match self.queue.try_send(run) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                crate::lineage::warn(&format!(
+                    "an export's OpenLineage run is dropped: {EXPORT_RUNS_WAITING} already wait \
+                     to be sent to {}",
+                    self.to.shown()
+                ));
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+}
+
+/// Without the `openlineage` feature a server sends nothing: no value of this exists.
+#[cfg(not(feature = "openlineage"))]
+#[derive(Clone)]
+enum ExportLineage {}
+
+/// Without the `openlineage` feature there is nowhere to send a run: no value of this exists.
+#[cfg(not(feature = "openlineage"))]
+#[derive(Debug, Clone)]
+pub enum Lineage {}
 
 impl AppState {
     /// The engine for `need`, or a refusal naming the feature this build lacks.
@@ -240,6 +350,76 @@ impl AppState {
             .with_json_path(read.json_path.as_deref())?
             .with_flatten(flatten))
     }
+
+    /// One side of `GET /v1/diff`, by the rule `lakeleto diff` reads its arguments by
+    /// ([`crate::diff::side`]), as this server reads any path: confined to `--root` first, so that
+    /// whether a name exists is never told for one outside it.
+    ///
+    /// Under `--root` a snapshot address is refused. A snapshot is read through its table's
+    /// metadata at that snapshot, and an Iceberg snapshot's manifest list and manifests can name
+    /// files anywhere: [`confine_members`] checks the files of the table as it is now, not those.
+    fn diff_side(
+        &self,
+        reference: &str,
+        read: &ReadAs,
+    ) -> Result<(Source, Option<crate::snapshot::SnapshotRef>), ApiError> {
+        confine_entry(&self.root, reference)?;
+        // Refused before anything is resolved: a name that is not there whole and ends in a
+        // snapshot is a snapshot address here, since --root refuses every URI above.
+        if self.root.is_some() && !Path::new(reference).exists() {
+            if let Some((_, at)) = crate::snapshot::split(reference) {
+                return Err(snapshot_under_root(reference, &at));
+            }
+        }
+        let (source, at) = crate::diff::side(
+            Path::new(reference),
+            read.format.as_deref(),
+            false,
+            |path, format| {
+                let read = ReadAs {
+                    format: format.map(str::to_string),
+                    json_path: read.json_path.clone(),
+                    flatten: read.flatten.clone(),
+                };
+                let source = self
+                    .resolve(&path.to_string_lossy(), &read)
+                    .map_err(|e| e.0)?;
+                confine_members(&self.root, &source).map_err(|e| e.0)?;
+                Ok(source)
+            },
+        )?;
+        // What the check above must have caught; kept so a change to the rule cannot let one by.
+        if let (Some(at), Some(_)) = (&at, &self.root) {
+            return Err(snapshot_under_root(reference, at));
+        }
+        Ok((source, at))
+    }
+}
+
+/// The refusal of a snapshot address on a server confined to `--root`.
+fn snapshot_under_root(reference: &str, at: &crate::snapshot::SnapshotRef) -> ApiError {
+    ApiError(EngineError::Forbidden(format!(
+        "`{reference}` names a snapshot (`@{at}`), which is read through its table's metadata at \
+         that snapshot; this server is confined to --root and does not confine those files. \
+         Compare it with `lakeleto diff` where the table is"
+    )))
+}
+
+/// A place for one more diff, or `None` when [`DIFFS_AT_ONCE`] are running.
+fn admit_diff(diffs: &Arc<tokio::sync::Semaphore>) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    diffs.clone().try_acquire_owned().ok()
+}
+
+/// The answer to a diff asked for while [`DIFFS_AT_ONCE`] are running.
+fn too_many_diffs() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({ "error": format!(
+            "this server is already running {DIFFS_AT_ONCE} diffs (one a client stopped waiting \
+             for still runs to its end): try again when one finishes"
+        ) })),
+    )
+        .into_response()
 }
 
 /// Build the router. Exposed (not just `serve`) so it can be driven in tests without a socket.
@@ -251,6 +431,44 @@ pub fn router(
     loopback: bool,
     store: Arc<dyn WorkspaceStore>,
 ) -> Router {
+    router_with_writes(engines, default_scan, token, root, loopback, store, None)
+}
+
+/// [`router`], writing new tables under `write_dir` when it is given.
+pub fn router_with_writes(
+    engines: EngineRegistry,
+    default_scan: usize,
+    token: Option<String>,
+    root: Option<PathBuf>,
+    loopback: bool,
+    store: Arc<dyn WorkspaceStore>,
+    write_dir: Option<WriteDir>,
+) -> Router {
+    router_with_lineage(
+        engines,
+        default_scan,
+        token,
+        root,
+        loopback,
+        store,
+        write_dir,
+        None,
+    )
+}
+
+/// [`router_with_writes`], sending each `/v1/export` as an OpenLineage run to `lineage` when it is
+/// given.
+#[allow(clippy::too_many_arguments)]
+pub fn router_with_lineage(
+    engines: EngineRegistry,
+    default_scan: usize,
+    token: Option<String>,
+    root: Option<PathBuf>,
+    loopback: bool,
+    store: Arc<dyn WorkspaceStore>,
+    write_dir: Option<WriteDir>,
+    lineage: Option<Lineage>,
+) -> Router {
     let state = AppState {
         engines,
         default_scan,
@@ -258,8 +476,14 @@ pub fn router(
         root: root.map(Arc::new),
         loopback,
         store,
+        write_dir: write_dir.map(Arc::new),
         #[cfg(feature = "catalog")]
         catalogs: crate::catalog::Catalogs::configured(),
+        #[cfg(feature = "openlineage")]
+        lineage: lineage.map(ExportLineage::start),
+        #[cfg(not(feature = "openlineage"))]
+        lineage: lineage.map(|never| match never {}),
+        diffs: Arc::new(tokio::sync::Semaphore::new(DIFFS_AT_ONCE)),
     };
     routes(state)
 }
@@ -275,6 +499,7 @@ fn routes(state: AppState) -> Router {
         .route("/v1/profile", get(profile))
         .route("/v1/rows", get(rows))
         .route("/v1/stats", get(stats))
+        .route("/v1/diff", get(diff))
         .route("/v1/export", get(export))
         .route("/v1/list", get(list))
         .route("/v1/query", post(query))
@@ -300,6 +525,12 @@ fn routes(state: AppState) -> Router {
             put(ws_put_result)
                 .get(ws_result_raw)
                 .layer(DefaultBodyLimit::max(MAX_RESULT_UPLOAD_BYTES)),
+        )
+        // New tables: the one way to create a table, 403 unless the server has a `--write-dir`.
+        .route("/v1/tables", post(create_table))
+        .route(
+            "/v1/workspaces/{id}/runs/{run_id}/table",
+            post(ws_run_table),
         )
         // Everything else: embedded static assets, with SPA fallback to index.html.
         .fallback(spa)
@@ -419,6 +650,9 @@ fn asset_response(path: &str, body: &[u8]) -> Response {
 /// Bind `addr` and serve until Ctrl-C. Owns its own multi-thread Tokio runtime so the
 /// synchronous [`crate::cli::run`] can call it directly. When `open_url` is set (`lakeleto open`),
 /// the browser is launched once the socket is bound.
+// Nine positional settings, each an independent operator choice the three callers spell out;
+// bundling them into a struct is a refactor of every caller for no new safety.
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     addr: &str,
     engines: EngineRegistry,
@@ -427,22 +661,61 @@ pub fn serve(
     token: Option<String>,
     root: Option<PathBuf>,
     store: Option<Arc<dyn WorkspaceStore>>,
+    write_dir: Option<WriteDir>,
+    lineage: Option<Lineage>,
 ) -> crate::error::Result<()> {
     let loopback = is_loopback(addr);
     let root_note = root.as_ref().map(|r| r.display().to_string());
+    // A server writes only where it can also read: a table it could not then open would be a
+    // write nobody can check, and `--root` is the operator's statement of what this server reaches.
+    if let (Some(r), Some(w)) = (&root, &write_dir) {
+        if !w.path().starts_with(r) {
+            return Err(EngineError::Other(format!(
+                "--write-dir {} is outside --root {}: new tables must be written where this \
+                 server can read them",
+                w.path().display(),
+                r.display()
+            )));
+        }
+    }
+    let write_dir = write_dir.map(|w| w.with_max_bytes(MAX_TABLE_BYTES as u64));
+    let write_note = write_dir.as_ref().map(|w| w.path().display().to_string());
     // The workspace store: the caller's override (e.g. a RemoteStore syncing to another server
     // or Lakeleto Cloud), else the on-disk default under $LAKELETO_HOME.
     let store: Arc<dyn WorkspaceStore> = match store {
         Some(s) => s,
         None => Arc::new(crate::workspace::LocalStore::open()?),
     };
-    let app = router(engines, default_scan, token.clone(), root, loopback, store);
+    let lineage_note = lineage.as_ref().map(lineage_url);
+    let app = router_with_lineage(
+        engines,
+        default_scan,
+        token.clone(),
+        root,
+        loopback,
+        store,
+        write_dir,
+        lineage,
+    );
     // A non-loopback bind with no token is an open API on the network — warn loudly.
     if token.is_none() && !is_loopback(addr) {
         eprintln!("lakeleto: WARNING binding {addr} (non-loopback) with no --token — the API is unauthenticated");
+        if write_note.is_some() {
+            eprintln!(
+                "lakeleto: WARNING and --write-dir lets anyone who reaches it write new tables"
+            );
+        }
     }
     if let Some(r) = &root_note {
         eprintln!("lakeleto: /v1/* file access confined to --root {r}");
+    }
+    if let Some(w) = &write_note {
+        eprintln!(
+            "lakeleto: new tables may be written under --write-dir {w} (never replacing one)"
+        );
+    }
+    if let Some(to) = &lineage_note {
+        eprintln!("lakeleto: each /v1/export is sent as an OpenLineage run to {to}");
     }
     // Precompute the URL to open (`lakeleto open`) or print (`lakeleto serve` + token), with the token
     // appended so the browser authenticates. Done before the async move so `token` isn't
@@ -723,6 +996,21 @@ struct EnginesResponse {
     ee: bool,
     limits: Limits,
     endpoints: Vec<&'static str>,
+    /// Present only when this server writes new tables (`--write-dir`); absent means it does not,
+    /// and the client should offer no "save as table".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writes: Option<WritesInfo>,
+}
+
+/// Where a server writes new tables, and how big one may be.
+#[derive(Serialize)]
+struct WritesInfo {
+    /// The write directory, canonical: new tables are `<dir>/<name>.parquet`.
+    dir: String,
+    /// Most rows a table written by this server may hold ([`TABLE_ROW_CAP`]).
+    max_rows: usize,
+    /// Most bytes it may occupy on disk ([`MAX_TABLE_BYTES`]).
+    max_bytes: usize,
 }
 
 // ---- result encoding (JSON | Arrow IPC) -----------------------------------------------
@@ -868,17 +1156,24 @@ async fn engines(State(st): State<AppState>) -> Result<Json<EnginesResponse>, Ap
                 Some(OSS_MAX_DB_CONNECTIONS)
             },
         },
-        endpoints: endpoints(&st.engines),
+        endpoints: endpoints(&st.engines, st.write_dir.is_some()),
+        writes: st.write_dir.as_ref().map(|w| WritesInfo {
+            dir: w.path().display().to_string(),
+            max_rows: TABLE_ROW_CAP,
+            max_bytes: MAX_TABLE_BYTES,
+        }),
     }))
 }
 
 /// The endpoints this server answers: [`ENDPOINTS`], less `POST /v1/query` when it has no engine
-/// to run SQL on, which would answer every query with a 501.
-fn endpoints(engines: &EngineRegistry) -> Vec<&'static str> {
+/// to run SQL on, which would answer every query with a 501, and less the [`WRITE_ENDPOINTS`]
+/// when it has no `--write-dir`, which would answer every write with a 403.
+fn endpoints(engines: &EngineRegistry, writes: bool) -> Vec<&'static str> {
     ENDPOINTS
         .iter()
         .copied()
         .filter(|endpoint| *endpoint != "POST /v1/query" || engines.can_query())
+        .filter(|endpoint| writes || !WRITE_ENDPOINTS.contains(endpoint))
         .collect()
 }
 
@@ -919,7 +1214,9 @@ async fn info(
             None
         }
     } else {
-        std::fs::metadata(&source.path).map(|m| m.len()).ok()
+        // A table that is a directory is sized by the files under it, which is a walk.
+        let path = source.path.clone();
+        blocking(move || Ok(crate::source::size_on_disk(&path))).await?
     };
     let format = source.format.to_string();
     let path = source.display();
@@ -1224,6 +1521,119 @@ async fn stats(
     ))
 }
 
+/// `GET /v1/diff`: what changed between `left` and `right`, as `lakeleto diff -o json` prints it
+/// (the same [`crate::diff::DiffReport`], `version: 1`). `left` is the table compared from, the old
+/// one or the reference; `right` the one compared with. Either may be `<table>@<snapshot>`.
+///
+/// - `key` (repeated, or comma-separated): compare the rows too, matched by these columns; needs
+///   the SQL engine.
+/// - `fast`: statistics from Parquet footers, with no row read; `scan`: from the first N rows of
+///   each side (at most the query cap). Without either, statistics are exact when this server
+///   runs SQL. They conflict, as on the command line.
+/// - `sample`: with `key`, how many rows of each kind to show (default 5, at most
+///   [`DIFF_SAMPLE_CAP`]).
+/// - `format`, `json_path` and `flatten` apply to both sides, as the command's flags do.
+///
+/// Nothing is sent as an OpenLineage run: a diff asked for in the web app is looking, not a step
+/// in a pipeline. Through a remote engine it is refused, as `lakeleto diff --remote-url` is. At
+/// most [`DIFFS_AT_ONCE`] run at once; another is refused with 429.
+async fn diff(State(st): State<AppState>, RawQuery(q): RawQuery) -> Result<Response, ApiError> {
+    use crate::diff::{DiffOptions, StatsMode};
+    let bad = |what: String| ApiError(EngineError::Other(what));
+    let mut left = None;
+    let mut right = None;
+    let mut key: Vec<String> = Vec::new();
+    let mut fast = false;
+    let mut scan = None;
+    let mut sample = None;
+    let mut read = ReadAs::default();
+    for (name, value) in decode_pairs(&q.unwrap_or_default())? {
+        let number = |value: &str| {
+            value
+                .parse::<usize>()
+                .map_err(|_| bad(format!("`{name}` is a count of rows, not `{value}`")))
+        };
+        match name.as_str() {
+            "left" => left = Some(value),
+            "right" => right = Some(value),
+            "key" => key.extend(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string),
+            ),
+            "fast" => {
+                fast = match value.as_str() {
+                    "" | "true" | "1" => true,
+                    "false" | "0" => false,
+                    other => return Err(bad(format!("`fast` is true or false, not `{other}`"))),
+                }
+            }
+            "scan" => match number(&value)? {
+                0 => return Err(bad("`scan` takes one row or more".to_string())),
+                n => scan = Some(n.min(QUERY_CAP)),
+            },
+            "sample" => sample = Some(number(&value)?.min(DIFF_SAMPLE_CAP)),
+            "format" => read.format = Some(value),
+            "json_path" => read.json_path = Some(value),
+            "flatten" => read.flatten = Some(value),
+            _ => {}
+        }
+    }
+    let (Some(left), Some(right)) = (left, right) else {
+        return Err(bad("a diff needs `left` and `right`".to_string()));
+    };
+    if fast && scan.is_some() {
+        return Err(bad(
+            "`fast` and `scan` ask for different statistics: give one".to_string(),
+        ));
+    }
+    if sample.is_some() && key.is_empty() {
+        return Err(bad(
+            "`sample` shows rows compared by `key`: give a key".to_string()
+        ));
+    }
+    let (left, left_at) = st.diff_side(&left, &read)?;
+    let (right, right_at) = st.diff_side(&right, &read)?;
+    for side in [&left, &right] {
+        if st.engine(Need::Read(side))?.name() == "remote" {
+            return Err(ApiError(EngineError::UnsupportedOperation {
+                engine: "remote".to_string(),
+                op: "diff two tables".to_string(),
+                hint: "run `lakeleto diff` where the tables are".to_string(),
+            }));
+        }
+    }
+    let opts = DiffOptions {
+        stats: match (fast, scan) {
+            (true, _) => StatsMode::Footer,
+            (false, Some(n)) => StatsMode::Sample(n),
+            (false, None) => StatsMode::Auto,
+        },
+        key,
+        sample_rows: sample.unwrap_or(crate::diff::SAMPLE_ROWS),
+    };
+    let Some(permit) = admit_diff(&st.diffs) else {
+        return Ok(too_many_diffs());
+    };
+    let engines = st.engines.clone();
+    let ctx = st.ctx();
+    let report = blocking(move || {
+        // Held by the work, not the request: a client that gives up does not free its place.
+        let _permit = permit;
+        crate::diff::diff_snapshots(
+            &ctx,
+            &engines,
+            (&left, left_at.as_ref()),
+            (&right, right_at.as_ref()),
+            &opts,
+        )
+    })
+    .await?;
+    Ok(Json(report).into_response())
+}
+
 /// `GET /v1/export` — the current view (same sort/filter) as a downloadable CSV/JSON/Parquet.
 async fn export(State(st): State<AppState>, RawQuery(q): RawQuery) -> Result<Response, ApiError> {
     let mut params = parse_scan_params(&q.unwrap_or_default())?;
@@ -1234,13 +1644,30 @@ async fn export(State(st): State<AppState>, RawQuery(q): RawQuery) -> Result<Res
     confine_entry(&st.root, &params.path)?;
     let source = st.resolve(&params.path, &params.read)?;
     confine_members(&st.root, &source)?;
+    // A run from here on: an export refused before its source resolved read nothing.
+    #[cfg(feature = "openlineage")]
+    let lineage = st.lineage.clone().map(|sender| {
+        let run = crate::lineage::Run::start(sender.to.clone());
+        (sender, run, params.path.clone())
+    });
     let spec = params.spec;
     let registry = st.engines.clone();
     let ctx = st.ctx();
 
-    let (body, mime, ext) = blocking(move || {
+    let exported = blocking(move || {
         let engine = registry.resolve(Need::Scan(&source, &spec))?;
         let rb = engine.scan(&ctx, &source, &spec)?.batch;
+        // A table Lakeleto wrote says where it came from, and the export passes that on. Only a
+        // single local Parquet file can carry it; anything else, or a footer that will not read,
+        // simply sends no header — provenance is information, never a reason to fail an export.
+        let provenance = (source.format == crate::source::Format::Parquet && source.path.is_file())
+            .then(|| {
+                crate::table_out::read_provenance(&source.path)
+                    .ok()
+                    .flatten()
+            })
+            .flatten()
+            .and_then(|p| p.header_value());
         let out: (Vec<u8>, &'static str, &'static str) = match fmt.as_str() {
             "parquet" => (
                 crate::render::to_parquet(&rb)?,
@@ -1273,9 +1700,18 @@ async fn export(State(st): State<AppState>, RawQuery(q): RawQuery) -> Result<Res
         // Bound the response in bytes (not just rows): a wide view can exceed a sane budget
         // well under EXPORT_CAP rows. Reject past the cap rather than ship a multi-GB body.
         export_cap_check(out.0.len(), MAX_EXPORT_BYTES)?;
-        Ok::<_, EngineError>(out)
+        Ok::<_, EngineError>((out.0, out.1, out.2, provenance))
     })
-    .await?;
+    .await;
+    #[cfg(feature = "openlineage")]
+    if let Some((sender, run, path)) = lineage {
+        sender.offer(QueuedExport {
+            run,
+            path,
+            exported: exported.is_ok(),
+        });
+    }
+    let (body, mime, ext, provenance) = exported?;
 
     let headers = [
         (header::CONTENT_TYPE, mime.to_string()),
@@ -1284,7 +1720,64 @@ async fn export(State(st): State<AppState>, RawQuery(q): RawQuery) -> Result<Res
             format!("attachment; filename=\"lakeleto-export.{ext}\""),
         ),
     ];
-    Ok((headers, body).into_response())
+    let mut response = (headers, body).into_response();
+    if let Some(value) = provenance.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        response.headers_mut().insert(
+            HeaderName::from_static(crate::protocol::PROVENANCE_HEADER),
+            value,
+        );
+    }
+    Ok(response)
+}
+
+/// Send an export as an OpenLineage run, on [`ExportLineage`]'s thread, off the response path:
+/// naming a catalog table and posting the events can each wait on the network, and the download
+/// waits for neither. Its input is the table it read. It names no output: the file is wherever
+/// the browser saved it, which the server never learns. A failure to name or send is a warning on
+/// stderr, and the export stands.
+#[cfg(feature = "openlineage")]
+fn send_export_lineage(queued: QueuedExport) {
+    use crate::lineage::{self, Input, Outcome};
+    let QueuedExport {
+        run,
+        path,
+        exported,
+    } = queued;
+    // The browser's file has no name the server learns, so the job is named for what it read.
+    {
+        let dataset = match lineage::dataset(&RequestContext::detached(), &path, false) {
+            Ok(dataset) => dataset,
+            Err(why) => return lineage::warn(&format!("no OpenLineage event is sent: {why}")),
+        };
+        let outcome = match exported {
+            true => Outcome::Complete,
+            false => Outcome::Fail,
+        };
+        let inputs = [Input {
+            dataset,
+            facets: None,
+        }];
+        let job = lineage::Job {
+            command: "export",
+            named_for: None,
+        };
+        let events = run.events(&job, &inputs, &[], outcome);
+        if let Err(why) = run.send(&events) {
+            let to = run.destination().shown();
+            lineage::warn(&format!("OpenLineage events not sent to {to}: {why}"));
+        }
+    }
+}
+
+/// The endpoint a server's exports are sent to, as it says so on start.
+#[cfg(feature = "openlineage")]
+fn lineage_url(to: &Lineage) -> String {
+    to.shown().to_string()
+}
+
+#[cfg(not(feature = "openlineage"))]
+fn lineage_url(to: &Lineage) -> String {
+    match *to {}
 }
 
 /// `GET /v1/list?dir=` — the file browser: subdirs + readable data files.
@@ -1485,6 +1978,7 @@ async fn ws_run(
         }]))?,
         None => st.engine(Need::Read(&source))?,
     };
+    let whole_known = proves_whole(engine.as_ref());
     let store = st.store.clone();
     let ctx = st.ctx();
     let source_path = source.display();
@@ -1499,6 +1993,9 @@ async fn ws_run(
         // doesn't exist must not execute the query (nor could its record be stored).
         store.get(&id)?;
         let started = std::time::Instant::now();
+        // One row past the cap is asked for, so a result that fills it says there was more: the
+        // difference between "the answer" and "the first `cap` rows of it", which a run saved
+        // as a table must not blur.
         let result = match &sql {
             Some(q) => {
                 let named = vec![NamedSource {
@@ -1507,9 +2004,9 @@ async fn ws_run(
                 }];
                 // The cap is pushed into the engine (plan-level LIMIT on the SQL engine), so a
                 // `SELECT *` over a huge table never materializes an unbounded result.
-                engine.query_capped(&ctx, q, &named, cap)
+                engine.query_capped(&ctx, q, &named, cap + 1)
             }
-            None => engine.preview(&ctx, &source, cap),
+            None => engine.preview(&ctx, &source, cap + 1),
         };
         let duration_ms = started.elapsed().as_millis() as u64;
         let mut rec = RunRecord {
@@ -1525,9 +2022,20 @@ async fn ws_run(
             cached: false,
             flatten,
             json_path,
+            truncated: None,
         };
         match result {
             Ok(rb) => {
+                let truncated = rb.num_rows() > cap;
+                let rb = if truncated {
+                    window_rowbatch(&rb, cap)
+                } else {
+                    rb
+                };
+                // More rows than the cap proves a cut; fewer proves the whole answer only when
+                // the engine itself is not capped by a peer it cannot hear from. Unknown stays
+                // unknown, which is what keeps such a run from being saved as a table.
+                rec.truncated = (truncated || whole_known).then_some(truncated);
                 rec.row_count = Some(rb.num_rows() as u64);
                 // `cached` is set from what is about to be written, not from what was asked for,
                 // so a history record never claims a result the store was never given.
@@ -1622,6 +2130,223 @@ async fn ws_run_result(
     Ok(Json(rows_response(rb).map_err(ApiError)?))
 }
 
+// ---- new tables (the one way to create one; see crate::table_out) --------------------
+
+/// Most rows a table written by the server may hold. The server holds them in memory before
+/// writing — a capped query or a cached run produces them whole — so this is the export cap, for
+/// the export cap's reason. `lakeleto create-table` streams to disk and has no cap.
+const TABLE_ROW_CAP: usize = EXPORT_CAP;
+
+/// Most bytes a table written by the server may occupy on disk.
+const MAX_TABLE_BYTES: usize = MAX_EXPORT_BYTES;
+
+#[derive(Deserialize)]
+struct CreateTableBody {
+    /// The new table's name: `marts/revenue_by_city` becomes
+    /// `<write-dir>/marts/revenue_by_city.parquet`.
+    name: String,
+    /// SQL whose result becomes the table. Absent or empty: a copy of the one table named.
+    #[serde(default)]
+    sql: Option<String>,
+    /// A table registered as `t`, as on `POST /v1/query`.
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    tables: Vec<TableSpec>,
+}
+
+#[derive(Deserialize)]
+struct SaveRunBody {
+    name: String,
+}
+
+/// Whether a result short of a cap from `engine` is the whole answer. Not from the remote engine:
+/// its peer applies its own row caps and the response does not say when one cut it, so "fewer
+/// rows than asked for" proves nothing there.
+fn proves_whole(engine: &dyn Engine) -> bool {
+    engine.name() != "remote"
+}
+
+/// The write directory, or the 403 a server without one answers every write with.
+fn write_dir(st: &AppState) -> Result<Arc<WriteDir>, ApiError> {
+    st.write_dir.clone().ok_or_else(|| {
+        ApiError(EngineError::Forbidden(
+            "this server does not write tables — start it with `--write-dir <DIR>` to allow \
+             new tables to be written there"
+                .to_string(),
+        ))
+    })
+}
+
+/// `POST /v1/tables` — run SQL over tables (or copy one table) and write the result as a NEW
+/// table under `--write-dir`. 201 with the [`NewTable`]; 409 when the name is taken; 413 when the
+/// result is over [`TABLE_ROW_CAP`] rows, which is refused rather than written short.
+async fn create_table(
+    State(st): State<AppState>,
+    Json(body): Json<CreateTableBody>,
+) -> Result<(StatusCode, Json<NewTable>), ApiError> {
+    let wd = write_dir(&st)?;
+    // The name is checked before anything is read, so a bad name costs no query.
+    wd.target(&body.name)?;
+    let mut named = Vec::new();
+    if let Some(f) = &body.file {
+        confine_entry(&st.root, f)?;
+        let source = st.resolve(f, &ReadAs::default())?;
+        confine_members(&st.root, &source)?;
+        named.push(NamedSource {
+            name: "t".to_string(),
+            source,
+        });
+    }
+    for t in &body.tables {
+        confine_entry(&st.root, &t.path)?;
+        let source = st.resolve(&t.path, &t.read)?;
+        confine_members(&st.root, &source)?;
+        named.push(NamedSource {
+            name: t.name.clone(),
+            source,
+        });
+    }
+    if named.is_empty() {
+        return Err(ApiError(EngineError::Other(
+            "no tables — provide `file` or a non-empty `tables` array".to_string(),
+        )));
+    }
+    let sql = body.sql.filter(|s| !s.trim().is_empty());
+    let engine = match &sql {
+        Some(_) => st.engine(Need::Query(&named))?,
+        None if named.len() == 1 => st.engine(Need::Read(&named[0].source))?,
+        None => {
+            return Err(ApiError(EngineError::Other(
+                "without `sql` a new table is a copy of one table — name exactly one, or give \
+                 the SQL that combines them"
+                    .to_string(),
+            )))
+        }
+    };
+    if !proves_whole(engine.as_ref()) {
+        return Err(ApiError(EngineError::UnsupportedOperation {
+            engine: engine.name().to_string(),
+            op: "write a new table from its result".to_string(),
+            hint: "this engine's peer caps the rows it returns without saying so, so the table \
+                   could be the first rows of the answer — write it on that server instead"
+                .to_string(),
+        }));
+    }
+    let from = Origin::Query {
+        sql: sql.clone(),
+        tables: named
+            .iter()
+            .map(|n| OriginTable {
+                name: n.name.clone(),
+                path: n.source.display(),
+            })
+            .collect(),
+    };
+    let ctx = st.ctx();
+    let name = body.name;
+    let table = blocking(move || {
+        let rb = match &sql {
+            Some(q) => engine.query_capped(&ctx, q, &named, TABLE_ROW_CAP + 1)?,
+            None => engine.preview(&ctx, &named[0].source, TABLE_ROW_CAP + 1)?,
+        };
+        if rb.num_rows() > TABLE_ROW_CAP {
+            return Err(EngineError::TooLarge(format!(
+                "the result has more than {TABLE_ROW_CAP} rows, the most a table written by the \
+                 server may hold — aggregate or filter it, or write it with `lakeleto \
+                 create-table`, which streams to disk"
+            )));
+        }
+        let table = wd.write(&name, RowStream::from_batch(rb), from)?;
+        eprintln!(
+            "lakeleto: wrote new table {} ({} rows, {} bytes)",
+            table.path, table.rows, table.bytes
+        );
+        Ok(table)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(table)))
+}
+
+/// `POST /v1/workspaces/{id}/runs/{run_id}/table` — save a run's cached result as a NEW table.
+///
+/// Only a run that succeeded, was cached and is known to be whole: a run that stopped at its row
+/// cap holds the first rows of an answer, and saved under a name it would read as the answer.
+async fn ws_run_table(
+    State(st): State<AppState>,
+    UrlPath((id, run_id)): UrlPath<(String, String)>,
+    Json(body): Json<SaveRunBody>,
+) -> Result<(StatusCode, Json<NewTable>), ApiError> {
+    let wd = write_dir(&st)?;
+    wd.target(&body.name)?;
+    let store = st.store.clone();
+    let name = body.name;
+    let table = blocking(move || {
+        let rec = store
+            .history(&id)?
+            .into_iter()
+            .find(|r| r.id == run_id)
+            .ok_or_else(|| {
+                EngineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no run `{run_id}` in workspace `{id}`"),
+                ))
+            })?;
+        let refuse = |why: String| Err(EngineError::Other(why));
+        if rec.status != RunStatus::Ok {
+            return refuse(format!(
+                "run `{run_id}` failed, so it has no result to save"
+            ));
+        }
+        if !rec.cached {
+            return refuse(format!(
+                "run `{run_id}` did not cache its result — run it again with `cache: true` to \
+                 save it as a table"
+            ));
+        }
+        match rec.truncated {
+            Some(false) => {}
+            Some(true) => {
+                return refuse(format!(
+                    "run `{run_id}` stopped at its row cap after {} rows, so its result is not the \
+                     whole answer — run it again with a higher `limit`, or write the query with \
+                     `POST /v1/tables`, which refuses rather than shortens",
+                    rec.row_count.unwrap_or(0)
+                ))
+            }
+            None => {
+                return refuse(format!(
+                    "run `{run_id}` does not record whether its result is whole (it predates \
+                     that record, or came from a writer that does not keep it) — run it again \
+                     to save it as a table"
+                ))
+            }
+        }
+        let rows = rec.row_count.unwrap_or(0) as usize;
+        let rb = store.run_result(&id, &run_id, 0, rows.max(1))?;
+        if rb.num_rows() != rows {
+            return refuse(format!(
+                "run `{run_id}` recorded {rows} rows but its cached result holds {}",
+                rb.num_rows()
+            ));
+        }
+        let from = Origin::Run {
+            workspace: id.clone(),
+            run_id: run_id.clone(),
+            sql: rec.sql.clone(),
+            source: rec.source_path.clone(),
+        };
+        let table = wd.write(&name, RowStream::from_batch(rb), from)?;
+        eprintln!(
+            "lakeleto: wrote new table {} from run {run_id} ({} rows, {} bytes)",
+            table.path, table.rows, table.bytes
+        );
+        Ok(table)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(table)))
+}
+
 // ---- helpers --------------------------------------------------------------------------
 
 /// First `n` rows of a [`RowBatch`] (across batches), for capping a run and its inline preview.
@@ -1669,88 +2394,19 @@ struct ScanParams {
 }
 
 /// Parse the shared `path/format/json_path/flatten/offset/limit/sort/desc/filter/cols/fmt` query
-/// params into a [`ScanSpec`]. `filter` may repeat; each is `column:op:value`, with an op
-/// [`FilterOp::parse`] reads (`eq ne lt le gt ge contains notcontains startswith endswith in isnull
-/// notnull`, or an alias of one, such as `>=` or `not_contains`), and `isnull`/`notnull` take no
-/// value.
+/// params into a [`ScanSpec`] — see [`crate::protocol::parse_scan_query`], which owns the grammar so
+/// that every server speaking `/v1/rows` reads it the same way.
 fn parse_scan_params(qs: &str) -> Result<ScanParams, ApiError> {
-    let pairs = decode_pairs(qs)?;
-    let mut path = None;
-    let mut format = None;
-    let mut json_path = None;
-    let mut flatten = None;
-    let mut offset = 0usize;
-    let mut limit = 100usize;
-    let mut sort = None;
-    let mut desc = false;
-    let mut fmt = None;
-    let mut projection = None;
-    let mut filters = Vec::new();
-
-    for (k, v) in &pairs {
-        match k.as_str() {
-            "path" => path = Some(v.clone()),
-            "format" if !v.is_empty() => format = Some(v.clone()),
-            // Empty is meaningful here — the whole document — so it is kept, unlike `format`.
-            "json_path" => json_path = Some(v.clone()),
-            // Empty is `all`, as for a bare `?flatten`.
-            "flatten" => flatten = Some(v.clone()),
-            "offset" => offset = v.parse().unwrap_or(0),
-            "limit" => limit = v.parse().unwrap_or(100),
-            "sort" if !v.is_empty() => sort = Some(v.clone()),
-            "desc" => desc = v == "1" || v.eq_ignore_ascii_case("true"),
-            "fmt" if !v.is_empty() => fmt = Some(v.clone()),
-            "cols" if !v.is_empty() => {
-                projection = Some(
-                    v.split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>(),
-                )
-            }
-            "filter" => {
-                let mut it = v.splitn(3, ':');
-                if let (Some(c), Some(o)) = (it.next(), it.next()) {
-                    if let Some(op) = FilterOp::parse(o) {
-                        // `is_null` / `not_null` take no operand, so `col:isnull` is accepted
-                        // without the trailing colon that would otherwise be required to make the
-                        // filter parse at all — this parser drops what it cannot read, and a
-                        // silently missing filter shows wrong rows rather than an error.
-                        let val = it.next();
-                        if !c.is_empty() && (val.is_some() || op.is_unary()) {
-                            filters.push(FilterSpec {
-                                column: c.to_string(),
-                                op,
-                                value: val.unwrap_or_default().to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let path = path.ok_or_else(|| ApiError(EngineError::Other("missing `path`".to_string())))?;
-    let sort = sort.map(|column| SortSpec {
-        column,
-        descending: desc,
-    });
+    let q = crate::protocol::parse_scan_query(&decode_pairs(qs)?)?;
     Ok(ScanParams {
-        path,
+        path: q.path,
         read: ReadAs {
-            format,
-            json_path,
-            flatten,
+            format: q.format,
+            json_path: q.json_path,
+            flatten: q.flatten,
         },
-        spec: ScanSpec {
-            offset,
-            limit: limit.clamp(1, 10_000),
-            sort,
-            filters,
-            projection,
-        },
-        fmt,
+        spec: q.spec,
+        fmt: q.fmt,
     })
 }
 
@@ -1838,6 +2494,7 @@ impl IntoResponse for ApiError {
             EngineError::Remote(_) => StatusCode::BAD_GATEWAY,
             EngineError::Forbidden(_) => StatusCode::FORBIDDEN,
             EngineError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            EngineError::Conflict(_) => StatusCode::CONFLICT,
             // A deadline is a timeout the server imposed, which is what 408 says.
             EngineError::Cancelled(CancelReason::Deadline) => StatusCode::REQUEST_TIMEOUT,
             // 499 is nginx's "client closed request" — non-standard, but it is the status the
@@ -1866,6 +2523,46 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
 
+    /// At most [`DIFFS_AT_ONCE`] diffs run: one more is refused with 429 saying why, until one of
+    /// them ends and gives its place back.
+    #[test]
+    fn diffs_past_the_limit_are_refused_until_one_ends() {
+        let diffs = Arc::new(tokio::sync::Semaphore::new(DIFFS_AT_ONCE));
+        let running: Vec<_> = (0..DIFFS_AT_ONCE)
+            .map(|_| admit_diff(&diffs).expect("a place"))
+            .collect();
+        assert!(admit_diff(&diffs).is_none(), "no place left");
+        assert_eq!(too_many_diffs().status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(running);
+        assert!(admit_diff(&diffs).is_some());
+    }
+
+    /// A server's export runs wait in a bounded queue: while the endpoint keeps the sender waiting,
+    /// one more waits, and the next is dropped rather than held.
+    #[cfg(feature = "openlineage")]
+    #[test]
+    fn export_runs_waiting_for_a_slow_endpoint_are_bounded() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let to = crate::lineage::Destination::parse(&format!(
+            "http://{}/lineage",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let sender = ExportLineage::with_capacity(to.clone(), 1);
+        let offer = || {
+            sender.offer(QueuedExport {
+                run: crate::lineage::Run::start(to.clone()),
+                path: "/srv/orders.csv".to_string(),
+                exported: true,
+            })
+        };
+        assert!(offer(), "the first is sent");
+        // The sender has it, and waits on an endpoint that never answers.
+        let (_held, _) = listener.accept().unwrap();
+        assert!(offer(), "one waits");
+        assert!(!offer(), "the next is dropped");
+    }
+
     /// `/v1/list?dir=catalog://` lists the catalogs this server is configured with, as directories
     /// the browser walks into, and a catalog reference is refused under `--root` before anything
     /// reaches a catalog.
@@ -1882,6 +2579,7 @@ mod tests {
             root: root.map(Arc::new),
             loopback: true,
             store: Arc::new(crate::workspace::LocalStore::at(home.path()).unwrap()),
+            write_dir: None,
             catalogs: Arc::new(
                 crate::catalog::Catalogs::from_configs([
                     crate::catalog::CatalogConfig::new("prod")
@@ -1893,6 +2591,8 @@ mod tests {
                 ])
                 .unwrap(),
             ),
+            lineage: None,
+            diffs: Arc::new(tokio::sync::Semaphore::new(DIFFS_AT_ONCE)),
         };
         let get = |root: Option<PathBuf>, uri: &str| {
             routes(state(root)).oneshot(

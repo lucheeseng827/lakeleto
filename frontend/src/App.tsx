@@ -38,6 +38,43 @@ let deepLink: string | null = qs.get("path");
 const dropDeepLink = () => {
   try { const u = new URL(location.href); u.searchParams.delete("path"); history.replaceState(history.state, "", u); } catch { /* no history API */ }
 };
+// A token the app was opened with — `#token=` (a fragment, never sent to any server, so the way to
+// share a link) or `?token=` (which the first request carries, so a proxy's access log may record
+// it) — is taken once, kept in this tab's sessionStorage (so a reload still works), and removed from
+// the address bar, so it does not linger in history, bookmarks or a copied link. Every request then
+// carries it in the Authorization header. (The page is also served with
+// `Referrer-Policy: no-referrer`, and index.html says the same, so it never leaves in a Referer.)
+//
+// A STORED token is only ever sent to this page's own origin. `?api=` can point the app at another
+// server, and anyone can craft a link with one: restoring the stored token for it would hand this
+// tab's credential to whatever origin the link named. So a token given for another origin (in the
+// same link as `?api=`) is used for this page only and never stored, and a stored one is never
+// restored for another origin.
+const TOKEN_KEY = "lakeleto.token";
+const apiParam = qs.get("api") || "";
+const sameOrigin = (() => {
+  if (!apiParam) return true;
+  try { return new URL(apiParam, location.href).origin === location.origin; } catch { return false; }
+})();
+const initialToken = (() => {
+  const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const fromUrl = hash.get("token") || qs.get("token");
+  let token = fromUrl || "";
+  try {
+    if (fromUrl && sameOrigin) sessionStorage.setItem(TOKEN_KEY, fromUrl);
+    else if (!fromUrl && sameOrigin) token = sessionStorage.getItem(TOKEN_KEY) || "";
+  } catch { /* storage blocked: the token lives for this page only */ }
+  if (fromUrl) {
+    try {
+      const u = new URL(location.href);
+      u.searchParams.delete("token");
+      hash.delete("token");
+      u.hash = hash.toString();
+      history.replaceState(history.state, "", u);
+    } catch { /* no history API */ }
+  }
+  return token;
+})();
 const dirOf = (p: string) => { const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); return i > 0 ? p.slice(0, i) : "/data/warehouse"; };
 
 interface RunnerCfg { open: boolean; title: string; sharedSql: string | null; jobs: RunJob[]; }
@@ -202,7 +239,7 @@ export function App() {
   };
 
   useEffect(() => {
-    connectLakeleto({ base: qs.get("api") || "", token: qs.get("token") || "" }).then(setConn).catch((e) => setConnErr((e as Error).message));
+    connectLakeleto({ base: apiParam, token: initialToken }).then(setConn).catch((e) => setConnErr((e as Error).message));
   }, []);
   useEffect(() => { if (conn) loadWorkspaces(conn.backend); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [conn]);
 
@@ -252,6 +289,23 @@ export function App() {
     const t: OpenTab = { id: newTabId(), kind: "result", title: "result · " + basename(r.source_path), path: r.source_path, sub: "Grid", sort: null, filters: {}, sql: "", connId: null, runId: r.id, run: r, result: null };
     addTab(t);
     backend.wsRunResult(wsId, r.id, 0, 500).then((res) => patchTab(t.id, { result: res })).catch((e) => patchTab(t.id, { resultErr: (e as Error).message }));
+  };
+
+  // Save a cached run as a NEW table, then open it like any other table: query → keep → query again.
+  const saveRunAsTable = async (t: OpenTab) => {
+    const r = t.run;
+    if (!backend?.wsSaveRunAsTable || !wsId || !r) return;
+    const base = basename(r.source_path).replace(/\.[^.]*$/, "").replace(/[^A-Za-z0-9_-]+/g, "_").replace(/^[^A-Za-z0-9]+/, "");
+    const name = window.prompt(
+      `Save these ${r.row_count ?? 0} rows as a new table under ${conn?.caps?.writes?.dir ?? "the write directory"}.\n` +
+      "Name: 1–3 parts separated by /, letters, digits, _ and - (an existing name is refused, never replaced).",
+      "results/" + (base || "result"));
+    if (!name) return;
+    try {
+      const created = await backend.wsSaveRunAsTable(wsId, r.id, name.trim());
+      setErr(null);
+      openPath(created.path, { title: created.name });
+    } catch (e) { setErr("Save as table failed: " + (e as Error).message); }
   };
 
   const onCompare = (r: RunRecord) => {
@@ -422,6 +476,9 @@ export function App() {
   if (!conn) return <div style={{ padding: 24, color: "var(--muted)", fontFamily: "var(--font-mono)", fontSize: "var(--text-base)" }}>connecting to engine…</div>;
 
   const sqlAvailable = !!(conn.caps && conn.caps.sql_available);
+  // The Diff view needs the server to answer `GET /v1/diff`. A server that does not (an older
+  // `lakeleto serve`, or one serving part of /v1) says so by leaving it out of its endpoints.
+  const canDiff = conn.mode === "live" && !!conn.backend.diff && (conn.caps.endpoints || []).some((e) => e.startsWith("GET /v1/diff"));
   const engineName = conn.caps.engine.engine;
   const shellBar: CSSProperties = { display: "flex", gap: "var(--space-4)", alignItems: "center", padding: "var(--pad-toolbar)", borderBottom: "var(--border-hairline)", flex: "0 0 auto", flexWrap: "wrap" };
 
@@ -474,8 +531,9 @@ export function App() {
               onNewQuery={(c) => launcherNewQuery(active.id, c)}
               onBrowse={() => setPaletteOpen(true)} />
           ) : active.kind === "compare" ? <CompareView tab={active} />
-            : active.kind === "result" ? <ResultView tab={active} onOpenRow={(row) => setDetailRow({ row, path: active.path || undefined })} />
-              : <TableView key={active.id} backend={conn.backend} conn={conn} tab={active} onPatch={(p) => patchTab(active.id, p)} onRunSql={(sql) => runSql(active.id, sql)} sqlAvailable={sqlAvailable} resolve={resolve} onOpenRow={(row) => setDetailRow({ row, path: active.path })} />
+            : active.kind === "result" ? <ResultView tab={active} onOpenRow={(row) => setDetailRow({ row, path: active.path || undefined })}
+                onSaveAsTable={conn.caps.writes && backend?.wsSaveRunAsTable ? () => saveRunAsTable(active) : undefined} />
+              : <TableView key={active.id} backend={conn.backend} conn={conn} tab={active} onPatch={(p) => patchTab(active.id, p)} onRunSql={(sql) => runSql(active.id, sql)} sqlAvailable={sqlAvailable} canDiff={canDiff} resolve={resolve} onOpenRow={(row) => setDetailRow({ row, path: active.path })} />
         ) : (
           <main style={{ flex: "1 1 auto", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)", flexDirection: "column", gap: 10 }}>
             <div>No open tabs.</div>

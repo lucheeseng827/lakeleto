@@ -466,17 +466,9 @@ impl DataFusionEngine {
         }))
     }
 
-    /// Register a source that DataFusion can't list natively (Iceberg, Delta, a partitioned Parquet
-    /// dir) by reading it fully through the local engine into a [`MemTable`]. The local engine
-    /// already resolves snapshots and Hive partition columns, and applies the source's flattening,
-    /// so SQL gets the schema and rows the grid shows.
-    fn register_via_local(
-        &self,
-        ctx: &RequestContext,
-        session: &SessionContext,
-        table: &NamedSource,
-    ) -> Result<()> {
-        use datafusion::datasource::MemTable;
+    /// The local reader this engine reads a table format with (Iceberg, Delta, a Parquet
+    /// directory), under this engine's identity fallback and catalogs.
+    fn local_reader(&self) -> crate::engine::local::LocalReaderEngine {
         // Hand this engine's FALLBACK down, `None` included. The caller's own identity already
         // reaches the local reader on `ctx`, so this is only about what happens when the call
         // named none — and the two engines have to agree on that, or a query joining a Parquet
@@ -498,7 +490,23 @@ impl DataFusionEngine {
         let local = crate::engine::local::LocalReaderEngine::default();
         #[cfg(feature = "catalog")]
         let local = local.with_catalogs(self.catalogs.clone());
-        let rb = local.preview(ctx, &table.source, usize::MAX)?; // full read (no row cap)
+        local
+    }
+
+    /// Register a source that DataFusion can't list natively (Iceberg, Delta, a partitioned Parquet
+    /// dir) by reading it fully through the local engine into a [`MemTable`]. The local engine
+    /// already resolves snapshots and Hive partition columns, and applies the source's flattening,
+    /// so SQL gets the schema and rows the grid shows.
+    fn register_via_local(
+        &self,
+        ctx: &RequestContext,
+        session: &SessionContext,
+        table: &NamedSource,
+    ) -> Result<()> {
+        use datafusion::datasource::MemTable;
+        let rb = self
+            .local_reader()
+            .preview(ctx, &table.source, usize::MAX)?; // full read (no row cap)
         let mem = MemTable::try_new(rb.schema.clone(), vec![rb.batches])
             .map_err(|e| EngineError::Query(e.to_string()))?;
         session
@@ -783,6 +791,17 @@ impl Engine for DataFusionEngine {
         "sql"
     }
 
+    /// A table format's metadata is the local reader's to describe: the same one this engine
+    /// reads the format's rows with.
+    fn metadata(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        at: Option<&crate::snapshot::SnapshotRef>,
+    ) -> Result<crate::snapshot::TableMetadata> {
+        self.local_reader().metadata(ctx, source, at)
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             engine: "sql (DataFusion)".to_string(),
@@ -792,11 +811,10 @@ impl Engine for DataFusionEngine {
             sql: true,
             profile: true,
             remote: false,
-            // `scan` is overridden (WHERE / ORDER BY / LIMIT+OFFSET pushed into DataFusion).
-            // `stats` is not, so it inherits the default that drops the caller's filters —
-            // reported honestly rather than advertised as working.
+            // `scan` is overridden (WHERE / ORDER BY / LIMIT+OFFSET pushed into DataFusion), and
+            // `stats` is built on it, so the caller's filters are applied, not dropped.
             scan: true,
-            filtered_stats: false,
+            filtered_stats: true,
         }
     }
 
@@ -928,6 +946,45 @@ impl Engine for DataFusionEngine {
     /// sort/filter over files larger than `scan_cap` is correct and complete.
     fn scan(&self, ctx: &RequestContext, source: &Source, spec: &ScanSpec) -> Result<ScanResult> {
         retrying(ctx, |streams| self.scan_with(ctx, source, spec, streams))
+    }
+
+    /// Column statistics over the *filtered* view: the filters go through [`Engine::scan`] (a
+    /// `WHERE` pushed into DataFusion), and the first `scan_limit` matching rows are profiled.
+    /// `row_count` is the exact number of matching rows, from the scan's `count(*)`. With no
+    /// filters this is [`Engine::profile`].
+    fn stats(
+        &self,
+        ctx: &RequestContext,
+        source: &Source,
+        filters: &[FilterSpec],
+        scan_limit: usize,
+    ) -> Result<TableProfile> {
+        if filters.is_empty() {
+            return self.profile(ctx, source, scan_limit);
+        }
+        if scan_limit == 0 {
+            // The footer-only path cannot apply a filter, and the sql engine has none anyway.
+            return Err(EngineError::Query(
+                "filtered statistics need a scan; `scan=0` (footer-only) cannot apply a filter"
+                    .to_string(),
+            ));
+        }
+        let spec = ScanSpec {
+            offset: 0,
+            limit: scan_limit,
+            sort: None,
+            filters: filters.to_vec(),
+            projection: None,
+        };
+        let res = self.scan(ctx, source, &spec)?;
+        let columns = profile_columns(&res.batch.schema, &res.batch.batches)?;
+        Ok(TableProfile {
+            source: source.display(),
+            engine: self.name().to_string(),
+            row_count: res.total_known.then_some(res.matched_rows as u64),
+            scanned_rows: res.batch.num_rows() as u64,
+            columns,
+        })
     }
 }
 
@@ -1209,7 +1266,13 @@ async fn physical(
         EngineError::Query(e.to_string())
     };
     let mut df = session.sql(sql).await.map_err(unplanned)?;
-    if let Some(cap) = cap {
+    // An EXPLAIN is a plan's description, whose rows its plan bounds, and DataFusion plans one
+    // only at the root: a limit above it fails to plan.
+    let explain = matches!(
+        df.logical_plan(),
+        datafusion::logical_expr::LogicalPlan::Explain(_)
+    );
+    if let (Some(cap), false) = (cap, explain) {
         df = df.limit(0, Some(cap)).map_err(unplanned)?;
     }
     let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
@@ -1434,6 +1497,13 @@ fn count_value(rb: &RowBatch) -> usize {
         })
         .unwrap_or(0)
 }
+
+/// The catalog and schema every query's tables are registered in, and so the names a qualified
+/// reference to one of them uses (`lakeleto_tables.main.orders`). Neither is a name a configured
+/// catalog can take, since those are letters, digits and `-`, so a client that lists catalogs (Flight
+/// SQL's) can show configured ones beside them.
+pub const CATALOG: &str = "lakeleto_tables";
+pub const SCHEMA: &str = "main";
 
 /// Reject any SQL that is not a single read-only query. `COPY TO`, `CREATE`, any DML/DDL,
 /// `EXPLAIN ANALYZE` (which executes), and multi-statement smuggling are all denied.
@@ -1817,6 +1887,34 @@ mod tests {
     }
 
     #[test]
+    fn stats_apply_the_filters_rather_than_drop_them() {
+        use crate::engine::{FilterOp, FilterSpec};
+        let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/people.csv");
+        let source = Source::with_format(csv, Format::Csv);
+        let engine = DataFusionEngine::new();
+        let ctx = RequestContext::detached();
+        assert!(engine.capabilities().filtered_stats);
+
+        let filters = vec![FilterSpec {
+            column: "city".into(),
+            op: FilterOp::Eq,
+            value: "London".into(),
+        }];
+        let p = engine.stats(&ctx, &source, &filters, 100).unwrap();
+        assert_eq!(p.row_count, Some(2), "two Londoners match");
+        assert_eq!(p.scanned_rows, 2);
+        let city = p.columns.iter().find(|c| c.name == "city").unwrap();
+        assert_eq!(city.distinct, 1, "only the filtered rows are profiled");
+
+        // No filters is a plain profile; scan=0 cannot apply a filter.
+        assert_eq!(
+            engine.stats(&ctx, &source, &[], 100).unwrap().scanned_rows,
+            8
+        );
+        assert!(engine.stats(&ctx, &source, &filters, 0).is_err());
+    }
+
+    #[test]
     fn contains_filter_casts_column_to_text() {
         use super::build_where;
         use crate::engine::{FilterOp, FilterSpec};
@@ -1892,6 +1990,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rb.num_rows(), 1);
+    }
+
+    /// A capped query of an EXPLAIN describes its plan, as an uncapped one does: the cap goes on
+    /// a query's rows, and an EXPLAIN's plan must stay at the root.
+    #[test]
+    fn a_capped_explain_describes_its_plan() {
+        use crate::engine::NamedSource;
+        use crate::source::Source;
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("t.csv");
+        std::fs::write(&csv, "v\n1\n2\n3\n").unwrap();
+        let table = [NamedSource {
+            name: "t".into(),
+            source: Source::detect(&csv).unwrap(),
+        }];
+        let eng = DataFusionEngine::new();
+        let ctx = RequestContext::detached();
+        let plan = eng
+            .query_stream(&ctx, "EXPLAIN SELECT v FROM t", &table, Some(1))
+            .unwrap()
+            .collect_batch()
+            .unwrap();
+        assert!(plan.num_rows() > 0);
+        // A query's rows are still capped.
+        let rows = eng
+            .query_stream(&ctx, "SELECT v FROM t", &table, Some(1))
+            .unwrap()
+            .collect_batch()
+            .unwrap();
+        assert_eq!(rows.num_rows(), 1);
     }
 
     /// The TopK a sorted window ends in hands the threshold its best rows set to the scan under
@@ -2028,6 +2156,10 @@ mod tests {
         assert!(ensure_read_only("SELECT 1").is_ok());
         assert!(ensure_read_only("WITH a AS (SELECT 1) SELECT * FROM a").is_ok());
         assert!(ensure_read_only("EXPLAIN SELECT 1").is_ok());
+        // DataFusion's own parser reads comments, so a query that opens with one is a read.
+        assert!(ensure_read_only("-- revenue\nSELECT 1").is_ok());
+        assert!(ensure_read_only("/* revenue */ SELECT 1").is_ok());
+        assert!(ensure_read_only("-- not a read\nDROP TABLE t").is_err());
     }
 
     #[test]

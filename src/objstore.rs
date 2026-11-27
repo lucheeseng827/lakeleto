@@ -516,27 +516,87 @@ pub fn looks_like_iceberg_with(uri: &str, opts: &StoreOptions) -> bool {
 /// is the caller having handed over something unusable, and reporting it as "not an Iceberg table"
 /// would attribute a credential mistake to the data — the same class of lie
 /// [`build_with_credentials`] refuses to tell when it declines to fall back to ambient keys.
+///
+/// A name ending in a snapshot address is probed by [`table_under_whole_name`] instead, where a
+/// failed listing is an error: there, "nothing here" reads another table.
 pub fn looks_like_iceberg_as(uri: &str, opts: &StoreOptions) -> Result<bool> {
+    has_objects_under(uri, opts, "metadata", "Iceberg")
+}
+
+/// [`looks_like_iceberg_as`] for a Delta table: whether anything is under `<uri>/_delta_log/`.
+/// Asked first, as a directory is classified: a Delta table that also writes Iceberg metadata
+/// (UniForm) is read by its log.
+pub fn looks_like_delta_as(uri: &str, opts: &StoreOptions) -> Result<bool> {
+    has_objects_under(uri, opts, "_delta_log", "Delta")
+}
+
+/// Whether the listing of `<uri>/<child>/` names any object: the probe a table format is told by.
+/// A listing that fails is `false`, as [`looks_like_iceberg_as`] says why.
+fn has_objects_under(uri: &str, opts: &StoreOptions, child: &str, format: &str) -> Result<bool> {
+    Ok(listing_under(uri, opts, child, format)?.unwrap_or(false))
+}
+
+/// The format of the table under `uri`'s whole name, for a name that ends in what reads as a
+/// snapshot address (`…/orders@7`): Delta, then Iceberg, as [`looks_like_delta_as`] and
+/// [`looks_like_iceberg_as`] tell them, and `None` when neither is there.
+///
+/// Unlike them, a listing that fails is an error here, not "nothing here". For such a name,
+/// "nothing here" means reading it as a snapshot of another table (`…/orders` at 7), so a refused
+/// or failed listing would turn into a read of a table the name may not be.
+pub(crate) fn table_under_whole_name(
+    uri: &str,
+    opts: &StoreOptions,
+) -> Result<Option<crate::source::Format>> {
+    use crate::source::Format;
+    for (child, name, format) in [
+        ("_delta_log", "Delta", Format::Delta),
+        ("metadata", "Iceberg", Format::Iceberg),
+    ] {
+        match listing_under(uri, opts, child, name)? {
+            Ok(true) => return Ok(Some(format)),
+            Ok(false) => {}
+            Err(e) => {
+                return Err(EngineError::Other(format!(
+                    "could not tell whether `{uri}` is a table by its whole name, which decides \
+                     whether its `@` names a snapshot: listing its `{child}/` failed: {e}"
+                )))
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The listing of `<uri>/<child>/`: whether it names any object, or the error it failed with.
+/// The outer error is an identity that cannot address `uri` at all; `format` names the probe in the
+/// error a panic becomes.
+fn listing_under(
+    uri: &str,
+    opts: &StoreOptions,
+    child: &str,
+    format: &str,
+) -> Result<std::result::Result<bool, object_store::Error>> {
     // `Source::detect` runs on the serve async thread; calling `block_on` there would panic
     // ("Cannot start a runtime from within a runtime"). Run the probe on a scratch OS thread, which
     // is not a Tokio worker, so `block_on` on our own runtime is legal.
     let uri_owned = uri.to_string();
     let opts = opts.clone();
+    let child = child.to_string();
     std::thread::spawn(move || {
         let (store, prefix) = store_for_with(&uri_owned, &opts)?;
-        let meta = ObjPath::from(format!(
-            "{}/metadata",
-            prefix.as_ref().trim_end_matches('/')
-        ));
+        let under = ObjPath::from(format!("{}/{child}", prefix.as_ref().trim_end_matches('/')));
         Ok(runtime().block_on(async {
-            let mut listing = store.list(Some(&meta));
-            matches!(listing.next().await, Some(Ok(_)))
+            let mut listing = store.list(Some(&under));
+            match listing.next().await {
+                Some(Ok(_)) => Ok(true),
+                None => Ok(false),
+                Some(Err(e)) => Err(e),
+            }
         }))
     })
     .join()
     .unwrap_or_else(|_| {
         Err(EngineError::Other(format!(
-            "the Iceberg probe for `{uri}` panicked"
+            "the {format} probe for `{uri}` panicked"
         )))
     })
 }
@@ -553,7 +613,7 @@ async fn object_reader(store: Arc<dyn ObjectStore>, path: &ObjPath) -> Result<Pa
 
 /// Drive `future` to completion on the object-store runtime, from a thread that is not running one
 /// (an engine call on a `spawn_blocking` thread, or the CLI's).
-#[cfg(feature = "iceberg")]
+#[cfg(any(feature = "iceberg", feature = "delta"))]
 pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     runtime().block_on(future)
 }
@@ -561,19 +621,19 @@ pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
 /// The stores one read reaches, under one identity: built once per bucket, and kept only for the
 /// read.
 ///
-/// An Iceberg table is many objects (its metadata, manifest lists, manifests, and data and delete
-/// files), and a store built per object would open a client per object, so no request would reuse
+/// An Iceberg or Delta table is many objects (its metadata, or its log, and its data files), and a
+/// store built per object would open a client per object, so no request would reuse
 /// another's connection. A store per bucket, for the length of one read, keeps the connections
 /// pooled without keeping a store, or the credential it was built with, past the read. A
 /// process-wide cache would have to be keyed by identity, and an identity that declares no scope
 /// gets a fresh one per `StoreOptions` value, so such a cache would only grow.
-#[cfg(feature = "iceberg")]
+#[cfg(any(feature = "iceberg", feature = "delta"))]
 pub(crate) struct Stores {
     opts: StoreOptions,
     built: std::sync::Mutex<std::collections::HashMap<String, Arc<dyn ObjectStore>>>,
 }
 
-#[cfg(feature = "iceberg")]
+#[cfg(any(feature = "iceberg", feature = "delta"))]
 impl Stores {
     /// Stores that read as `opts`.
     pub(crate) fn new(opts: &StoreOptions) -> Stores {
@@ -601,6 +661,7 @@ impl Stores {
     }
 
     /// The whole of the object at `uri`.
+    #[cfg(feature = "iceberg")]
     pub(crate) fn get(&self, uri: &str) -> Result<Bytes> {
         self.fetch(uri)?
             .map_err(|e| EngineError::Other(format!("object-store get {uri}: {e}")))
@@ -631,6 +692,33 @@ impl Stores {
         Ok(listing
             .objects
             .into_iter()
+            .filter_map(|object| object.location.filename().map(str::to_string))
+            .collect())
+    }
+
+    /// The names of the objects directly under prefix `uri` that sort after `after`, as
+    /// [`Self::names`] lists them: from a key on, rather than from the start, so a prefix that
+    /// holds years of objects is listed only as far back as the caller needs. A store that ignores
+    /// the offset lists more than asked for, never less.
+    #[cfg(feature = "delta")]
+    pub(crate) fn names_after(&self, uri: &str, after: &str) -> Result<Vec<String>> {
+        use futures::TryStreamExt;
+        let (store, prefix) = self.locate(uri)?;
+        let offset = prefix.clone().join(after);
+        // The listing is recursive: what is under a directory below the prefix is left out, so
+        // the names are the ones `names` would give.
+        let depth = prefix.parts().count() + 1;
+        let objects: Vec<object_store::ObjectMeta> = runtime()
+            .block_on(async move {
+                store
+                    .list_with_offset(Some(&prefix), &offset)
+                    .try_collect()
+                    .await
+            })
+            .map_err(|e| EngineError::Other(format!("object-store list {uri}: {e}")))?;
+        Ok(objects
+            .into_iter()
+            .filter(|object| object.location.parts().count() == depth)
             .filter_map(|object| object.location.filename().map(str::to_string))
             .collect())
     }
@@ -955,6 +1043,22 @@ pub fn object_size_with(uri: &str, opts: &StoreOptions) -> Option<u64> {
         .ok()? // elapsed → None
         .ok() // request error → None
         .map(|meta| meta.size)
+}
+
+/// An object's size and when it was last modified, in milliseconds since the epoch, through
+/// `opts`: one `HEAD`, bounded in time.
+///
+/// # Errors
+///
+/// A URI no store reads, a request that fails, or one that takes longer than a few seconds.
+pub fn object_meta_with(uri: &str, opts: &StoreOptions) -> Result<(u64, i64)> {
+    const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let (store, path) = store_for_with(uri, opts)?;
+    let meta = runtime()
+        .block_on(async move { tokio::time::timeout(HEAD_TIMEOUT, store.head(&path)).await })
+        .map_err(|_| EngineError::Other(format!("head {uri}: no answer in 10 seconds")))?
+        .map_err(|e| EngineError::Other(format!("head {uri}: {e}")))?;
+    Ok((meta.size, meta.last_modified.timestamp_millis()))
 }
 
 /// List an object-store prefix for the file browser: immediate "subdirectories" (common

@@ -40,7 +40,53 @@ export interface Engines {
   engine: { engine: string; formats: string[]; sql: boolean; profile: boolean; remote: boolean };
   sql_available: boolean;
   endpoints: string[];
+  /** Present only when the server writes new tables (`serve --write-dir`): where, and how big. */
+  writes?: { dir: string; max_rows: number; max_bytes: number };
 }
+/** One side of a diff, as it was read. `snapshot` is the one compared at, for a side compared by
+ *  its table metadata; `committed_ms` when that snapshot was committed. */
+export interface DiffSide { source: string; format: string; engine: string; snapshot?: string; committed_ms?: number; }
+/** One column's statistics on one side; `null` is not computed, never zero. */
+export interface DiffStats { nulls: number | null; min: string | null; max: string | null; }
+/** A row only one side has, or one both have that differs: its key, and its compared columns. */
+export interface DiffRow { key: (string | null)[]; values: (string | null)[]; }
+export interface DiffChangedRow { key: (string | null)[]; changes: { column: string; left: string | null; right: string | null }[]; }
+/** `GET /v1/diff`'s answer: what `lakeleto diff -o json` prints (`version: 1`). `left` is the side
+ *  compared from (the old one), `right` the one compared with (the new one). */
+export interface DiffReport {
+  version: number;
+  left: DiffSide; right: DiffSide;
+  schema: {
+    added: Column[]; removed: Column[];
+    changed: { name: string; left_type: string; right_type: string; left_nullable: boolean; right_nullable: boolean }[];
+    reordered: boolean;
+  };
+  rows: { left: number | null; right: number | null };
+  stats: {
+    method: "exact" | "footer" | "sample" | "metadata"; engine: string;
+    left_rows_read: number; right_rows_read: number;
+    columns: { name: string; left: DiffStats; right: DiffStats; changed: boolean; not_compared?: string }[];
+  };
+  keyed?: {
+    key: string[]; compared: string[]; not_compared: { name: string; reason: string }[];
+    added: number; removed: number; changed: number; unchanged: number;
+    changed_by_column: { name: string; changed: number }[];
+    samples: { added: DiffRow[]; removed: DiffRow[]; changed: DiffChangedRow[] };
+  };
+  /** Every kind of difference found, as `--fail-on` names them (`added-column`, `row-count`, …). */
+  found: string[];
+  notes?: string[];
+}
+/** What `GET /v1/diff` is asked: the two sides, and the command's options. `flatten` and
+ *  `jsonPath` read both sides, as `--flatten` and `--json-path` do. */
+export interface DiffQuery {
+  left: string; right: string; key?: string[]; fast?: boolean; scan?: number; sample?: number;
+  flatten?: boolean; jsonPath?: string | null;
+}
+/** A diff reads two tables whole for exact statistics, so it is given far longer than a read. */
+export const DIFF_TIMEOUT_MS = 10 * 60_000;
+/** A table just written by `POST /v1/tables` or by saving a run as a table. */
+export interface NewTable { name: string; path: string; rows: number; bytes: number; columns: string[]; }
 export interface Entry { name: string; path: string; kind: "dir" | "file"; size?: number | null; }
 export interface Listing { dir: string; parent?: string | null; entries: Entry[]; }
 export interface SchemaResp { source: string; format: string; engine: string; row_count?: number | null; columns: Column[];
@@ -81,6 +127,9 @@ export interface RunRecord {
   flatten?: string | null;
   /** The JSON records path the run read its source at (`/data`), when it was given one. */
   json_path?: string | null;
+  /** Whether the run stopped at its row cap with more rows to give. Only a run known to be whole
+   *  (`false`) can be saved as a table; absent means the run did not say. */
+  truncated?: boolean | null;
 }
 export interface WorkspaceBundle { bundle_version: number; workspace: Workspace; history: RunRecord[]; }
 export interface RunResponse { run: RunRecord; columns: Column[]; num_rows: number; rows: Row[]; }
@@ -107,6 +156,9 @@ export interface Backend {
   stats(o: { path: string; filters?: Filters; flatten?: boolean; jsonPath?: string | null }): Promise<Profile>;
   query(o: { sql: string; file?: string | null; tables?: string[] }): Promise<QueryResp>;
   exportUrl(o: { path: string; fmt?: string; sort?: Sort | null; filters?: Filters; cols?: string[] | null; flatten?: boolean; jsonPath?: string | null }): string | null;
+  /** Download an export with the bearer token in a header, never in the URL. Lakeleto Cloud
+   *  honours no query-string token, so this is how the app exports from a plane. */
+  download?(o: Parameters<Backend["exportUrl"]>[0]): Promise<void>;
   // workspace data plane
   wsList(): Promise<WsMeta[]>;
   wsCreate(name: string): Promise<Workspace>;
@@ -118,6 +170,11 @@ export interface Backend {
   wsRunResult(id: string, runId: string, offset?: number, limit?: number): Promise<QueryResp>;
   wsExport(id: string): Promise<WorkspaceBundle>;
   wsImport(bundle: WorkspaceBundle): Promise<Workspace>;
+  /** Save a cached, whole run as a NEW table under the server's `--write-dir`. Absent offline. */
+  wsSaveRunAsTable?(id: string, runId: string, name: string): Promise<NewTable>;
+  /** What changed between two tables (`GET /v1/diff`). Absent offline; a server lists the
+   *  endpoint in `GET /v1/engines` when it answers it. `signal` aborts the request. */
+  diff?(q: DiffQuery, signal?: AbortSignal): Promise<DiffReport>;
 }
 
 export interface Conn { mode: "live" | "sample"; base: string | null; caps: Engines; backend: Backend; }
@@ -203,11 +260,29 @@ export class LakeletoHttpClient implements Backend {
     if (this.token) h["Authorization"] = "Bearer " + this.token;
     return h;
   }
-  private async get<T>(path: string): Promise<T> {
-    const r = await fetch(this.base + path, { headers: this.headers(), signal: AbortSignal.timeout(30_000) });
-    const b = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
-    if (!r.ok) throw new ApiError((b as { error?: string }).error || `HTTP ${r.status}`, r.status);
-    return b as T;
+  private async get<T>(path: string, o: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<T> {
+    const timeout = AbortSignal.timeout(o.timeoutMs ?? 30_000);
+    // Either ends the request: the caller's abort, or the timeout. The listeners go when it ends.
+    const both = new AbortController();
+    const signals = o.signal ? [o.signal, timeout] : [timeout];
+    const stop = (e: Event) => both.abort((e.target as AbortSignal).reason);
+    for (const s of signals) {
+      if (s.aborted) both.abort(s.reason);
+      else s.addEventListener("abort", stop);
+    }
+    try {
+      // The body is read under the same signal, as the headers are.
+      const r = await fetch(this.base + path, { headers: this.headers(), signal: both.signal });
+      if (!r.ok) {
+        const b = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+        throw new ApiError((b as { error?: string }).error || `HTTP ${r.status}`, r.status);
+      }
+      // An answer whose body cannot be read (stopped, timed out, or not JSON) is an error, never
+      // an object standing in for one.
+      return (await r.json()) as T;
+    } finally {
+      for (const s of signals) s.removeEventListener("abort", stop);
+    }
   }
   private async post<T>(path: string, payload: unknown): Promise<T> {
     return this.body<T>("POST", path, payload);
@@ -253,14 +328,40 @@ export class LakeletoHttpClient implements Backend {
   query({ sql, file = null, tables = [] }: Parameters<Backend["query"]>[0]) {
     return this.post<QueryResp>("/v1/query", { sql, file, tables });
   }
-  exportUrl({ path, fmt = "csv", sort = null, filters = {}, cols = null, flatten = false, jsonPath = null }: Parameters<Backend["exportUrl"]>[0]) {
+  diff({ left, right, key = [], fast = false, scan, sample, flatten = false, jsonPath = null }: DiffQuery, signal?: AbortSignal) {
+    const p = new URLSearchParams({ left, right });
+    for (const k of key) p.append("key", k);
+    if (fast) p.set("fast", "true");
+    if (scan != null) p.set("scan", String(scan));
+    if (sample != null && key.length) p.set("sample", String(sample));
+    readAs(p, flatten, jsonPath);
+    return this.get<DiffReport>("/v1/diff?" + p, { timeoutMs: DIFF_TIMEOUT_MS, signal });
+  }
+  private exportParams({ path, fmt = "csv", sort = null, filters = {}, cols = null, flatten = false, jsonPath = null }: Parameters<Backend["exportUrl"]>[0]) {
     const p = new URLSearchParams({ path, fmt });
     if (sort) { p.set("sort", sort.col); p.set("desc", sort.desc ? "1" : "0"); }
     for (const f of filterSpecs(filters)) p.append("filter", f);
     if (cols && cols.length) p.set("cols", cols.join(","));
     readAs(p, flatten, jsonPath);
+    return p;
+  }
+  exportUrl(o: Parameters<Backend["exportUrl"]>[0]) {
+    const p = this.exportParams(o);
     if (this.token) p.set("token", this.token);
     return this.base + "/v1/export?" + p;
+  }
+  async download(o: Parameters<Backend["exportUrl"]>[0]) {
+    const r = await fetch(this.base + "/v1/export?" + this.exportParams(o), { headers: this.headers() });
+    if (!r.ok) {
+      const b = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+      throw new ApiError((b as { error?: string }).error || `HTTP ${r.status}`, r.status);
+    }
+    const name = /filename="([^"]+)"/.exec(r.headers.get("content-disposition") || "")?.[1] || "lakeleto-export";
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
   }
   // ---- workspace data plane ----
   async wsList() { return (await this.get<{ workspaces: WsMeta[] }>("/v1/workspaces")).workspaces; }
@@ -276,6 +377,9 @@ export class LakeletoHttpClient implements Backend {
   }
   wsExport(id: string) { return this.get<WorkspaceBundle>("/v1/workspaces/" + encodeURIComponent(id) + "/export"); }
   wsImport(bundle: WorkspaceBundle) { return this.post<Workspace>("/v1/workspaces/import", bundle); }
+  wsSaveRunAsTable(id: string, runId: string, name: string) {
+    return this.post<NewTable>("/v1/workspaces/" + encodeURIComponent(id) + "/runs/" + encodeURIComponent(runId) + "/table", { name });
+  }
 }
 
 // ======================================================================

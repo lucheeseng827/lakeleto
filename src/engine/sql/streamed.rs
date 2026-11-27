@@ -64,7 +64,11 @@ struct Attempt {
 impl Streams {
     /// A session whose planning failures these streams hear of ([`planning_failed`]).
     pub(super) fn session(&self) -> SessionContext {
-        SessionContext::new_with_config(SessionConfig::new().with_extension(Arc::new(self.clone())))
+        SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_default_catalog_and_schema(super::CATALOG, super::SCHEMA)
+                .with_extension(Arc::new(self.clone())),
+        )
     }
 
     /// Whether any table was registered here, to be read in passes.

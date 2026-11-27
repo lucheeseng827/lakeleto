@@ -32,6 +32,10 @@ struct State {
     /// The access key each request was signed with, `-` for an unsigned one, in request order.
     signers: Mutex<Vec<String>>,
     sent: AtomicU64,
+    /// The keys whose body the client stopped reading before its end, in order.
+    cut: Mutex<Vec<String>>,
+    /// Key prefixes answered `403 Forbidden`, listings of them included.
+    refused: Mutex<Vec<String>>,
 }
 
 /// An object's bytes, and the ETag a request names them by.
@@ -107,10 +111,36 @@ impl FakeS3 {
         self.state.sent.load(Ordering::SeqCst)
     }
 
+    /// Whether a `GET` of `key` was cut short since the last [`Self::reset`]: the client closed the
+    /// connection before the body's end, as a reader that stops reading does. Waits up to
+    /// `timeout` for it, since the server sees the close only at its next write.
+    ///
+    /// What a reader stopped is told by this, not by [`Self::sent`]: the reader's kernel takes in
+    /// what arrives whether or not it is read (on loopback, receive buffers grow to tens of
+    /// megabytes), so a count of bytes sent says as much about the buffers as about the reader.
+    pub fn cut_short(&self, key: &str, timeout: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + timeout;
+        loop {
+            if self.state.cut.lock().unwrap().iter().any(|k| k == key) {
+                return true;
+            }
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Run `hook` as each request arrives, before it is answered, with the line it is logged as:
     /// how a test acts at an exact point in a read, such as cancelling it.
     pub fn on_request(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
         *self.state.hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Answer every request for a key under `prefix`, and every listing of one, `403 Forbidden`,
+    /// as a bucket policy that denies them does.
+    pub fn refuse(&self, prefix: &str) {
+        self.state.refused.lock().unwrap().push(prefix.to_string());
     }
 
     /// Forget the requests and bytes counted so far.
@@ -118,6 +148,7 @@ impl FakeS3 {
         self.state.requests.lock().unwrap().clear();
         self.state.signers.lock().unwrap().clear();
         self.state.sent.store(0, Ordering::SeqCst);
+        self.state.cut.lock().unwrap().clear();
     }
 }
 
@@ -168,23 +199,31 @@ fn serve(stream: TcpStream, state: &State) {
                 };
                 let prefix = param("prefix").unwrap_or_default();
                 let delimiter = param("delimiter");
-                state
-                    .requests
-                    .lock()
-                    .unwrap()
-                    .push(format!("LIST {prefix}"));
-                let body = list_body(state, &prefix, delimiter.as_deref());
+                // `start-after`: only the keys that sort after it, as a listing from an offset asks.
+                let after = param("start-after");
+                state.requests.lock().unwrap().push(match &after {
+                    Some(after) => format!("LIST {prefix} after {after}"),
+                    None => format!("LIST {prefix}"),
+                });
+                if refused(state, &prefix) {
+                    if respond(&mut out, "403 Forbidden", &[], &[], None).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let body = list_body(state, &prefix, delimiter.as_deref(), after.as_deref());
                 if respond(&mut out, "200 OK", &[], body.as_bytes(), None).is_err() {
                     return;
                 }
                 continue;
             }
         }
-        // `/bucket/key`, the bucket dropped.
+        // `/bucket/key`, the bucket dropped, and decoded as S3 decodes it: a key can hold any
+        // character, `%` included, and `object_store` sends it percent-encoded.
         let key = target
             .trim_start_matches('/')
             .split_once('/')
-            .map_or(String::new(), |(_, key)| key.to_string());
+            .map_or(String::new(), |(_, key)| percent_decode(key));
         let range = headers.get("range").cloned();
         let logged = match &range {
             Some(range) => format!("{method} {key} {range}"),
@@ -194,6 +233,12 @@ fn serve(stream: TcpStream, state: &State) {
             hook(&logged);
         }
         state.requests.lock().unwrap().push(logged);
+        if refused(state, &key) {
+            if respond(&mut out, "403 Forbidden", &[], &[], None).is_err() {
+                return;
+            }
+            continue;
+        }
 
         let object = state.objects.lock().unwrap().get(&key).cloned();
         let Some(Stored { body, tag }) = object else {
@@ -229,6 +274,9 @@ fn serve(stream: TcpStream, state: &State) {
         let sent = (method == "GET").then_some(&state.sent);
         let body = if method == "GET" { content } else { &[] };
         if respond_sized(&mut out, status, &head, content.len(), body, sent).is_err() {
+            if method == "GET" {
+                state.cut.lock().unwrap().push(key);
+            }
             return;
         }
     }
@@ -280,13 +328,25 @@ fn respond_sized(
     out.flush()
 }
 
+/// Whether `key`, or a listing's prefix, is under a prefix [`FakeS3::refuse`] named.
+fn refused(state: &State, key: &str) -> bool {
+    state
+        .refused
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|prefix| key.starts_with(prefix.as_str()))
+}
+
 /// A `ListObjectsV2` response for the objects under `prefix`: every key under it, or with a
-/// delimiter, the keys directly under it and the "directories" below those.
-fn list_body(state: &State, prefix: &str, delimiter: Option<&str>) -> String {
+/// delimiter, the keys directly under it and the "directories" below those. With `after`, only the
+/// keys that sort after it.
+fn list_body(state: &State, prefix: &str, delimiter: Option<&str>, after: Option<&str>) -> String {
     let objects = state.objects.lock().unwrap();
     let mut keys: Vec<(&String, &Stored)> = objects
         .iter()
         .filter(|(key, _)| key.starts_with(prefix))
+        .filter(|(key, _)| after.is_none_or(|after| key.as_str() > after))
         .collect();
     keys.sort_by(|a, b| a.0.cmp(b.0));
     let mut contents = String::new();

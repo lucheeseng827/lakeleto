@@ -84,7 +84,7 @@ fn a_catalog_reference_detects_as_iceberg_with_no_request() {
     assert!(source.is_catalog());
     for (reference, says) in [
         ("catalog://lab/db/", "names a catalog or a namespace"),
-        ("catalog://lab/db/orders@42", "0.5.0"),
+        ("catalog://lab/db/orders@42", "lakeleto diff"),
     ] {
         let err = Source::detect(reference).unwrap_err().to_string();
         assert!(err.contains(says), "{reference}: {err}");
@@ -902,6 +902,82 @@ fn the_cli_reads_its_catalogs_from_lakeleto_home() {
     );
 }
 
+/// A check of a catalog table is sent as a run on the table's location, as ADR-0002 §6 names
+/// it, with the catalog's name for it as a symlink and the catalog it is in.
+#[cfg(feature = "openlineage")]
+#[test]
+fn a_catalog_tables_run_names_its_location_and_the_catalogs_name_for_it() {
+    #[path = "support/openlineage.rs"]
+    mod openlineage;
+    use openlineage::*;
+
+    let s3 = FakeS3::start();
+    let catalog = FakeCatalog::start();
+    serve_orders(&s3, &catalog);
+    catalog.vend(vending(&s3, None));
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("catalogs.toml"),
+        format!(
+            "[catalog.lab]\ntype = \"rest\"\nuri = \"{}\"\nwarehouse = \"analytics-wh\"\n",
+            catalog.uri()
+        ),
+    )
+    .unwrap();
+    let (url, rx) = endpoint(200);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_lakeleto"))
+        .args([
+            "--openlineage",
+            &format!("{url}/lineage"),
+            "check",
+            "catalog://lab/db/orders",
+            "--max-age",
+            "100000d",
+        ])
+        .env("LAKELETO_HOME", home.path())
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("OPENLINEAGE_URL")
+        .env_remove("LAKELETO_REMOTE_URL")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Counting every row takes the SQL engine; without it the check errs, and its run names the
+    // table all the same. What its gates found is the check's business, not this test's.
+    let counted = cfg!(feature = "sql");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        matches!(out.status.code(), Some(0 | 1 | 3)),
+        "{stdout}{stderr}"
+    );
+    let events: Vec<Json> = sent(&rx, 2).iter().map(Received::json).collect();
+    assert_run(&events, if counted { "COMPLETE" } else { "FAIL" });
+    for event in &events {
+        let input = &event["inputs"][0];
+        assert_eq!(input["namespace"], "s3://bucket");
+        assert_eq!(input["name"], ORDERS);
+        assert_eq!(
+            input["facets"]["symlinks"]["identifiers"],
+            serde_json::json!([{ "namespace": catalog.uri(), "name": "db.orders", "type": "TABLE" }])
+        );
+        let facet = &input["facets"]["catalog"];
+        assert_eq!(facet["framework"], "iceberg");
+        assert_eq!(facet["type"], "rest");
+        assert_eq!(facet["name"], "lab");
+        assert_eq!(facet["metadataUri"], catalog.uri());
+        assert!(facet.get("warehouseUri").is_none(), "a name is no location");
+    }
+    assert_eq!(
+        events[0]["job"]["name"],
+        format!("check s3://bucket/{ORDERS}")
+    );
+    if counted {
+        assert_eq!(
+            events[1]["inputs"][0]["inputFacets"]["dataQualityMetrics"]["rowCount"],
+            90000
+        );
+    }
+}
+
 /// A catalog nobody answers at is named, with the URL that was tried, less its query, and with
 /// why the connection failed.
 #[test]
@@ -981,4 +1057,47 @@ fn a_catalog_that_hangs_past_the_deadline_cancels_the_call() {
         "{err}"
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(4));
+}
+
+/// A catalog's table at a snapshot, described by its metadata as `diff` compares one: loaded
+/// through the catalog, its manifests read with the credentials the catalog vends, and no data
+/// file asked for.
+#[test]
+fn a_catalog_tables_snapshot_is_described_by_its_manifests() {
+    use lakeleto::snapshot::SnapshotRef;
+    let s3 = FakeS3::start();
+    let catalog = FakeCatalog::start();
+    serve_orders(&s3, &catalog);
+    catalog.vend(vending(&s3, None));
+    let engine = engine(&catalogs(&catalog, &[]));
+    let ctx = RequestContext::detached();
+    let source = table("catalog://lab/db/orders");
+
+    let one = engine
+        .metadata(&ctx, &source, Some(&SnapshotRef::Id(1)))
+        .unwrap();
+    assert_eq!(
+        (one.snapshot.as_deref(), one.rows, one.files),
+        (Some("1"), Some(10), 1)
+    );
+    let now = engine.metadata(&ctx, &source, None).unwrap();
+    assert_eq!(
+        (now.snapshot.as_deref(), now.rows, now.files),
+        (Some("2"), Some(90_000), 3)
+    );
+    let requests = s3.requests();
+    assert!(
+        !requests.iter().any(|r| r.contains("/data/")),
+        "no data file: {requests:#?}"
+    );
+    assert!(
+        s3.signers().iter().all(|k| k.starts_with("VENDED-")),
+        "read with the vended credentials: {:?}",
+        s3.signers()
+    );
+    let missing = engine
+        .metadata(&ctx, &source, Some(&SnapshotRef::Id(7)))
+        .unwrap_err()
+        .to_string();
+    assert!(missing.contains("no snapshot 7"), "{missing}");
 }

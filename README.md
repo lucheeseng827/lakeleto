@@ -7,15 +7,48 @@ see the schema, a clean row preview, and per-column profiles **near-instantly** 
 upload, no server, offline. A single static binary that runs on your laptop or inside a
 locked-down CI runner. (`.tsv` is read tab-delimited; `--format tsv` forces it for any name.)
 
-> **Status: v0.4.1 — released 2026-11-04 (lakeleto).** *Low-Med MVP, "fastest to lovable,"
-> engine is a commodity → pure UX.* The MVP
-> ships the lean, pure-Rust **local reader** engine (Parquet, CSV/TSV, JSON and Arrow IPC) behind a
-> single [`Engine`](src/engine/mod.rs) trait, with `schema` / `head` / `profile` / `info`
-> commands, table/JSON/NDJSON/CSV output, a virtualized-grid SPA (`--features serve`), an
-> opt-in DataFusion **SQL** engine (`--features sql`, read-only), a self-contained **Iceberg**
-> reader (`--features iceberg`), **BYO-credential `s3://`/`gs://`/`az://` reads**
-> (`--features object-store`), and the **Lakeleto Cloud** engine seam (`--features
-> remote`). Last updated 2026-11-04.
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/lucheeseng827/lakeleto?sort=semver)](https://github.com/lucheeseng827/lakeleto/releases)
+[![crates.io](https://img.shields.io/crates/v/lakeleto)](https://crates.io/crates/lakeleto)
+[![Docker pulls](https://img.shields.io/docker/pulls/mancube/lakeleto)](https://hub.docker.com/r/mancube/lakeleto)
+[![Image size](https://img.shields.io/docker/image-size/mancube/lakeleto?sort=semver&label=image)](https://hub.docker.com/r/mancube/lakeleto)
+[![Platforms](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-informational)](https://github.com/lucheeseng827/lakeleto/releases)
+
+**Status: released.** The current release is **0.4.1** (2026-11-04). Each tagged release
+publishes:
+- signed binaries for Linux (musl, `x86_64` and `aarch64`), macOS (`x86_64` and `aarch64`) and
+  Windows (`x86_64`), a macOS `.dmg` and a Windows `.msi`, with `SHA256SUMS` and an SBOM, on the
+  [GitHub release](https://github.com/lucheeseng827/lakeleto/releases);
+- a multi-arch image (`linux/amd64`, `linux/arm64`), `mancube/lakeleto`;
+- the `lakeleto` crate on crates.io;
+- a Homebrew formula (`brew install lucheeseng827/lakeleto/lakeleto`).
+
+It ships the lean, pure-Rust **local reader** engine (Parquet, CSV/TSV, JSON and Arrow IPC) behind a
+single [`Engine`](src/engine/mod.rs) trait, with `schema` / `head` / `profile` / `info`
+commands, table/JSON/NDJSON/CSV output, a virtualized-grid SPA (`--features serve`), an
+opt-in DataFusion **SQL** engine (`--features sql`, read-only), a self-contained **Iceberg**
+reader (`--features iceberg`), **BYO-credential `s3://`/`gs://`/`az://` reads**
+(`--features object-store`), and the **Lakeleto Cloud** engine seam (`--features
+remote`).
+
+## See it in action
+
+`lakeleto serve` opens the workspace in a browser: a virtualized grid over the file, its schema
+and column profiles, and a SQL tab, with saved sources, saved queries, variables and a run
+history. The UI is embedded in the binary, so it works offline. The screenshots are of 0.4.0
+reading a folder of Parquet, CSV and TSV files.
+
+| Grid — virtualized, with per-column filters and sorting done by the server | Schema — every column's type and nullability | Profile — nulls, distinct values, min and max per column |
+|---|---|---|
+| [![Lakeleto grid view](docs/screenshots/lakeleto-grid.webp)](docs/screenshots/lakeleto-grid.webp) | [![Lakeleto schema view](docs/screenshots/lakeleto-schema.webp)](docs/screenshots/lakeleto-schema.webp) | [![Lakeleto profile view](docs/screenshots/lakeleto-profile.webp)](docs/screenshots/lakeleto-profile.webp) |
+
+| SQL — read-only DataFusion over the tab's source, registered as `t` | Workbench — a saved query filed in a folder, a variable, and the run history | Run across — one query against several connections at once |
+|---|---|---|
+| [![Lakeleto SQL tab](docs/screenshots/lakeleto-sql.webp)](docs/screenshots/lakeleto-sql.webp) | [![Lakeleto workbench with saved query and history](docs/screenshots/lakeleto-workbench.webp)](docs/screenshots/lakeleto-workbench.webp) | [![Lakeleto run across connections](docs/screenshots/lakeleto-run-across.webp)](docs/screenshots/lakeleto-run-across.webp) |
+
+| Row detail — one row as fields, copied as JSON, `WHERE` or `INSERT` | Command palette — files, connections, saved queries and tabs by name | Dark theme |
+|---|---|---|
+| [![Lakeleto row detail](docs/screenshots/lakeleto-row-detail.webp)](docs/screenshots/lakeleto-row-detail.webp) | [![Lakeleto command palette](docs/screenshots/lakeleto-palette.webp)](docs/screenshots/lakeleto-palette.webp) | [![Lakeleto SQL tab in the dark theme](docs/screenshots/lakeleto-sql-dark.webp)](docs/screenshots/lakeleto-sql-dark.webp) |
 
 ## Why it exists
 
@@ -240,6 +273,12 @@ cargo run --bin lakeleto -- engines
 # pipe-friendly output
 cargo run --bin lakeleto -- head examples/people.csv -o json
 cargo run --bin lakeleto -- info examples/people.csv -o json
+
+# diff — what changed between two tables, of any formats: columns added, removed or retyped,
+# row counts, each shared column's nulls / min / max (every row, with SQL; `--fast` from Parquet
+# footers). `-o markdown` for a pull request; `--fail-on` exits 3 on the kinds it names
+cargo run --bin lakeleto -- diff examples/sample-data/orders.csv examples/sample-data/orders.parquet
+cargo run --bin lakeleto -- diff before.parquet after.parquet --fail-on removed-column,type-change
 ```
 
 SQL is an **opt-in** upgrade (heavy DataFusion build stays out of the default binary):
@@ -248,6 +287,19 @@ SQL is an **opt-in** upgrade (heavy DataFusion build stays out of the default bi
 cargo run --features sql --bin lakeleto -- \
   query "SELECT city, count(*) n, avg(score) avg_score FROM t GROUP BY city ORDER BY n DESC" \
   --file examples/people.csv
+
+# with SQL, diff also compares the rows, matched by a key: added, removed, changed, and where
+cargo run --features sql --bin lakeleto -- \
+  diff before.parquet after.parquet --key order_id
+
+# check — a gate for CI: a table against the baseline it was, exit 3 on a column removed or
+# retyped, rows dropped past --max-row-drop, a share of nulls risen past --max-null-rise, files
+# jumped past --max-file-jump, or (with --max-age) a table that has not changed for too long.
+# The first run writes the baseline with --update; -o junit for a CI system's test view
+cargo run --features sql --bin lakeleto -- \
+  check warehouse/orders --baseline checks/orders.json --update
+cargo run --features sql --bin lakeleto -- \
+  check warehouse/orders --baseline checks/orders.json --max-age 24h
 ```
 
 ## The backend + UI: `lakeleto serve` / `lakeleto open`
@@ -275,16 +327,12 @@ from the first row of a two-million-row Parquet file to its last. A CSV, TSV or 
 row count until its last window is read, so its scrollbar grows as you scroll. Non-API routes
 fall back to the SPA; `/v1/*` misses return `404` JSON.
 
-![Lakeleto workspace — a SQL result grid over a local CSV, with the file browser and run history](docs/screenshots/lakeleto-sql-workspace.png)
-
 The multi-tab workbench: saved queries, per-tab variables, run history, and multiple
 connections — every query cached to a re-openable result.
 
-![Lakeleto workbench — two saved sources, a query filed under a reports folder, a variable named active, and a run history where every result is cached](docs/screenshots/lakeleto-workbench.png)
-
-> Both screenshots are of the shipped **v0.1.4** build reading `examples/people.csv`. They are
-> regenerated when the UI changes — a screenshot showing an older layout (or, as these once did,
-> an older product name) is a documentation bug, not a cosmetic one.
+The screenshots are under [See it in action](#see-it-in-action). They are regenerated when the
+UI changes — a screenshot showing an older layout (or, as these once did, an older product name)
+is a documentation bug, not a cosmetic one.
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -455,7 +503,10 @@ read only through `dyn Engine`:
 | `DatabaseEngine` | `sqlite` / `postgres` / `mysql` | a database's tables (`sqlite://`, `postgres://`, `mysql://`) | ✅ (read-only, the database's own SQL) | live databases; sort, filter and paging pushed into the database |
 | `RemoteEngine` | `remote` | the server's, from `GET /v1/engines` | the server's | the **Lakeleto Cloud** seam |
 | Iceberg reader | `iceberg` | Iceberg | — | self-contained (metadata + Avro manifests → Parquet); merge-on-read **positional + equality deletes** (scoped by sequence number, and by partition where the reader can prove two partitions differ; on a table with more than one partition spec, or with null or undecodable partition values, a delete applies anyway and can over-delete), compressed manifests, **schema evolution** (field-id match/cast/null-fill), **statistics/partition pruning** (skip files by manifest bounds) |
-| Delta reader | `delta` | Delta Lake (local) | — | self-contained: replays the `_delta_log` JSON commits (add/remove, latest schema, partition values); checkpoints are not read |
+| Delta reader | `delta` | Delta Lake, on disk, or in an object store with `object-store` | — | self-contained: replays `_delta_log` from its newest checkpoint (single-file or multi-part; V2 checkpoints are refused) through the commits after it (add/remove, latest schema, partition values); in a store, the log and checkpoint are read through it and the data files by ranged requests, with nothing copied to disk |
+| Data contracts | `contracts` | — | — | `check --contract`: every row against an ODCS or Covenant contract, with Covenant's validator in process; brings `sql`, whose engine streams the rows |
+| Flight SQL server | `flight` | the declared tables | ✅ (read-only, the SQL engine) | `lakeleto flight`: ADBC (Python, R, Go, Java), JDBC tools and notebooks query the tables named on its command line ([details](docs/CONFIG.md#flight-sql-server)) |
+| OpenLineage events | `openlineage` | — | — | `check`, `diff` and exports sent as OpenLineage runs, naming what they read and wrote; nothing is sent unless an endpoint is given ([what is sent](docs/CONFIG.md#openlineage-events)) |
 | Object-store reads | `object-store` | remote Parquet/CSV/JSON/Arrow (`s3://`/`gs://`/`az://`) | — | the local engine over your bucket with your own creds; ranged Parquet and Arrow, streamed JSON and CSV, compressed text decompressed as it streams, zero hosted compute |
 
 One `EngineRegistry` decides which engine answers each request, for the CLI and the API alike:
@@ -477,7 +528,9 @@ deliberate, adversarially-reviewed design decision.
 - **Headless-first.** The CLI is the scriptable surface the desktop UI (Phase 2) is built
   on top of — both bind to the same trait, so `lakeleto schema` and the UI can never diverge.
 - **Read-only.** `lakeleto query` rejects anything that isn't a `SELECT`/`WITH`/`EXPLAIN`
-  (guard ported from `module_62`). An explorer never mutates your data.
+  (guard ported from `module_62`). An explorer never mutates your data. The one way it creates a
+  table is opt-in and create-only: `lakeleto create-table` (and `serve --write-dir`) keeps a query's result as a
+  *new* Parquet table and refuses a name that exists — see `docs/CONFIG.md`, "New tables".
 - **Your data stays yours.** Local reads never touch the network. Object-store reads
   (`--features object-store`) use *your own* credentials with zero hosted compute — the bytes
   go bucket→machine, nothing is uploaded. The remote *engine* is opt-in and explicitly a
@@ -519,8 +572,23 @@ lakeleto/
 └── examples/people.csv
 ```
 
+## Which tool for which job
+
+Lakeleto is one of three tools that each do one job and meet at files and HTTP:
+
+| If you want to… | Use |
+|---|---|
+| land JSON your systems emit as Parquet or Iceberg tables, appended or upserted | **shapeshift** |
+| open a table or file, query and profile it, and keep an answer as a new table | **Lakeleto** |
+| show it as a live dashboard, shared or embedded in your app | **dagpane** |
+
+Each works on its own; none needs the others installed. Lakeleto creates new tables and never
+changes an existing one: for a table that grows by append or upsert, land it with shapeshift;
+for a dashboard others keep open, use dagpane.
+
 ## Roadmap
 
 The seam and the local engine (Phase 0–1) are in, and the UI, SQL, Iceberg reader, and
 object-store reads have all landed behind the trait. Next is hardening and polish of that
-shipped surface; the hosted **Lakeleto Cloud** plane remains future work.
+shipped surface. The hosted **Lakeleto Cloud** plane has been written but is not released; its
+code is not in the public repository.

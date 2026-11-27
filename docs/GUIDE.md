@@ -102,6 +102,304 @@ ORDER BY date DESC
 > `lakeleto open "exports/orders-$(date +%F).parquet"` on macOS/Linux — one
 > command each morning opens today's file in the browser.
 
+### What changed since yesterday (`diff`)
+
+`lakeleto diff` compares two tables — any two Lakeleto reads, in any formats — and says what
+changed, from the left one (the old, or the reference) to the right one:
+
+```bash
+lakeleto diff exports/orders-2026-07-17.parquet exports/orders-2026-07-18.parquet
+```
+
+```text
+left   exports/orders-2026-07-17.parquet  (parquet, local engine)
+right  exports/orders-2026-07-18.parquet  (parquet, local engine)
+found  added-column, removed-column, row-count, stats
+
+schema
+  + channel  Utf8 (nullable)
+  - rating   Float64 (nullable)
+
+rows
+  5000 → 4998  (-2, -0.04%)
+
+statistics  (exact: every row of each side, sql engine)
+  column      nulls      min        max
+  city        0 → 1      Berlin     Toronto
+  amount_usd  0          5.01       1172.35 → 99999.0
+  (8 more shared columns unchanged)
+```
+
+- **Schema:** columns added (`+`), removed (`-`) and changed (`~`: type or nullability), matched by
+  name, and whether the shared ones moved. A type change is the physical one: a CSV's `Int64`
+  against a Parquet file's `Int32` is reported, though the values may be the same.
+- **Statistics** read every row of each side when your build has SQL (the release binaries do).
+  Numbers compare as numbers (`2` and `2.0` are one value); a column that holds text on one side
+  and numbers on the other is shown and listed as *not compared*, never as changed.
+  `--fast` takes them from Parquet footers instead — exact, and no row read — for two single
+  Parquet files. `--scan N` reads the first N rows of each, which is quicker and is a sample: a
+  difference it finds may not be one between the tables, and the report says so.
+- **Rows, matched by a key** (needs SQL): `--key order_id` (or `--key id,day` for a key of two
+  columns) counts the rows added, removed, changed and unchanged, which columns the changed ones
+  changed in, and shows a few of each (`--sample N`, 5 by default):
+
+  ```bash
+  lakeleto diff yesterday.parquet today.parquet --key order_id
+  ```
+
+  ```text
+  rows by key  (order_id)
+    added 1 · removed 3 · changed 11 · unchanged 4986
+    changed in: amount_usd 10, city 1
+    + order_id=999999  customer=cust_0640  city=London  …
+    - order_id=100010  customer=cust_0597  city=Nairobi  …
+    ~ order_id=100000  amount_usd: 23.29 → 25.62
+  ```
+
+  The key must name one row on each side: a key that repeats is refused, rather than matching
+  rows many to many and miscounting. A null key matches a null key. A key of integers is never
+  matched against one of floats — a float holds every integer only up to 2^53, so two keys could
+  match as one — and is refused. Columns compare when their values are of one kind, whatever the
+  width — an `Int32` against an `Int64`, text against text, an integer against a float (as
+  floats) — and any other shared column is listed as *not compared*, never as changed. `NaN`
+  matches `NaN`; `0.0` and `-0.0` differ. The comparison runs in the SQL engine, which holds the
+  left side's key and compared columns in memory, so put the smaller table on the left. `--key`
+  is refused for a database table (read by its own engine, which cannot join it to a file) and
+  with `--engine local` (which runs no SQL).
+
+**In CI.** `--fail-on` names the kinds of difference that fail the job; any other is reported and
+passes. It exits `3` when one is found, `0` when none is, and `1` on an error:
+
+```bash
+lakeleto diff baseline.parquet build/output.parquet --key id \
+  --fail-on removed-column,type-change,removed-rows -o markdown --out diff.md
+```
+
+The kinds are `added-column`, `removed-column`, `type-change`, `nullability`, `column-order`,
+`row-count`, `stats`, `added-rows`, `removed-rows` and `changed-rows`, and the groups `schema`
+(the first four: not the order, which a reader that finds columns by name never sees), `rows` (the
+three row kinds) and `any`; a row kind needs `--key`. `-o markdown` writes a
+report for a pull request comment — every value, column name and path in it is inline code, so
+whatever a table holds (an `@mention`, a link, an image) shows as text and never renders. In the
+terminal and in Markdown, a control character a value holds is written as its escape (`\n`,
+`\x1b`), so data cannot move the cursor or hide a line. `-o json` writes the whole report, values
+whole, with a `version` and a `found` list for a script to read.
+
+The source flags — `--format`, `--json-path`, `--flatten` — apply to both sides, so leave them out
+when the two are different formats: each side's format is found on its own.
+
+**A table against an earlier snapshot of itself.** An Iceberg or Delta table keeps its history, so
+`<table>@<snapshot>` names it as it was — `@<id>` (an Iceberg snapshot id, a Delta version) or
+`@<instant>` (RFC 3339, such as `@2026-10-01T00:00:00Z`: the snapshot current then):
+
+```bash
+lakeleto diff warehouse/orders@41 warehouse/orders          # version 41 against today
+lakeleto diff s3://lake/orders@2026-10-01T00:00:00Z s3://lake/orders --fail-on schema
+lakeleto diff catalog://prod/sales/orders@4182309823479 catalog://prod/sales/orders
+```
+
+```text
+left   warehouse/orders@41  (delta, local engine, committed 2026-11-20T09:12:44.017Z)
+right  warehouse/orders@44  (delta, local engine, committed 2026-11-26T14:30:08.135Z)
+found  row-count, stats
+```
+
+Both sides are then compared by the table's **metadata** — an Iceberg table's manifests, a Delta
+table's log — at the snapshot each names, the side without `@` at the newest. No row and no data
+file is read: in a store, an Iceberg side costs a request for its metadata, its manifest list and
+each manifest, and a Delta side the log's listing, its checkpoint and each commit after it (and for
+`@<instant>`, a few more commits, each read whole). A snapshot whose files were since cleaned up
+still compares. Each side shows the snapshot it was compared at, which is how to see which one an
+`@<instant>` found, and when it was committed: a Delta version's in-commit timestamp when it records
+one, otherwise the latest time its log records.
+
+- **What is compared:** the schema the snapshot was written with (the side without `@`: the table's
+  current schema, which a schema change sets without a new snapshot), its rows, and each column's
+  nulls, minimum and maximum — only where the metadata makes them exact, so a difference found is
+  one in the data. Text and binary bounds are left out (writers truncate them), as are a Delta
+  table's timestamp bounds (cut to milliseconds) and float bounds (the protocol leaves NaN unsaid),
+  and an Iceberg float's where a file counted no NaN. An Iceberg snapshot with delete files gives no
+  rows or statistics, since only reading the deletes would count them, and one that records no
+  `schema-id` (as early v1 writers did not) is refused, since its columns are not recorded. Each
+  leaving-out, a file whose metadata gives nothing for a column among them, is a note in the report.
+- **`@<instant>` on a Delta table** needs in-commit timestamps (`delta.enableInCommitTimestamps`).
+  Without them the protocol dates a commit by its log file's modification time, which a copy or a
+  checkout resets, so it is refused: name the version (`@<n>`) instead. An Iceberg table answers
+  from its `snapshot-log`.
+- **Not with a snapshot:** `--key`, `--fast` and `--scan` read rows or footers, and are refused.
+  Only `diff` takes `@<snapshot>`. Anywhere else it is refused, pointing here, except for a store
+  name read with `--format`, which skips the probe that tells: that is read whole, and fails as a
+  table that is not there. A name that exists whole is still that name: a directory called
+  `orders@2`, or a store prefix with a table under it (found by the same probes a bare prefix always
+  takes, run even with `--format iceberg` or `delta`). If the store refuses that probe, or it fails,
+  that is the error: the name is not read as a snapshot of another table on a guess. A database URI,
+  a ref sent with `--remote-url`, and a store object named with another format (`--format csv`) are
+  always taken whole.
+
+### Is the table still what it was? (`check`)
+
+`lakeleto check` is a gate for a CI job or a pipeline step: it measures a table and compares it
+with a **baseline** — what the table was the last time the check passed — and fails when it moved
+too far. The first run writes the baseline:
+
+```bash
+lakeleto check warehouse/orders --baseline checks/orders.json --update
+```
+
+Every later run compares with it, and exits `3` when a check fails, `0` when none does, and `1`
+on an error:
+
+```bash
+lakeleto check warehouse/orders --baseline checks/orders.json --max-age 24h
+```
+
+```text
+check     warehouse/orders  (delta, rows counted by sql)
+now       8 rows · 3 files, 4.0 KB · changed 2h 5m ago
+baseline  checks/orders.json  (10 rows · 3 files, 4.8 KB · changed 1d 2h ago, taken 1d ago)
+
+  FAIL     schema     1 column removed, 0 columns changed
+                        removed  city  Utf8
+                        added    team  Utf8  (allowed)
+  FAIL     row-count  10 → 8 rows: 2 fewer (20.00%), more than the 10% allowed
+  FAIL     nulls      1 column rose more than the 5 points allowed
+                        name: 10.00% → 37.50% null
+  PASS     files      within 2×
+                        files  3 → 3
+                        bytes  5017 → 4198
+  PASS     freshness  last changed 2h 5m ago, within the 1d allowed
+
+result    FAIL
+```
+
+- **schema:** a column removed, retyped or changed in nullability fails. A column added, or the
+  columns in a new order, is reported and passes: a table that grows is a healthy one.
+- **row-count:** fails when the rows drop by more than `--max-row-drop` percent (10 by default;
+  exactly 10% passes).
+- **nulls:** fails when a column's share of nulls rises by more than `--max-null-rise` percentage
+  points (5 by default) — 0.1% to 40% fails; twice the rows with twice the nulls is the same share.
+- **files:** fails when the table's data files, or their bytes, grow or shrink by more than
+  `--max-file-jump` (2× by default). They are the files the reader reads: a file's or an
+  object's own, a Parquet directory's `.parquet` files, an Iceberg table's current snapshot —
+  on this machine, in a store or behind a catalog, read as your identity for the store — and a
+  Delta table's, from its log, on this machine or in a store. For anything else (a database
+  table) the gate is skipped, unless `--max-file-jump` is given, which asks for it: then it is
+  unknown.
+- **freshness:** with `--max-age 30m`, `24h` or `7d`, fails when the table last changed longer ago
+  than that — an Iceberg table's current snapshot, a Delta table's latest commit, or a file's
+  modification time. It needs no baseline: `lakeleto check t.parquet --max-age 1d` alone is a
+  check.
+
+Each gate passes, fails, is **skipped** (nothing to compare: no baseline yet), or is **unknown** —
+asked for, and it could not be told, such as `--max-age` on a table whose last change is not
+recorded here. An unknown gate makes the check exit `1`, never `0`: a gate that could not judge
+never reads as one that passed.
+
+**Every row is counted.** The rows and each column's nulls are counted by the SQL engine, which
+the release binaries have. For a single Parquet file, `--fast` reads them from its footer instead
+— exact, and no row read — which is also how a build without SQL counts one; anything else
+without SQL is refused, rather than gated on a sample. A column whose nulls the footer did not
+record (a list column's never are) is not counted, so the nulls gate is unknown: drop `--fast` to
+count every row.
+
+**The baseline** is a JSON file with a `version`, the table's columns, its row count, each
+column's null count, its files and bytes, and when it last changed — and no value the table holds,
+so it can be committed beside the job that checks it. `--update` writes it when the check passes
+or there is none yet, whole or not at all, making the directories it is in when they are missing;
+a baseline that cannot be written is said in the report, which is still printed, and the check
+exits `1`. When the table's files could not be listed — a store's `HEAD` that timed out — the
+rows are still counted and a note says why, but `--update` writes no baseline from that run, and
+exits `1`: a baseline without the files would leave the `files` gate nothing to compare from then
+on. A check that fails leaves the baseline as it was, so the next run
+still compares with the last good table. To accept a change that fails a gate — a column dropped
+on purpose — remove the file and run `--update` again. A baseline of another version is refused,
+never misread.
+
+**In CI.** `-o junit` (or `--out report.xml`) writes the report as JUnit XML, which GitHub
+Actions, GitLab and Jenkins show as tests: one test case a gate, a failed gate a `<failure>`, an
+unknown one an `<error>`. `-o json` writes the whole report, with a `version`, both fingerprints
+and each gate's status, for a script to read. In the terminal and in JUnit, a control character a
+column name holds is written as its escape (`\x1b`), so it cannot drive a terminal or break a
+CI's XML parser.
+
+```yaml
+# .github/workflows/data.yml
+- run: lakeleto check warehouse/orders --baseline checks/orders.json --max-age 24h --out check.xml
+```
+
+An orchestrator's shell step runs the same command — an Airflow `BashOperator`, a Dagster
+`op` that shells out, a dagron step — and fails the step on a non-zero exit.
+
+**Through a server** (`--remote-url`), the server counts the rows and nulls: its answer is one
+row, which no cap on a result cuts, so the counts are every row's. The server's files are not
+seen from here, so `files` skips and `freshness` is unknown (`--max-age` asks for it); run `check`
+where the table is for those. `--contract` is refused through a server — it streams every row,
+and a server answers with only some — and so is a database table, as every remote read of one is.
+
+**A database table** (`sqlite://…?table=orders`, `postgres://…?table=orders`) is counted in its
+own database — one `count(*)` and a `count(<column>)` a column, in its own quoting — and gated
+like any table. It has no files here and no recorded last change, so `files` and `freshness` skip,
+or are unknown when `--max-file-jump` or `--max-age` asks for them; `--fast` and `--contract` are
+refused for it. The baseline and the report carry the URI with its password masked. SQLite and
+Postgres are tested; MySQL takes the same path untested.
+
+**Against a data contract.** `--contract orders.odcs.yaml` checks every row against an ODCS v3
+contract — or a Covenant one — with Covenant's validator, and fails when there are more
+violations than the contract's policy allows (none, unless it says). A contract is a check on its
+own, or beside a baseline:
+
+```bash
+lakeleto check warehouse/orders --contract contracts/orders.odcs.yaml
+```
+
+```text
+contract  orders 1.0.0  (model orders)
+
+  FAIL     contract   4 violations in 3 rows, 0 allowed
+                        amount  min: 1, first at data row 2
+                        currency  allowed: 2, first at data row 2
+                        id  unique: 1, first at data row 3
+```
+
+The report counts each rule's violations and says where each first broke — never the value, so a
+CI log does not keep what the table holds. The text counts data rows from 1, not counting a CSV's
+header; JSON's `first_row` counts them from 0, as Covenant does. `--model <name>` picks the model when the contract has
+several. A contract with rules the validator cannot enforce (a SQL quality check, say) is refused;
+`--allow-unenforced` checks the rest, and the report says the check was **partial** — in the text
+(`PASS, partially`), in JSON (`"partial": true` and the rules left unchecked), and in JUnit (the
+test case's output). The contract is read and compiled before the table is: a contract that does
+not read, a model it does not have, or rules it cannot enforce stop the check before any row is.
+The rows are streamed through the SQL engine a batch at a time — a second read of the table, after
+the one that counts it — and memory holds a batch, plus every distinct value seen so far of a
+field the contract says is `unique`, up to `--unique-memory` (512 MiB unless given: `2G`, `256M`).
+That is an estimate on the high side — 2 million 36-character ids take some 240 MiB. Past it, the
+rest of the table is checked for every rule but uniqueness, duplicates already found still count,
+and the gate says from which data row `unique` stopped: it is **unknown** (exit `1`), not a pass,
+unless `--allow-unenforced` accepts it as partial. It needs the `contracts` feature, which builds
+the SQL engine with it; the release binaries do not have it yet. A database table's contract is
+refused for now.
+
+### Into your lineage graph (`--openlineage`)
+
+A check, a diff or an export that runs in a pipeline can say so to the lineage server the rest of
+the pipeline reports to (Marquez, or any OpenLineage endpoint), with a build that has the
+`openlineage` feature:
+
+```bash
+export OPENLINEAGE_URL=https://marquez.internal       # the server; dagron reads the same variable
+export OPENLINEAGE_API_KEY=…                          # sent as a bearer token, never printed
+lakeleto check s3://lake/orders --baseline orders.baseline.json
+lakeleto --openlineage https://marquez.internal/api/v1/lineage diff orders@41 orders
+```
+
+Each run is a `START` and then a `COMPLETE` (a failed gate completed: the gate's verdict is the
+result) or a `FAIL` (an error). It names the tables it read, and an export (`--out` to a file)
+also names the file it wrote. A check also sends what it found: each gate and contract rule as an
+assertion, and the row count and null counts as metrics. No row or value is sent. Nothing is sent
+unless an endpoint is given, and an endpoint that is down costs a warning, never the command's
+result. [OpenLineage events](CONFIG.md#openlineage-events) has what each event holds and how
+tables are named.
+
 ### Compressed files, and Arrow files from Python
 
 A compressed text file opens as the format it holds, and an Arrow file as the table it is:
@@ -153,6 +451,12 @@ Once a file is open:
 - **Schema** — every column, its type, nullability, and the exact row count.
 - **Profile** — per-column null %, distinct count, min/max, and sample values —
   a fast data-quality read on any file.
+- **Diff** — what changed between this table and another, or one of its own snapshots
+  (type `@41` for version 41): the columns, the row count, each column's nulls, min and max, and
+  with a **key** the rows added, removed and changed. The same report as
+  [`lakeleto diff`](#what-changed-since-yesterday-diff). It reads nothing until you press
+  **Compare**; exact statistics read both tables whole, so on a large table pick footers or a
+  sample. Offered only by a server that answers it, as `lakeleto serve` does.
 - **SQL** — read-only `SELECT … FROM t`. Results render in the same grid.
 - **Download view** — save the *current* (filtered + sorted) view as CSV, JSON,
   or Parquet.
@@ -208,6 +512,22 @@ lakeleto head sales.parquet --out sample.arrow
   and the image have it; without it, `-o parquet` is refused before anything is read. Its writer
   is about 530 KB of the default build, where the Arrow writers are about 110 KB, so every build
   writes `arrow` and `arrows`.
+
+### Keep an answer as a table
+
+A query you'll come back to can be kept as a table of its own, which the browser lists and every
+tool reads:
+
+```bash
+lakeleto create-table marts/revenue_by_city --write-dir ./tables \
+  --table orders=./orders.parquet \
+  --sql "SELECT city, sum(amount) AS revenue FROM orders GROUP BY city"
+```
+
+That writes `./tables/marts/revenue_by_city.parquet`. Lakeleto never replaces a table: run it
+again and it refuses, so pick a new name (`marts/revenue_by_city_2026_07`). `--sql-file
+mart.sql` reads the SQL from a file. In the browser, start the server with
+`lakeleto serve --write-dir ./tables` and a cached result gets a **Save as table…** button.
 
 ---
 
@@ -340,6 +660,10 @@ Details worth knowing:
   than mixing two versions. A long read — a large object, or a query result read
   slowly — that outlasts the store's request timeout carries on from where it
   stopped.
+- **Iceberg and Delta tables:** a table's prefix opens it
+  (`lakeleto open s3://my-bucket/warehouse/orders`), told apart by its `_delta_log/` (Delta) or
+  `metadata/` (Iceberg). Its metadata, or its log and checkpoint, are read through the store, and
+  its data files by ranged requests, as far as a read goes: nothing is copied to disk.
 - **S3-compatible stores:** set `AWS_ENDPOINT=https://…` for MinIO, R2, etc.
 - **Env-only:** credentials are read from the environment and nowhere else; they
   are never written to disk or a config file.
@@ -460,11 +784,14 @@ lakeleto open ./warehouse/delta_orders
 ```
 Lakeleto replays the transaction log (`_delta_log`), so an overwritten or
 row-deleted table reads the **right rows** — not the stale/removed Parquet files
-still sitting on disk. Partition columns are filled from the log. (JSON commit
-log; checkpoints aren't read, so the table's `*.json` commits must all still be
-there. Once log cleanup has removed the early ones, the table either fails to open
-or shows only the files added since, with a row count that falls short. `VACUUM`,
-which deletes unused data files, is fine.)
+still sitting on disk. Partition columns are filled from the log. The replay
+starts from the newest checkpoint, so a table whose old commits log cleanup has
+removed reads correctly; a commit missing after the checkpoint is an error, never
+a table read short. The same table in an object store opens the same way
+(`lakeleto open s3://my-bucket/warehouse/delta_orders`), read as your identity,
+with nothing copied to disk. (V2 checkpoints, named with a UUID or keeping their
+files in `_sidecars/`, aren't read yet: a table only one can rebuild is refused,
+naming it.)
 
 **Hive-partitioned Parquet** — a directory of `date=…/region=…/*.parquet`:
 
@@ -585,6 +912,38 @@ What keeps it in bounds:
 > Point `--root` at data you're happy for both to read.
 
 ---
+
+### From a notebook or a JDBC tool (Flight SQL)
+
+A build with the `flight` feature serves your tables to any Flight SQL client, read-only:
+
+```bash
+lakeleto flight --token s3cret --table orders=data/orders.parquet --table events=s3://lake/events/
+```
+
+From Python, with ADBC (`pip install adbc_driver_flightsql pyarrow pandas`; pandas only for the
+last line):
+
+```python
+import adbc_driver_flightsql.dbapi as flight_sql
+
+conn = flight_sql.connect(
+    "grpc://127.0.0.1:50051",
+    db_kwargs={"adbc.flight.sql.authorization_header": "Bearer s3cret"},
+)
+cur = conn.cursor()
+cur.execute("SELECT region, sum(amount) AS total FROM orders GROUP BY region")
+df = cur.fetch_arrow_table().to_pandas()
+```
+
+Off this machine, give it a certificate: `--tls-cert` and `--tls-key` (PEM) make it
+`grpc+tls://host:50051`. Plaintext on any address but loopback is refused unless you pass
+`--plaintext`, for a TLS proxy or tunnel in front. A client trusts a private certificate with
+`"adbc.flight.sql.client_option.tls_root_certs": open("ca.pem").read()` in `db_kwargs`.
+
+Each table is `lakeleto_tables.main.<name>`, which is how a tool that browses catalogs lists it.
+Every statement is one read query. A result past `--max-rows` (a million rows unless set) is an
+error, not a cut-off answer. [Flight SQL server](CONFIG.md#flight-sql-server) has the details.
 
 ## 11. Sharing it safely (beyond your own machine)
 

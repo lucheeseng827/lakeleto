@@ -23,7 +23,7 @@ pub mod flatten;
 pub mod local;
 pub mod registry;
 
-// Self-contained Delta Lake reader (JSON transaction log → active Parquet files).
+// Self-contained Delta Lake reader (transaction log and checkpoints → active Parquet files).
 #[cfg(feature = "delta")]
 pub mod delta;
 
@@ -51,7 +51,7 @@ use crate::error::{EngineError, Result};
 use crate::source::{Format, Source};
 
 /// One column's declared shape.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct ColumnSchema {
     pub name: String,
     pub data_type: String,
@@ -121,6 +121,12 @@ pub struct ColumnProfile {
     pub name: String,
     pub data_type: String,
     pub null_count: u64,
+    /// Whether `null_count` is counted. `false` only for footer statistics that did not record
+    /// the column's nulls in every row group, where `null_count` and `null_fraction` are 0 and
+    /// mean nothing. Written only when `false`, and read as `true` when absent, so a peer that
+    /// knows nothing of it means what it always did: every engine counted.
+    #[serde(default = "counted", skip_serializing_if = "is_counted")]
+    pub null_count_known: bool,
     pub null_fraction: f64,
     /// Distinct values observed in the scan window (`distinct_capped` = the cap was hit).
     pub distinct: u64,
@@ -128,6 +134,26 @@ pub struct ColumnProfile {
     pub min: Option<String>,
     pub max: Option<String>,
     pub sample: Vec<String>,
+}
+
+fn counted() -> bool {
+    true
+}
+
+fn is_counted(known: &bool) -> bool {
+    *known
+}
+
+/// What an engine sees of a table's files without reading a row: how many data files it reads,
+/// their bytes, and when the table last changed. `None` for what it cannot tell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableFiles {
+    pub files: Option<u64>,
+    /// The files' bytes, when every one's size is known.
+    pub bytes: Option<u64>,
+    /// When the table last changed, in milliseconds since the epoch: a table format's commit time
+    /// from its metadata, or the files' latest modification.
+    pub updated_ms: Option<i64>,
 }
 
 /// A whole-table profile: the per-column stats plus how much was actually scanned.
@@ -431,6 +457,32 @@ pub trait Engine: Send + Sync {
             None => self.query(ctx, sql, tables)?,
         };
         Ok(RowStream::from_batch(rb))
+    }
+
+    /// [`TableFiles`] for `source`: the data files this engine reads for it, their bytes, and when
+    /// the table last changed, as far as it can tell without reading a row. Default: nothing, for
+    /// an engine that reads no files (a database's) or cannot see them (another machine's).
+    fn files(&self, _ctx: &RequestContext, _source: &Source) -> Result<TableFiles> {
+        Ok(TableFiles::default())
+    }
+
+    /// `source` as it was at snapshot `at`, or as it is now when `None`, described by its
+    /// metadata alone: for `diff` of a snapshot ([`crate::snapshot`]). Only a table format keeps
+    /// metadata of its own, so only Iceberg and Delta tables have one. Default: refused, for an
+    /// engine that reads no table format (a database's) or reads it elsewhere (a remote's).
+    fn metadata(
+        &self,
+        _ctx: &RequestContext,
+        source: &Source,
+        _at: Option<&crate::snapshot::SnapshotRef>,
+    ) -> Result<crate::snapshot::TableMetadata> {
+        Err(EngineError::UnsupportedOperation {
+            engine: self.name().to_string(),
+            op: format!("describe {} by its metadata", source.display()),
+            hint: "a snapshot is compared where its table is read: run `lakeleto diff` on a \
+                   machine that reads it"
+                .to_string(),
+        })
     }
 
     /// Profile columns over the *filtered* view (the grid's current filter). Default:
@@ -807,6 +859,7 @@ pub fn profile_columns(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<Ve
             name: field.name().clone(),
             data_type: format!("{}", field.data_type()),
             null_count,
+            null_count_known: true,
             null_fraction,
             distinct: distinct.len() as u64,
             distinct_capped,
@@ -1411,6 +1464,24 @@ mod stream_default_tests {
                 batches: vec![batch(0, 3), batch(3, 3)],
             })
         }
+    }
+
+    /// An engine that reads no metadata refuses a snapshot with the variant a name that is nothing
+    /// by its whole name is refused with, and `diff` must not read the one as the other.
+    #[test]
+    fn the_default_metadata_refusal_is_not_the_snapshot_address_one() {
+        let err = BufferedOnlyEngine
+            .metadata(
+                &RequestContext::detached(),
+                &Source::with_format("t", crate::source::Format::Delta),
+                Some(&crate::snapshot::SnapshotRef::Id(7)),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::UnsupportedOperation { .. }),
+            "{err}"
+        );
+        assert!(!crate::snapshot::is_only_diff_reads(&err), "{err}");
     }
 
     /// An engine that overrides nothing still answers `query_stream`, which is what makes the

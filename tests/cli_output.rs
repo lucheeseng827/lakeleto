@@ -293,6 +293,32 @@ fn a_build_without_parquet_out_refuses_parquet_before_making_a_file() {
     );
 }
 
+/// A query that opens with a `--` comment, as one pasted from a `.sql` file does, is the query
+/// and not an option: clap used to refuse it as an unknown argument before any engine saw it.
+/// Flags before it and after it still parse as flags.
+#[cfg(feature = "sql")]
+#[test]
+fn query_takes_sql_that_starts_with_a_comment() {
+    let dir = tempfile::tempdir().unwrap();
+    let csv = fixture(dir.path());
+    let sql = "-- people with a score\nSELECT count(*) AS n FROM t WHERE score IS NOT NULL";
+    let want = "n\n3\n";
+    let text = |args: &[&str]| String::from_utf8(ok(args)).unwrap();
+    assert_eq!(
+        text(&["query", sql, "--file", arg(&csv), "-o", "csv"]),
+        want
+    );
+    assert_eq!(
+        text(&["query", "--file", arg(&csv), "-o", "csv", sql]),
+        want
+    );
+    let block = "/* people with a score */ SELECT count(*) AS n FROM t WHERE score IS NOT NULL";
+    assert_eq!(
+        text(&["query", block, "--file", arg(&csv), "-o", "csv"]),
+        want
+    );
+}
+
 /// `query` in each binary format, to a file and down a pipe, reads back as the SQL engine's answer.
 #[cfg(feature = "sql")]
 #[test]
@@ -324,6 +350,45 @@ fn query_writes_each_binary_format_as_the_engine_answers() {
         );
         assert_same_rows(&got, &want, &format!("{format} on stdout"));
     }
+}
+
+/// `lakeleto info` on a table that is a directory — here a Hive-partitioned Parquet dataset —
+/// reports the bytes of the files under it. It used to report the directory's own entry, 4 KiB,
+/// whatever the table held.
+#[test]
+fn info_sizes_a_table_directory_by_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = dir.path().join("people");
+    std::fs::create_dir_all(table.join("team=a")).unwrap();
+    std::fs::create_dir_all(table.join("team=b")).unwrap();
+    let mut total = 0;
+    for (part, ids) in [
+        ("team=a/part-0.parquet", 0..100),
+        ("team=b/part-0.parquet", 100..300),
+    ] {
+        let batch = RecordBatch::try_from_iter([(
+            "id",
+            std::sync::Arc::new(arrow_array::Int64Array::from_iter_values(ids))
+                as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let out = table.join(part);
+        let mut w = parquet::arrow::ArrowWriter::try_new(
+            std::fs::File::create(&out).unwrap(),
+            batch.schema(),
+            None,
+        )
+        .unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        total += std::fs::metadata(&out).unwrap().len();
+    }
+    // Its own entry is not what it holds.
+    assert_ne!(total, std::fs::metadata(&table).unwrap().len());
+    let json: serde_json::Value =
+        serde_json::from_slice(&ok(&["info", arg(&table), "-o", "json"])).unwrap();
+    assert_eq!(json["format"], "parquet", "{json}");
+    assert_eq!(json["size_bytes"], total, "{json}");
 }
 
 /// `lakeleto info` prints what `-o` asks for. It used to print its `name : value` lines whatever

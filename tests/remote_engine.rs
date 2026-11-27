@@ -647,6 +647,7 @@ async fn engines_lists_a_live_server() {
             json_path: None,
             flatten: None,
             max_decompressed: lakeleto::source::DEFAULT_MAX_DECOMPRESSED,
+            openlineage: None,
             cmd: lakeleto::cli::Cmd::Engines,
         };
         assert_eq!(lakeleto::cli::run(cli).unwrap(), 0);
@@ -810,4 +811,194 @@ async fn a_server_reading_through_another_reports_the_far_servers_formats() {
     tokio::task::spawn_blocking(move || drop(remote))
         .await
         .unwrap();
+}
+
+// ---- new tables through a remote engine -------------------------------------------------
+
+/// A [`RemoteEngine`] pointed at `peer`, built where its blocking client may build its runtime.
+/// Drop the last reference with [`drop_blocking`], for the same reason.
+async fn remote_to(peer: std::net::SocketAddr) -> Arc<dyn Engine> {
+    tokio::task::spawn_blocking(move || {
+        Arc::new(RemoteEngine::new(format!("http://{peer}"), None)) as Arc<dyn Engine>
+    })
+    .await
+    .unwrap()
+}
+
+async fn drop_blocking(engine: Arc<dyn Engine>) {
+    tokio::task::spawn_blocking(move || drop(engine))
+        .await
+        .unwrap();
+}
+
+/// A server that writes new tables under `out` and reads everything through `remote`: the
+/// shape an embedder could build.
+fn writing_front(
+    remote: Arc<dyn Engine>,
+    out: &Path,
+    store: Arc<dyn WorkspaceStore>,
+) -> axum::Router {
+    lakeleto::api::router_with_writes(
+        EngineRegistry::new(remote),
+        10_000,
+        None,
+        None,
+        true,
+        store,
+        Some(lakeleto::table_out::WriteDir::open(out).unwrap()),
+    )
+}
+
+async fn send_json(
+    app: axum::Router,
+    method: &str,
+    uri: &str,
+    body: serde_json::Value,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// `POST /v1/tables` refuses an engine whose peer caps rows without saying so, before it asks
+/// the peer anything: the table could be the answer's first rows under the answer's name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_reading_through_a_remote_engine_writes_no_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture.parquet");
+    write_fixture(&path);
+    let out = tempfile::tempdir().unwrap();
+    let remote = remote_to(serve(None).await).await;
+    let (status, body) = send_json(
+        writing_front(remote.clone(), out.path(), store()),
+        "POST",
+        "/v1/tables",
+        serde_json::json!({ "name": "copy", "file": path.to_str().unwrap() }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("first rows"),
+        "{body}"
+    );
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    drop_blocking(remote).await;
+}
+
+/// A run through a remote engine that comes back short of its cap is not recorded as whole —
+/// the peer may have cut it at its own cap — so it cannot be saved as a table either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_through_a_remote_engine_is_not_recorded_as_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture.parquet");
+    write_fixture(&path);
+    let out = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let store: Arc<dyn WorkspaceStore> = Arc::new(LocalStore::at(home.path()).unwrap());
+    let remote = remote_to(serve(None).await).await;
+    let front = || writing_front(remote.clone(), out.path(), store.clone());
+
+    let (_, ws) = send_json(
+        front(),
+        "POST",
+        "/v1/workspaces",
+        serde_json::json!({ "name": "remote" }),
+    )
+    .await;
+    let id = ws["id"].as_str().unwrap().to_string();
+    let (status, run) = send_json(
+        front(),
+        "POST",
+        &format!("/v1/workspaces/{id}/runs"),
+        serde_json::json!({ "path": path.to_str().unwrap(), "limit": 100, "cache": true }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{run}");
+    assert_eq!(run["run"]["row_count"], 3, "{run}");
+    assert!(
+        run["run"].get("truncated").is_none(),
+        "claimed to know: {run}"
+    );
+
+    let run_id = run["run"]["id"].as_str().unwrap();
+    let (status, err) = send_json(
+        front(),
+        "POST",
+        &format!("/v1/workspaces/{id}/runs/{run_id}/table"),
+        serde_json::json!({ "name": "saved" }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    drop_blocking(remote).await;
+}
+
+/// `check` through a server counts every row: its counts are one aggregate row, which no cap on
+/// a result cuts, of a table larger than the server's default limit (10,000) and its cap
+/// (100,000). They match the same table counted here; the server's files are not seen from here.
+#[cfg(feature = "sql")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_through_a_server_counts_every_row_past_its_caps() {
+    use lakeleto::check::{measure, Counting};
+    use lakeleto::engine::sql::DataFusionEngine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.csv");
+    let mut text = String::from("id,name\n");
+    for i in 0..120_000 {
+        if i % 7 == 0 {
+            text.push_str(&format!("{i},\n"));
+        } else {
+            text.push_str(&format!("{i},n{i}\n"));
+        }
+    }
+    std::fs::write(&path, text).unwrap();
+    let addr = serve(Some(Arc::new(DataFusionEngine::new()))).await;
+
+    tokio::task::spawn_blocking(move || {
+        let ctx = RequestContext::detached();
+        let remote: Arc<dyn Engine> = Arc::new(RemoteEngine::new(format!("http://{addr}"), None));
+        let far_engines = EngineRegistry::new(remote.clone())
+            .with_sql(remote.clone())
+            .with_database(remote);
+        let far_source = Source::unresolved(path.to_str().unwrap(), None).unwrap();
+        let far = measure(&ctx, &far_engines, &far_source, Counting::Auto, 0).unwrap();
+        let engine = far.engine;
+        let far = far.fingerprint;
+        assert_eq!(engine, "remote");
+
+        let read: Arc<dyn Engine> = Arc::new(LocalReaderEngine::default());
+        let near_engines = EngineRegistry::new(read).with_sql(Arc::new(DataFusionEngine::new()));
+        let near_source = Source::resolve(&path, None).unwrap();
+        let near = measure(&ctx, &near_engines, &near_source, Counting::Auto, 0)
+            .unwrap()
+            .fingerprint;
+
+        assert_eq!(far.rows, 120_000);
+        assert_eq!(far.rows, near.rows);
+        assert_eq!(far.nulls, near.nulls);
+        let name = far.nulls.iter().find(|c| c.name == "name").unwrap();
+        assert_eq!(name.nulls, Some(120_000 / 7 + 1));
+        assert_eq!(far.files, None, "the server's files are not seen from here");
+        assert!(near.files.is_some());
+    })
+    .await
+    .unwrap();
 }
