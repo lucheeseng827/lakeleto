@@ -448,24 +448,39 @@ jobs:
         run: |
           ( cd dist && cat ./*.sha256 > SHA256SUMS && cat SHA256SUMS )
       - name: Publish release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          tag_name: ${{ env.TAG }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          # A pre-release suffix (vX.Y.Z-rc.N) is marked a GitHub pre-release — exercise the
-          # pipeline without presenting an rc as a GA download.
-          prerelease: ${{ contains(env.TAG, '-') }}
-          files: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.msi
-            dist/*.dmg
-            dist/*.sha256
-            dist/*.sig
-            dist/*.pem
-            dist/*.cdx.json
-            dist/SHA256SUMS
+        # `gh`, not an action that edits the release: the sync creates the release before this
+        # runs, and editing an existing release re-sends its tag, which GitHub refuses this job's
+        # token ("Resource not accessible by integration") when the run's workflow files differ
+        # from the tagged commit's — a run started by hand from main after a fix to this file,
+        # as v0.5.0's was. Uploading assets touches no ref, so it works from either start.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # Every kind of file must be there (what fail_on_unmatched_files checked before).
+          files=()
+          for pattern in 'dist/*.tar.gz' 'dist/*.zip' 'dist/*.msi' 'dist/*.dmg' 'dist/*.sha256' \
+                         'dist/*.sig' 'dist/*.pem' 'dist/*.cdx.json' 'dist/SHA256SUMS'; do
+            # shellcheck disable=SC2206 # the pattern is meant to glob
+            matched=( $pattern )
+            if [ "${#matched[@]}" -eq 0 ]; then
+              echo "::error::no file matches $pattern"
+              exit 1
+            fi
+            files+=( "${matched[@]}" )
+          done
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # A run again replaces the assets of the same name.
+            gh release upload "$TAG" "${files[@]}" --repo "$REPO" --clobber
+          else
+            flags=(--verify-tag --generate-notes --title "lakeleto $TAG")
+            # A pre-release suffix (vX.Y.Z-rc.N) is marked a GitHub pre-release — exercise the
+            # pipeline without presenting an rc as a GA download.
+            case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+            gh release create "$TAG" "${files[@]}" --repo "$REPO" "${flags[@]}"
+          fi
 
   cratesio:
     name: publish lakeleto to crates.io
