@@ -37,6 +37,8 @@
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
+use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_schema::SchemaRef;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
 use serde::{Deserialize, Serialize};
@@ -248,13 +250,8 @@ impl WriteDir {
         let mut writer = ArrowWriter::try_new(BufWriter::new(file), schema.clone(), Some(props))
             .map_err(EngineError::parquet)?;
         let mut rows: u64 = 0;
-        for batch in stream {
-            let batch = batch?;
-            if batch.schema().fields() != schema.fields() {
-                return Err(EngineError::Other(format!(
-                    "`{name}`: a batch of the result does not have the result's columns"
-                )));
-            }
+        for (i, batch) in stream.enumerate() {
+            let batch = conform(name, &schema, i, batch?)?;
             rows += batch.num_rows() as u64;
             writer.write(&batch).map_err(EngineError::parquet)?;
         }
@@ -300,6 +297,35 @@ impl WriteDir {
             provenance,
         })
     }
+}
+
+/// Batch `i` of the result on the result's own schema, or a refusal.
+///
+/// Parquet encodes each batch against the schema the file was opened with, by position, so every
+/// batch must hold the result's columns: the same names, in the same order, of the same types.
+/// That is the rule the CLI's other writers keep ([`crate::render::ensure_batch_matches`]), and
+/// for the same reason it leaves nullability and metadata alone: a plan's batches legitimately
+/// differ from its schema there. A `UNION ALL` with a literal row is the common case: the
+/// literal's column cannot be null and the union's can, and each side's batches say what their
+/// side says. The batch is rebuilt on the result's schema, which also refuses a null in a column
+/// the result says has none.
+///
+/// Only a column's own nullability is left alone. A list's items and a struct's fields are part of
+/// its type, compared whole; the physical plan gives each side of a union the same nested types
+/// (as it does for `make_array` and `named_struct` columns), so a difference there is refused.
+fn conform(name: &str, schema: &SchemaRef, i: usize, batch: RecordBatch) -> Result<RecordBatch> {
+    if batch.schema_ref().fields() == schema.fields() {
+        return Ok(batch);
+    }
+    crate::render::ensure_batch_matches(schema, i, &batch, &format!("the new table `{name}`"))?;
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(schema.clone(), batch.columns().to_vec(), &options).map_err(
+        |e| {
+            EngineError::Arrow(format!(
+                "batch {i}: {e} — refusing to write the new table `{name}`"
+            ))
+        },
+    )
 }
 
 impl WriteDir {
@@ -684,6 +710,172 @@ mod tests {
         assert!(matches!(err, EngineError::Query(_)), "{err}");
         assert!(!wd.target("half").unwrap().exists());
         assert!(leftovers(wd.path()).is_empty());
+    }
+
+    /// A stream whose result says `city` may be null, with a batch of rows from a table, where
+    /// it may, and a batch from a literal row, where it cannot: a `UNION ALL` with a literal row.
+    fn union_with_a_literal_row() -> RowStream {
+        let result = Arc::new(Schema::new(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("orders", DataType::Int64, true),
+        ]));
+        let table = RecordBatch::try_new(
+            result.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("Oslo"), None])),
+                Arc::new(Int64Array::from(vec![Some(3), Some(4)])),
+            ],
+        )
+        .unwrap();
+        // The literal side's own schema, as the plan gives it: the union's names, and nothing in
+        // it can be null.
+        let literal = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("city", DataType::Utf8, false),
+                Field::new("orders", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["Lima"])),
+                Arc::new(Int64Array::from(vec![7])),
+            ],
+        )
+        .unwrap();
+        RowStream::new(result, vec![Ok(table), Ok(literal)].into_iter())
+    }
+
+    fn read_back(path: &str) -> RecordBatch {
+        let file = std::fs::File::open(path).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap()
+    }
+
+    #[test]
+    fn a_union_all_with_a_literal_row_is_written_with_the_results_columns() {
+        let (_tmp, wd) = dir();
+        let t = wd
+            .write("with_lima", union_with_a_literal_row(), origin())
+            .unwrap();
+        assert_eq!(t.rows, 3);
+        assert_eq!(t.columns, vec!["city", "orders"]);
+
+        let back = read_back(&t.path);
+        let schema = back.schema();
+        assert_eq!(schema.field(0).name(), "city");
+        assert!(
+            schema.field(0).is_nullable(),
+            "the result's column, not the literal's"
+        );
+        let cities = back
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            cities.iter().collect::<Vec<_>>(),
+            vec![Some("Oslo"), None, Some("Lima")]
+        );
+        let orders = back
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(orders.values().to_vec(), vec![3, 4, 7]);
+        assert!(leftovers(wd.path()).is_empty());
+    }
+
+    #[test]
+    fn a_batch_that_does_not_hold_the_results_columns_is_refused() {
+        use arrow_array::Int32Array;
+
+        let result = Arc::new(Schema::new(vec![
+            Field::new("city", DataType::Utf8, false),
+            Field::new("orders", DataType::Int64, true),
+        ]));
+        let refused = |result: Arc<Schema>, batch: RecordBatch| -> String {
+            let (_tmp, wd) = dir();
+            let stream = RowStream::new(result, vec![Ok(batch)].into_iter());
+            let err = wd.write("bad", stream, origin()).unwrap_err().to_string();
+            assert!(!wd.target("bad").unwrap().exists(), "{err}");
+            assert!(leftovers(wd.path()).is_empty(), "{err}");
+            assert!(
+                err.contains("refusing to write the new table `bad`"),
+                "{err}"
+            );
+            err
+        };
+        let batch = |fields: Vec<Field>, columns: Vec<arrow_array::ArrayRef>| {
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        };
+
+        // Another type, even one a cast could reach.
+        let err = refused(
+            result.clone(),
+            batch(
+                vec![
+                    Field::new("city", DataType::Utf8, false),
+                    Field::new("orders", DataType::Int32, true),
+                ],
+                vec![
+                    Arc::new(StringArray::from(vec!["Oslo"])),
+                    Arc::new(Int32Array::from(vec![1])),
+                ],
+            ),
+        );
+        assert!(err.contains("the batch has `orders: Int32"), "{err}");
+
+        // Another number of columns.
+        let err = refused(
+            result.clone(),
+            batch(
+                vec![Field::new("city", DataType::Utf8, false)],
+                vec![Arc::new(StringArray::from(vec!["Oslo"]))],
+            ),
+        );
+        assert!(
+            err.contains("has 1 column(s) but the result declares 2"),
+            "{err}"
+        );
+
+        // A null where the result says there is none.
+        let err = refused(
+            result.clone(),
+            batch(
+                vec![
+                    Field::new("city", DataType::Utf8, true),
+                    Field::new("orders", DataType::Int64, true),
+                ],
+                vec![
+                    Arc::new(StringArray::from(vec![None::<&str>])),
+                    Arc::new(Int64Array::from(vec![1])),
+                ],
+            ),
+        );
+        assert!(err.contains("non-nullable"), "{err}");
+
+        // Columns of one type in another order: by position they would land under each other's
+        // names.
+        let pair = Arc::new(Schema::new(vec![
+            Field::new("shipped", DataType::Int64, true),
+            Field::new("returned", DataType::Int64, true),
+        ]));
+        let err = refused(
+            pair,
+            batch(
+                vec![
+                    Field::new("returned", DataType::Int64, true),
+                    Field::new("shipped", DataType::Int64, true),
+                ],
+                vec![
+                    Arc::new(Int64Array::from(vec![1])),
+                    Arc::new(Int64Array::from(vec![2])),
+                ],
+            ),
+        );
+        assert!(err.contains("the batch has `returned: Int64"), "{err}");
     }
 
     #[test]

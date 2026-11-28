@@ -352,6 +352,59 @@ fn query_writes_each_binary_format_as_the_engine_answers() {
     }
 }
 
+/// A `UNION ALL` whose literal changed a column's type is written, in each binary format, with the
+/// type its rows have: `2.5` widens `id` (`Int64`) to `Float64`, and a `VALUES` row's text (`Utf8`)
+/// meets the text Parquet is read as (`Utf8View`). Both were refused: the declared schema was the
+/// plan's from before DataFusion coerced its types, and named a type no batch had.
+#[cfg(feature = "sql")]
+#[test]
+fn query_writes_a_union_whose_literal_changed_a_type() {
+    use arrow_array::{Array, Float64Array, StringArray};
+    use arrow_schema::DataType;
+
+    let dir = tempfile::tempdir().unwrap();
+    let csv = fixture(dir.path());
+    let orders = format!(
+        "o={}",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/sample-data/orders.parquet"
+        )
+    );
+    let widened = "SELECT id FROM t UNION ALL SELECT 2.5";
+    let text = "SELECT * FROM (VALUES (1, 'a')) AS v(x, y) \
+                UNION ALL SELECT order_id, city FROM o WHERE order_id < 100002";
+    for format in binary() {
+        let out = dir.path().join(format!("widened.{format}"));
+        ok(&["query", widened, "--file", arg(&csv), "--out", arg(&out)]);
+        let got = read(std::fs::read(&out).unwrap(), format);
+        assert_eq!(
+            got.schema().field(0).data_type(),
+            &DataType::Float64,
+            "{format}"
+        );
+        let ids = got
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let mut ids: Vec<f64> = ids.iter().flatten().collect();
+        ids.sort_by(f64::total_cmp);
+        assert_eq!(ids, vec![1.0, 2.0, 2.5, 3.0, 4.0], "{format}");
+
+        let out = dir.path().join(format!("text.{format}"));
+        ok(&["query", text, "--table", &orders, "--out", arg(&out)]);
+        let got = read(std::fs::read(&out).unwrap(), format);
+        let ys = arrow_cast::cast(got.column(1), &DataType::Utf8).unwrap();
+        let ys = ys.as_any().downcast_ref::<StringArray>().unwrap();
+        let mut ys: Vec<&str> = ys.iter().flatten().collect();
+        ys.sort_unstable();
+        assert_eq!(ys, vec!["Berlin", "Nairobi", "a"], "{format}");
+        assert_eq!(got.num_rows(), 3, "{format}");
+        assert!(got.column(1).null_count() == 0, "{format}");
+    }
+}
+
 /// `lakeleto info` on a table that is a directory — here a Hive-partitioned Parquet dataset —
 /// reports the bytes of the files under it. It used to report the directory's own entry, 4 KiB,
 /// whatever the table held.

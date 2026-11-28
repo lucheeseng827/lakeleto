@@ -6,6 +6,20 @@ adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **A `UNION ALL` with a literal row can be kept as a table.** `create-table` and
+  `POST /v1/tables` refused one: `a batch of the result does not have the result's columns`. When
+  the literal changed a column's type (`SELECT id FROM t UNION ALL SELECT 2.5`), `query --out`
+  refused it too, as Parquet and as Arrow.
+  - **The SQL engine declares its physical plan's schema**, the one its batches are built to. It
+    declared the plan's schema from before DataFusion coerces types, so a union whose literal
+    widened a column (`Int32` to `Int64`, `Int64` to `Float64`) or whose sides read text
+    differently (`Utf8`, `Utf8View`) named a type no batch had. Such a result's declared types are
+    now what its rows are, in every output.
+  - **A new table is held to the rule the other writers keep:** each batch has the result's column
+    names and types, in order. Nullability may differ, as each side of a union says what its own
+    side says; a null in a column the result says has none is refused.
+
 ## [0.5.0] - 2026-11-27
 
 ### Added

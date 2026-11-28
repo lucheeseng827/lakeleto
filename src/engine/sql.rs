@@ -1256,6 +1256,13 @@ fn sorts_in_file_order(source: &Source) -> bool {
 /// [`SessionContext::sql`] has returned: a failure anywhere here is the query's planning, not its
 /// rows, and is noted for a table it streams to be checked before the error is final
 /// ([`streamed::planning_failed`]).
+///
+/// The schema is the physical plan's, the one its batches are built to. The DataFrame's own
+/// schema is the plan before DataFusion coerces its types, so it can name a type no batch has:
+/// `SELECT id FROM t UNION ALL SELECT 2.5` declares `id`'s type there, and every batch is
+/// `Float64`. A writer that encodes batches against the declared schema (Parquet, Arrow IPC, a
+/// new table) then refuses the result. What the two still differ in is nullability: a union's
+/// column may be null when either side's can, while each side's batches say what that side says.
 async fn physical(
     session: &SessionContext,
     sql: &str,
@@ -1275,10 +1282,9 @@ async fn physical(
     if let (Some(cap), false) = (cap, explain) {
         df = df.limit(0, Some(cap)).map_err(unplanned)?;
     }
-    let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
     let task = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await.map_err(unplanned)?;
-    Ok((schema, plan, task))
+    Ok((plan.schema(), plan, task))
 }
 
 /// The next batch of `stream`, under `ctx`'s deadline and cancellation; `None` at its end.

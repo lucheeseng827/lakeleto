@@ -2984,6 +2984,53 @@ async fn headers_of(app: axum::Router, uri: &str) -> (StatusCode, axum::http::He
     (resp.status(), resp.headers().clone())
 }
 
+/// A `UNION ALL` with a literal row: the literal widens `id` (`Int64`) to `Float64`, and its side
+/// cannot be null where the file's can. The table is written with the result's columns, as the
+/// plan computed them, and every row is in it.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn post_tables_writes_a_union_all_with_a_literal_row() {
+    let out = tempfile::tempdir().unwrap();
+    let (_s, store) = temp_store();
+    let (st, t) = send(
+        app_writes(None, out.path(), store),
+        "POST",
+        "/v1/tables",
+        Some(serde_json::json!({
+            "name": "ids_and_one_more",
+            "file": CSV,
+            "sql": "SELECT id, name FROM t UNION ALL SELECT 2.5, 'Zed'",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{t}");
+    assert_eq!(t["rows"], 9);
+    assert_eq!(t["columns"], serde_json::json!(["id", "name"]));
+
+    let file = std::fs::File::open(t["path"].as_str().unwrap()).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut ids = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &arrow_schema::DataType::Float64
+        );
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        ids.extend(col.iter().flatten());
+    }
+    ids.sort_by(f64::total_cmp);
+    assert_eq!(ids.len(), 9);
+    assert!(ids.contains(&2.5), "{ids:?}");
+}
+
 #[tokio::test]
 async fn an_export_of_a_new_table_says_which_table_and_when() {
     let out = tempfile::tempdir().unwrap();

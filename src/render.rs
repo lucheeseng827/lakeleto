@@ -508,12 +508,12 @@ fn describe_field(f: &arrow_schema::Field) -> String {
 /// - *Nullability* is not a positional hazard either. A reader that is handed the declared
 ///   schema decodes the same bytes whether the field says nullable or not; no value is
 ///   mislabelled and no column shifts. It is also the attribute producers disagree about most:
-///   the SQL engine takes `RowBatch::schema` from `df.schema()` while the batches come out of
-///   the execution plan (`engine/sql.rs`), and DataFusion's planner and its plans legitimately
-///   differ here — a `UNION ALL` mixing a `NOT NULL` source with a nullable one is the standard
-///   case. An earlier revision of this function compared nullability and turned exactly that
-///   query into a `400` on the Arrow arm while the JSON arm still answered `200`. Guarding it
-///   cost correct results and bought no safety.
+///   the SQL engine declares its physical plan's schema (`engine/sql.rs`), and a plan's batches
+///   legitimately differ from it here — a `UNION ALL` mixing a `NOT NULL` side with a nullable
+///   one declares the column nullable, while each side's batches say what that side says. An
+///   earlier revision of this function compared nullability and turned exactly that query into
+///   a `400` on the Arrow arm while the JSON arm still answered `200`. Guarding it cost correct
+///   results and bought no safety.
 ///
 /// The one genuinely unsafe case nullability *could* flag — a field declared `NOT NULL` whose
 /// array actually contains nulls — is a property of the data, not of the schema, so this check
@@ -531,7 +531,8 @@ fn ensure_batches_match_schema(rb: &RowBatch) -> Result<()> {
 }
 
 /// [`ensure_batches_match_schema`]'s check for one batch, `i`, about to be written as `what`.
-fn ensure_batch_matches(
+/// A new table ([`crate::table_out`]) is held to it too.
+pub(crate) fn ensure_batch_matches(
     schema: &arrow_schema::Schema,
     i: usize,
     batch: &arrow_array::RecordBatch,
